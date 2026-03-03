@@ -44,7 +44,9 @@ env:
   group_size: 8
   total_steps: 10000
   steps_per_eval: 500
+
   num_eval_tasks: 10
+  eval_split_ratio: 0.1
 
   # Logging
   use_wandb: true
