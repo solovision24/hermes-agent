@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import signal
+import time
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -1422,6 +1423,23 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            # If streaming already delivered the response via progressive edits,
+            # do a final edit with the post-processed text and suppress the
+            # normal send to avoid duplicating the message.
+            _streamed_id = agent_result.get("_streamed_msg_id")
+            if _streamed_id and response:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    try:
+                        await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=_streamed_id,
+                            content=response,
+                        )
+                    except Exception:
+                        pass
+                return ""  # Suppress normal send in base.py
             
             return response
             
@@ -3061,7 +3079,35 @@ class GatewayRunner:
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
-        
+
+        # ── Streaming setup ─────────────────────────────────────────────
+        _stream_q = None
+        _stream_done = None
+        _stream_msg_id = [None]
+        _streaming_enabled = False
+
+        try:
+            import yaml as _s_yaml
+            _s_cfg_path = _hermes_home / "config.yaml"
+            if _s_cfg_path.exists():
+                with open(_s_cfg_path, encoding="utf-8") as _s_f:
+                    _s_data = _s_yaml.safe_load(_s_f) or {}
+                _s_cfg = _s_data.get("streaming", {})
+                if isinstance(_s_cfg, dict):
+                    _platform_key = source.platform.value if source.platform else ""
+                    if _platform_key and _s_cfg.get(_platform_key) is not None:
+                        _streaming_enabled = str(_s_cfg[_platform_key]).lower() in ("true", "1", "yes")
+                    else:
+                        _streaming_enabled = str(_s_cfg.get("enabled", False)).lower() in ("true", "1", "yes")
+        except Exception:
+            pass
+        if os.getenv("HERMES_STREAMING_ENABLED", "").lower() in ("true", "1", "yes"):
+            _streaming_enabled = True
+
+        if _streaming_enabled:
+            _stream_q = queue.Queue()
+            _stream_done = threading.Event()
+
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_event_loop()
         _hooks_ref = self.hooks
@@ -3134,6 +3180,19 @@ class GatewayRunner:
                 }
 
             pr = self._provider_routing
+
+            # Streaming: build callback that feeds the async queue
+            _on_stream_token = None
+            if _stream_q is not None:
+                _sq = _stream_q      # capture for closure
+                _sd = _stream_done
+                def _on_stream_token(delta):
+                    if delta is None:
+                        if _sd:
+                            _sd.set()
+                    else:
+                        _sq.put(delta)
+
             agent = AIAgent(
                 model=model,
                 **runtime_kwargs,
@@ -3151,6 +3210,7 @@ class GatewayRunner:
                 provider_require_parameters=pr.get("require_parameters", False),
                 provider_data_collection=pr.get("data_collection"),
                 session_id=session_id,
+                stream_callback=_on_stream_token,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
                 platform=platform_key,
@@ -3277,7 +3337,7 @@ class GatewayRunner:
                         unique_tags.insert(0, "[[audio_as_voice]]")
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             
-            return {
+            _result_dict = {
                 "final_response": final_response,
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
@@ -3285,12 +3345,86 @@ class GatewayRunner:
                 "history_offset": len(agent_history),
                 "last_prompt_tokens": _last_prompt_toks,
             }
+            if _stream_msg_id[0]:
+                _result_dict["_streamed_msg_id"] = _stream_msg_id[0]
+            return _result_dict
         
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
-        
+
+        # ── Stream preview: progressively edit a message with streaming tokens ──
+        async def stream_preview():
+            if not _stream_q or not _stream_done:
+                return
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return
+
+            accumulated = []
+            token_count = 0
+            last_edit = 0.0
+            MIN_TOKENS = 20
+            EDIT_INTERVAL = 1.5
+            _metadata = {"thread_id": source.thread_id} if source.thread_id else None
+
+            try:
+                while not _stream_done.is_set():
+                    try:
+                        chunk = _stream_q.get(timeout=0.1)
+                        accumulated.append(chunk)
+                        token_count += 1
+                    except Exception:
+                        continue
+
+                    now = time.monotonic()
+                    if token_count >= MIN_TOKENS and (now - last_edit) >= EDIT_INTERVAL:
+                        preview = "".join(accumulated) + " ▌"
+                        if _stream_msg_id[0] is None:
+                            r = await adapter.send(
+                                chat_id=source.chat_id, content=preview,
+                                metadata=_metadata,
+                            )
+                            if r.success and r.message_id:
+                                _stream_msg_id[0] = r.message_id
+                        else:
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=_stream_msg_id[0],
+                                content=preview,
+                            )
+                        last_edit = now
+
+                # Drain remaining
+                while not _stream_q.empty():
+                    try:
+                        accumulated.append(_stream_q.get_nowait())
+                    except Exception:
+                        break
+
+                # Final edit: remove cursor
+                if _stream_msg_id[0] and accumulated:
+                    await adapter.edit_message(
+                        chat_id=source.chat_id,
+                        message_id=_stream_msg_id[0],
+                        content="".join(accumulated),
+                    )
+            except asyncio.CancelledError:
+                if _stream_msg_id[0] and accumulated:
+                    try:
+                        await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=_stream_msg_id[0],
+                            content="".join(accumulated),
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug("stream_preview error: %s", e)
+
+        stream_task = asyncio.create_task(stream_preview()) if _stream_q else None
+
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created
         async def track_agent():
@@ -3365,9 +3499,11 @@ class GatewayRunner:
                     session_key=session_key
                 )
         finally:
-            # Stop progress sender and interrupt monitor
+            # Stop progress sender, stream preview, and interrupt monitor
             if progress_task:
                 progress_task.cancel()
+            if stream_task:
+                stream_task.cancel()
             interrupt_monitor.cancel()
             
             # Clean up tracking
@@ -3376,7 +3512,7 @@ class GatewayRunner:
                 del self._running_agents[session_key]
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task]:
+            for task in [progress_task, stream_task, interrupt_monitor, tracking_task]:
                 if task:
                     try:
                         await task

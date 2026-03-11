@@ -314,11 +314,18 @@ class TestChatCompletionsEndpoint:
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-                mock_run.return_value = (
+            async def _mock_run_agent(**kwargs):
+                # Simulate streaming: invoke stream_callback with tokens
+                cb = kwargs.get("stream_callback")
+                if cb:
+                    cb("Hello!")
+                    cb(None)  # End signal
+                return (
                     {"final_response": "Hello!", "messages": [], "api_calls": 1},
                     {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
                 )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
