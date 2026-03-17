@@ -333,6 +333,14 @@ DEFAULT_CONFIG = {
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
     },
 
+    # WhatsApp platform settings (gateway mode)
+    "whatsapp": {
+        # Reply prefix prepended to every outgoing WhatsApp message.
+        # Default (None) uses the built-in "⚕ *Hermes Agent*" header.
+        # Set to "" (empty string) to disable the header entirely.
+        # Supports \n for newlines, e.g. "🤖 *My Bot*\n──────\n"
+    },
+
     # Approval mode for dangerous commands:
     #   manual — always prompt the user (default)
     #   smart  — use auxiliary LLM to auto-approve low-risk commands, prompt for high-risk
@@ -365,7 +373,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 9,
+    "_config_version": 10,
 }
 
 # =============================================================================

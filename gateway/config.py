@@ -420,6 +420,13 @@ def load_gateway_config() -> GatewayConfig:
                     os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
                 if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
                     os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+
+            # Bridge whatsapp settings from config.yaml into platform config
+            whatsapp_cfg = yaml_cfg.get("whatsapp", {})
+            if isinstance(whatsapp_cfg, dict) and "reply_prefix" in whatsapp_cfg:
+                if Platform.WHATSAPP not in config.platforms:
+                    config.platforms[Platform.WHATSAPP] = PlatformConfig()
+                config.platforms[Platform.WHATSAPP].extra["reply_prefix"] = whatsapp_cfg["reply_prefix"]
     except Exception:
         pass
 
