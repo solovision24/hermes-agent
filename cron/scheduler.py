@@ -347,11 +347,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             format_runtime_provider_error,
         )
         try:
+            cfg_provider = None
+            cfg_base_url = None
+            if isinstance(_model_cfg, dict):
+                cfg_provider = _model_cfg.get("provider")
+                cfg_base_url = _model_cfg.get("base_url")
+
             runtime_kwargs = {
-                "requested": job.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER"),
+                "requested": job.get("provider") or cfg_provider or os.getenv("HERMES_INFERENCE_PROVIDER"),
             }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
+            effective_base_url = job.get("base_url") or cfg_base_url
+            if effective_base_url:
+                runtime_kwargs["explicit_base_url"] = effective_base_url
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except Exception as exc:
             message = format_runtime_provider_error(exc)
@@ -396,8 +403,55 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         result = agent.run_conversation(prompt)
 
-        final_response = result.get("final_response", "") or ""
-        logged_response = final_response if final_response else "(No response generated)"
+        completed = bool(result.get("completed", False))
+        failed = bool(result.get("failed", False))
+        partial = bool(result.get("partial", False))
+        agent_error = result.get("error")
+        final_response = (result.get("final_response", "") or "").strip()
+
+        if failed or partial or not completed:
+            error_msg = str(agent_error or "Agent run did not complete successfully")
+            output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Agent ID:** {agent_id or '(default)'}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Error
+
+{error_msg}
+
+## Raw final response
+
+{final_response or '(No response generated)'}
+"""
+            logger.error("Job '%s' failed: %s", job_name, error_msg)
+            return False, output, final_response, error_msg
+
+        if not final_response:
+            error_msg = "Agent completed without producing a final response"
+            output = f"""# Cron Job: {job_name} (FAILED)
+
+**Job ID:** {job_id}
+**Agent ID:** {agent_id or '(default)'}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Prompt
+
+{prompt}
+
+## Error
+
+{error_msg}
+"""
+            logger.error("Job '%s' failed: %s", job_name, error_msg)
+            return False, output, "", error_msg
 
         output = f"""# Cron Job: {job_name}
 
@@ -412,7 +466,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Response
 
-{logged_response}
+{final_response}
 """
 
         logger.info("Job '%s' completed successfully", job_name)
