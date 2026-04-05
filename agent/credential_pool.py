@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 import threading
 import time
 import uuid
-import os
 from dataclasses import dataclass, fields, replace
+from pathlib import Path
+from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+    _HAS_DOTENV = True
+except ImportError:
+    _HAS_DOTENV = False
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
@@ -39,6 +47,24 @@ def _load_config_safe() -> Optional[dict]:
         return load_config()
     except Exception:
         return None
+
+
+def _load_hermes_dotenv() -> None:
+    """Load env vars from .env file in the Hermes config directory."""
+    if not _HAS_DOTENV:
+        return
+    # Walk up from the hermes-agent directory to find the hermes config root
+    # The agent lives at ~/.hermes/hermes-agent/agent/credential_pool.py
+    # The .env lives at ~/.hermes/.env
+    import hermes_cli.config as cfg_mod
+    try:
+        config = cfg_mod.load_config()
+        config_dir = Path(config.get("_hermes_dir", "/home/solo/.hermes"))
+    except Exception:
+        config_dir = Path.home() / ".hermes"
+    env_path = config_dir / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
 
 
 # --- Status and type constants ---
@@ -684,6 +710,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
+    _load_hermes_dotenv()
     if provider == "openrouter":
         token = os.getenv("OPENROUTER_API_KEY", "").strip()
         if token:

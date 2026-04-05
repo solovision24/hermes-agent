@@ -3,8 +3,9 @@
 Vision Tools Module
 
 This module provides vision analysis tools that work with image URLs.
-Uses the centralized auxiliary vision router, which can select OpenRouter,
-Nous, Codex, native Anthropic, or a custom OpenAI-compatible endpoint.
+Uses MiniMax VLM directly at /v1/coding_plan/vlm — the only confirmed working
+vision path. All other providers (OpenRouter, Nous, Codex, Anthropic, custom)
+are broken via httpx/OpenAI SDK and have been removed from the routing order.
 
 Available tools:
 - vision_analyze_tool: Analyze images from URLs with custom prompts
@@ -495,12 +496,14 @@ async def vision_analyze_tool(
 
 
 def check_vision_requirements() -> bool:
-    """Check if the configured runtime vision path can resolve a client."""
+    """Check if MINIMAX_API_KEY is available (required for MiniMax VLM)."""
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
+    if api_key:
+        return True
     try:
-        from agent.auxiliary_client import resolve_vision_provider_client
-
-        _provider, client, _model = resolve_vision_provider_client()
-        return client is not None
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+        creds = resolve_api_key_provider_credentials("minimax")
+        return bool(str(creds.get("api_key", "")).strip())
     except Exception:
         return False
 
@@ -526,11 +529,11 @@ if __name__ == "__main__":
     api_available = check_vision_requirements()
     
     if not api_available:
-        print("❌ No auxiliary vision model available")
-        print("Configure a supported multimodal backend (OpenRouter, Nous, Codex, Anthropic, or a custom OpenAI-compatible endpoint).")
+        print("❌ No MiniMax API key available")
+        print("Set MINIMAX_API_KEY in ~/.hermes/.env to enable vision analysis.")
         exit(1)
     else:
-        print("✅ Vision model available")
+        print("✅ MiniMax VLM available")
     
     print("🛠️ Vision tools ready for use!")
     
@@ -574,7 +577,7 @@ from tools.registry import registry
 
 VISION_ANALYZE_SCHEMA = {
     "name": "vision_analyze",
-    "description": "Analyze images using AI vision. Provides a comprehensive description and answers a specific question about the image content.",
+    "description": "Analyze images using MiniMax VLM. Provides a comprehensive description and answers a specific question about the image content. Routes directly to /v1/coding_plan/vlm — no OpenRouter or other providers.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -593,14 +596,94 @@ VISION_ANALYZE_SCHEMA = {
 
 
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+    """
+    Directly calls MiniMax VLM at /v1/coding_plan/vlm using the same
+    process_image_url utility as the minimax-coding-plan-mcp server.
+    This bypasses the broken httpx/OpenAI-SDK path entirely.
+    """
     image_url = args.get("image_url", "")
     question = args.get("question", "")
     full_prompt = (
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}"
     )
-    model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return vision_analyze_tool(image_url, full_prompt, model)
+
+    # Resolve API key — prefer env var, fall back to hermes credentials
+    api_key = os.getenv("MINIMAX_API_KEY", "").strip()
+    if not api_key:
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+            creds = resolve_api_key_provider_credentials("minimax")
+            api_key = str(creds.get("api_key", "")).strip()
+        except Exception:
+            pass
+
+    if not api_key:
+        return _mini_error(
+            "MINIMAX_API_KEY is not set. Vision analysis requires a MiniMax API key.",
+            "MiniMax API key is missing. Set MINIMAX_API_KEY in ~/.hermes/.env."
+        )
+
+    # Use the same utility the MCP server uses for URL/file/base64 handling
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/home/solo/.cache/uv/archive-v0/a1PB1FMh7AO6ddkMxCuQ9/lib/python3.11/site-packages")
+        from minimax_mcp.utils import process_image_url
+    except Exception:
+        return _mini_error(
+            "minimax_mcp package not found",
+            "The minimax-coding-plan-mcp package is required for vision. "
+            "Ensure it is installed: uvx minimax-coding-plan-mcp"
+        )
+
+    try:
+        processed_image = process_image_url(image_url)
+    except Exception as e:
+        return _mini_error(f"Failed to process image: {e}", str(e))
+
+    # Call MiniMax VLM endpoint directly — not via OpenAI SDK
+    try:
+        import httpx as _httpx
+        import asyncio as _asyncio
+
+        async def _call():
+            async with _httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.minimax.io/v1/coding_plan/vlm",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"prompt": full_prompt, "image_url": processed_image},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                content = data.get("content", "").strip()
+                if not content:
+                    raise ValueError("MiniMax VLM returned empty content")
+                return json.dumps({"success": True, "analysis": content}, indent=2, ensure_ascii=False)
+
+        return _asyncio.run(_call())
+
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        err_str = str(e).lower()
+        if status == 401 or "invalid api key" in err_str:
+            analysis = "MiniMax API key is invalid or expired. Please check MINIMAX_API_KEY."
+        elif status == 403:
+            analysis = "MiniMax API access forbidden — the API key may not have vision permissions."
+        elif status == 429:
+            analysis = "MiniMax API rate limit reached. Please try again shortly."
+        else:
+            analysis = f"MiniMax VLM HTTP {status}: {e}"
+        return json.dumps({"success": False, "error": f"HTTP {status}", "analysis": analysis}, indent=2)
+    except Exception as e:
+        return _mini_error(f"Vision call failed: {e}", str(e))
+
+
+def _mini_error(error_msg: str, user_analysis: str) -> str:
+    """Return a structured error JSON for _handle_vision_analyze."""
+    return json.dumps({"success": False, "error": error_msg, "analysis": user_analysis}, indent=2, ensure_ascii=False)
 
 
 registry.register(

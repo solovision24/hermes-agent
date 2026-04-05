@@ -610,6 +610,36 @@ class TestGetTextAuxiliaryClient:
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""
 
+    def test_vision_auto_prefers_minimax_then_zai_before_openrouter(self):
+        with (
+            patch("agent.auxiliary_client._resolve_minimax_vision_backend", return_value=(MagicMock(), "MiniMax-M2.7")) as mock_minimax,
+            patch("agent.auxiliary_client._resolve_zai_vision_backend", return_value=(MagicMock(), "glm-5.1")) as mock_zai,
+            patch("agent.auxiliary_client._try_openrouter", return_value=(MagicMock(), "google/gemini-3-flash-preview")) as mock_openrouter,
+        ):
+            provider, client, model = resolve_vision_provider_client()
+
+        assert provider == "minimax"
+        assert client is not None
+        assert model == "MiniMax-M2.7"
+        mock_minimax.assert_called_once()
+        mock_zai.assert_not_called()
+        mock_openrouter.assert_not_called()
+
+    def test_vision_auto_falls_back_to_zai_when_minimax_unavailable(self):
+        with (
+            patch("agent.auxiliary_client._resolve_minimax_vision_backend", return_value=(None, None)) as mock_minimax,
+            patch("agent.auxiliary_client._resolve_zai_vision_backend", return_value=(MagicMock(), "glm-5.1")) as mock_zai,
+            patch("agent.auxiliary_client._try_openrouter", return_value=(MagicMock(), "google/gemini-3-flash-preview")) as mock_openrouter,
+        ):
+            provider, client, model = resolve_vision_provider_client()
+
+        assert provider == "zai"
+        assert client is not None
+        assert model == "glm-5.1"
+        mock_minimax.assert_called_once()
+        mock_zai.assert_called_once()
+        mock_openrouter.assert_not_called()
+
     def test_vision_returns_none_without_any_credentials(self):
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
@@ -767,11 +797,17 @@ class TestAuxiliaryPoolAwareness:
         """Custom endpoint is used as fallback in vision auto mode.
 
         Many local models (Qwen-VL, LLaVA, etc.) support vision.
-        When no OpenRouter/Nous/Codex is available, try the custom endpoint.
+        When no higher-priority vision backend is available, try the custom endpoint.
         """
         monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
         monkeypatch.setenv("OPENAI_API_KEY", "local-key")
-        with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+        config = {"model": {"provider": "custom", "base_url": "http://localhost:1234/v1", "default": "my-local-model"}}
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+        monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+        with patch("agent.auxiliary_client._resolve_minimax_vision_backend", return_value=(None, None)), \
+             patch("agent.auxiliary_client._resolve_zai_vision_backend", return_value=(None, None)), \
+             patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._try_codex", return_value=(None, None)), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = get_vision_auxiliary_client()
         assert client is not None  # Custom endpoint picked up as fallback
@@ -838,8 +874,8 @@ class TestAuxiliaryPoolAwareness:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
-             patch("agent.auxiliary_client._read_codex_access_token", return_value=None), \
-             patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
+             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
+             patch("agent.auxiliary_client._try_codex", return_value=(None, None)):
             client, model = get_vision_auxiliary_client()
         assert client is None
         assert model is None
@@ -980,6 +1016,7 @@ class TestResolveForcedProvider:
 
     def test_forced_main_falls_to_codex(self, codex_auth_dir, monkeypatch):
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
+             patch("agent.auxiliary_client._try_custom_endpoint", return_value=(None, None)), \
              patch("agent.auxiliary_client.OpenAI"):
             client, model = _resolve_forced_provider("main")
         from agent.auxiliary_client import CodexAuxiliaryClient

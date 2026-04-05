@@ -15,13 +15,8 @@ Resolution order for text tasks (auto mode):
   7. None
 
 Resolution order for vision/multimodal tasks (auto mode):
-  1. Selected main provider, if it is one of the supported vision backends below
-  2. OpenRouter
-  3. Nous Portal
-  4. Codex OAuth (gpt-5.3-codex supports vision via Responses API)
-  5. Native Anthropic
-  6. Custom endpoint (for local vision models: Qwen-VL, LLaVA, Pixtral, etc.)
-  7. None
+  1. MiniMax VLM — directly calls /v1/coding_plan/vlm (the only working path)
+  2. None — all other providers were broken via httpx/OpenAI SDK
 
 Per-task provider overrides (e.g. AUXILIARY_VISION_PROVIDER,
 CONTEXT_COMPRESSION_PROVIDER) can force a specific provider for each task.
@@ -641,22 +636,24 @@ def _get_auxiliary_env_override(task: str, suffix: str) -> Optional[str]:
 
 
 def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
+    # Respect AUXILIARY_VISION_MODEL env var so config.yaml can control the model
+    or_model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or _OPENROUTER_MODEL
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         or_key = _pool_runtime_api_key(entry)
         if not or_key:
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
-        logger.debug("Auxiliary client: OpenRouter via pool")
+        logger.debug("Auxiliary client: OpenRouter via pool (%s)", or_model)
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                       default_headers=_OR_HEADERS), or_model
 
     or_key = os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         return None, None
-    logger.debug("Auxiliary client: OpenRouter")
+    logger.debug("Auxiliary client: OpenRouter (%s)", or_model)
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+                   default_headers=_OR_HEADERS), or_model
 
 
 def _try_nous() -> Tuple[Optional[OpenAI], Optional[str]]:
@@ -1158,11 +1155,7 @@ def get_async_text_auxiliary_client(task: str = ""):
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
-    "openrouter",
-    "nous",
-    "openai-codex",
-    "anthropic",
-    "custom",
+    "minimax",
 )
 
 
@@ -1177,6 +1170,10 @@ def _normalize_vision_provider(provider: Optional[str]) -> str:
 
 def _resolve_strict_vision_backend(provider: str) -> Tuple[Optional[Any], Optional[str]]:
     provider = _normalize_vision_provider(provider)
+    if provider == "minimax":
+        return _resolve_minimax_vision_backend()
+    if provider == "zai":
+        return _resolve_zai_vision_backend()
     if provider == "openrouter":
         return _try_openrouter()
     if provider == "nous":
@@ -1192,6 +1189,55 @@ def _resolve_strict_vision_backend(provider: str) -> Tuple[Optional[Any], Option
 
 def _strict_vision_backend_available(provider: str) -> bool:
     return _resolve_strict_vision_backend(provider)[0] is not None
+
+
+def _resolve_minimax_vision_backend() -> Tuple[Optional[Any], Optional[str]]:
+    """MiniMax vision route via OpenAI-compatible /anthropic endpoint.
+
+    MiniMax M2.5/M2.7 support vision via the OpenAI-compatible /anthropic
+    endpoint. The portal key is authorized for these endpoints.
+    """
+    try:
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+    except ImportError:
+        return None, None
+
+    creds = resolve_api_key_provider_credentials("minimax")
+    api_key = str(creds.get("api_key", "")).strip()
+    base_url = str(creds.get("base_url", "")).strip().rstrip("/")
+    if not api_key or not base_url:
+        logger.debug("Auxiliary vision: MiniMax has no api_key or base_url")
+        return None, None
+
+    # MiniMax portal /anthropic endpoint supports OpenAI-style vision requests
+    model = os.getenv("MINIMAX_VISION_MODEL", "").strip() or "MiniMax-M2.7"
+    logger.debug("Auxiliary vision: MiniMax via %s (%s)", base_url, model)
+    return OpenAI(api_key=api_key, base_url=base_url), model
+
+
+def _resolve_zai_vision_backend() -> Tuple[Optional[Any], Optional[str]]:
+    """Z.AI vision route using GLM-4 Vision via the coding endpoint.
+
+    Tries the detected/resolved base URL (from ZAI_BASE_URL env or
+    the auto-detected coding endpoint) and constructs an OpenAI-compatible
+    client for GLM vision models.
+    """
+    try:
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+    except ImportError:
+        return None, None
+
+    creds = resolve_api_key_provider_credentials("zai")
+    api_key = str(creds.get("api_key", "")).strip()
+    base_url = str(creds.get("base_url", "")).strip().rstrip("/")
+    if not api_key or not base_url:
+        logger.debug("Auxiliary vision: Z.AI has no api_key or base_url")
+        return None, None
+
+    # Use GLM-4V if available, fall back to glm-4-flash for compatibility
+    model = os.getenv("ZAI_VISION_MODEL", "").strip() or "glm-4v"
+    logger.debug("Auxiliary vision: Z.AI via %s (%s)", base_url, model)
+    return OpenAI(api_key=api_key, base_url=base_url), model
 
 
 def _preferred_main_vision_provider() -> Optional[str]:

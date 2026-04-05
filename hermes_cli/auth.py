@@ -28,6 +28,30 @@ import threading
 import time
 import uuid
 import webbrowser
+
+try:
+    from dotenv import load_dotenv
+    _HAS_DOTENV = True
+except ImportError:
+    _HAS_DOTENV = False
+
+# Lazy-load .env once per process
+_env_loaded = False
+
+
+def _ensure_hermes_dotenv() -> None:
+    """Load ~/.hermes/.env if not already loaded."""
+    global _env_loaded
+    if _env_loaded or not _HAS_DOTENV:
+        return
+    # auth.py lives at ~/.hermes/hermes-agent/hermes_cli/auth.py
+    # We need to go up 3 levels to reach ~/.hermes/
+    import pathlib
+    config_dir = pathlib.Path(__file__).resolve().parent.parent.parent
+    env_path = config_dir / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+    _env_loaded = True
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -129,7 +153,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         id="zai",
         name="Z.AI / GLM",
         auth_type="api_key",
-        inference_base_url="https://api.z.ai/api/paas/v4",
+        inference_base_url="https://api.z.ai/api/coding/paas/v4",
         api_key_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
         base_url_env_var="GLM_BASE_URL",
     ),
@@ -317,6 +341,7 @@ def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
+    _ensure_hermes_dotenv()
     if provider_id == "copilot":
         # Use the dedicated copilot auth module for proper token validation
         try:
@@ -348,7 +373,7 @@ def _resolve_api_key_provider_secret(
 
 ZAI_ENDPOINTS = [
     # (id, base_url, default_model, label)
-    ("global",        "https://api.z.ai/api/paas/v4",        "glm-5",   "Global"),
+    ("global",        "https://api.z.ai/api/coding/paas/v4",        "glm-5",   "Global"),
     ("cn",            "https://open.bigmodel.cn/api/paas/v4", "glm-5",   "China"),
     ("coding-global", "https://api.z.ai/api/coding/paas/v4",  "glm-4.7", "Global (Coding Plan)"),
     ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", "glm-4.7", "China (Coding Plan)"),
