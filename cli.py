@@ -936,12 +936,13 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
 
 
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
-    """Remove a worktree and its branch on exit.
+    """Safely remove a temporary worktree and local branch on exit.
 
-    Preserves the worktree only if it has unpushed commits (real work
-    that hasn't been pushed to any remote).  Uncommitted changes alone
-    (untracked files, test artifacts) are not enough to keep it — agent
-    work lives in commits/PRs, not the working tree.
+    Cleanup is intentionally conservative.  Canonical repo files are never
+    touched, dirty worktrees are preserved, commits must already be reachable
+    from a remote, and the local branch is deleted only with ``git branch -d``
+    after the commit is merged to ``origin/main``/``main``.  ``-D`` and forced
+    worktree removal require explicit human action outside this helper.
     """
     global _active_worktree
     info = info or _active_worktree
@@ -954,46 +955,114 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     branch = info["branch"]
     repo_root = info["repo_root"]
 
+    def _keep(reason: str, detail: str = "") -> None:
+        print(f"\n\033[33m⚠ Keeping worktree ({reason}): {wt_path}\033[0m")
+        if detail:
+            print(f"  {detail}")
+        print("  Safe cleanup after review/merge:")
+        print(f"    git -C {repo_root} worktree remove {wt_path}")
+        print(f"    git -C {repo_root} branch -d {branch}")
+
     if not Path(wt_path).exists():
         return
 
-    # Check for unpushed commits — commits reachable from HEAD but not
-    # from any remote branch.  These represent real work the agent did
-    # but didn't push.
-    has_unpushed = False
+    # Never delete uncommitted work.  Even untracked files may contain useful
+    # task artifacts; a human can inspect or discard them explicitly.
     try:
-        result = subprocess.run(
-            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
             capture_output=True, text=True, timeout=10, cwd=wt_path,
         )
-        has_unpushed = bool(result.stdout.strip())
-    except Exception:
-        has_unpushed = True  # Assume unpushed on error — don't delete
-
-    if has_unpushed:
-        print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
-        print(f"  To clean up manually: git worktree remove --force {wt_path}")
+        if status.returncode != 0:
+            _keep("status check failed", status.stderr.strip())
+            _active_worktree = None
+            return
+        if status.stdout.strip():
+            _keep("uncommitted changes present")
+            _active_worktree = None
+            return
+    except Exception as e:
+        logger.debug("Failed to check worktree status: %s", e)
+        _keep("status check errored", str(e))
         _active_worktree = None
         return
 
-    # Remove worktree (even if working tree is dirty — uncommitted
-    # changes without unpushed commits are just artifacts)
+    # Check for commits reachable from HEAD but from no remote branch.
     try:
-        subprocess.run(
-            ["git", "worktree", "remove", wt_path, "--force"],
+        unpushed = subprocess.run(
+            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+            capture_output=True, text=True, timeout=10, cwd=wt_path,
+        )
+        if unpushed.returncode != 0:
+            _keep("remote reachability check failed", unpushed.stderr.strip())
+            _active_worktree = None
+            return
+        if unpushed.stdout.strip():
+            _keep("unpushed commits present")
+            _active_worktree = None
+            return
+    except Exception as e:
+        logger.debug("Failed to check remote reachability: %s", e)
+        _keep("remote reachability check errored", str(e))
+        _active_worktree = None
+        return
+
+    # Do not prune a pushed-but-unmerged task branch just because GitHub has it.
+    # Keep it until the commit is on main (or the human explicitly deletes it).
+    merged_to_main = False
+    for main_ref in ("origin/main", "main"):
+        try:
+            result = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", "HEAD", main_ref],
+                capture_output=True, text=True, timeout=10, cwd=wt_path,
+            )
+            if result.returncode == 0:
+                merged_to_main = True
+                break
+        except Exception as e:
+            logger.debug("Failed to check merge ancestry against %s: %s", main_ref, e)
+    if not merged_to_main:
+        remote_refs = subprocess.run(
+            ["git", "branch", "-r", "--contains", "HEAD"],
+            capture_output=True, text=True, timeout=10, cwd=wt_path,
+        )
+        detail = remote_refs.stdout.strip() if remote_refs.returncode == 0 else ""
+        _keep("remote commit is not merged to main", detail)
+        _active_worktree = None
+        return
+
+    try:
+        removed = subprocess.run(
+            ["git", "worktree", "remove", wt_path],
             capture_output=True, text=True, timeout=15, cwd=repo_root,
         )
+        if removed.returncode != 0:
+            _keep("git worktree remove refused", removed.stderr.strip())
+            _active_worktree = None
+            return
     except Exception as e:
         logger.debug("Failed to remove worktree: %s", e)
+        _keep("worktree removal errored", str(e))
+        _active_worktree = None
+        return
 
-    # Delete the branch
     try:
-        subprocess.run(
-            ["git", "branch", "-D", branch],
+        deleted = subprocess.run(
+            ["git", "branch", "-d", branch],
             capture_output=True, text=True, timeout=10, cwd=repo_root,
         )
+        if deleted.returncode != 0:
+            print(
+                f"\033[33m⚠ Worktree removed, but local branch kept ({branch}): "
+                f"{deleted.stderr.strip()}\033[0m"
+            )
+            _active_worktree = None
+            return
     except Exception as e:
         logger.debug("Failed to delete branch %s: %s", branch, e)
+        print(f"\033[33m⚠ Worktree removed, but branch cleanup errored: {e}\033[0m")
+        _active_worktree = None
+        return
 
     _active_worktree = None
     print(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")

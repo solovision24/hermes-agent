@@ -90,8 +90,8 @@ def _setup_worktree(repo_root):
 def _cleanup_worktree(info):
     """Test version of _cleanup_worktree.
 
-    Preserves the worktree only if it has unpushed commits.
-    Dirty working tree alone is not enough to keep it.
+    Removes only clean worktrees whose HEAD is reachable from a remote and
+    already merged to main. Uses non-forced removal and ``git branch -d``.
     """
     wt_path = info["path"]
     branch = info["branch"]
@@ -100,25 +100,43 @@ def _cleanup_worktree(info):
     if not Path(wt_path).exists():
         return
 
-    # Check for unpushed commits
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True, timeout=10, cwd=wt_path,
+    )
+    if status.returncode != 0 or status.stdout.strip():
+        return False
+
     result = subprocess.run(
         ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
         capture_output=True, text=True, timeout=10, cwd=wt_path,
     )
-    has_unpushed = bool(result.stdout.strip())
+    if result.returncode != 0 or result.stdout.strip():
+        return False
 
-    if has_unpushed:
-        return False  # Did not clean up — has unpushed commits
+    merged_to_main = False
+    for main_ref in ("origin/main", "main"):
+        merged = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", main_ref],
+            capture_output=True, text=True, timeout=10, cwd=wt_path,
+        )
+        if merged.returncode == 0:
+            merged_to_main = True
+            break
+    if not merged_to_main:
+        return False
 
-    subprocess.run(
-        ["git", "worktree", "remove", wt_path, "--force"],
+    removed = subprocess.run(
+        ["git", "worktree", "remove", wt_path],
         capture_output=True, text=True, timeout=15, cwd=repo_root,
     )
-    subprocess.run(
-        ["git", "branch", "-D", branch],
+    if removed.returncode != 0:
+        return False
+    deleted = subprocess.run(
+        ["git", "branch", "-d", branch],
         capture_output=True, text=True, timeout=10, cwd=repo_root,
     )
-    return True  # Cleaned up
+    return deleted.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -215,13 +233,8 @@ class TestWorktreeCleanup:
         assert result is True
         assert not Path(info["path"]).exists()
 
-    def test_dirty_worktree_cleaned_when_no_unpushed(self, git_repo):
-        """Dirty working tree without unpushed commits is cleaned up.
-
-        Agent sessions typically leave untracked files / artifacts behind.
-        Since all real work is in pushed commits, these don't warrant
-        keeping the worktree.
-        """
+    def test_dirty_worktree_kept_even_when_no_unpushed(self, git_repo):
+        """Dirty working tree without unpushed commits is still preserved."""
         info = _setup_worktree(str(git_repo))
         assert info is not None
 
@@ -232,11 +245,29 @@ class TestWorktreeCleanup:
             cwd=info["path"], capture_output=True,
         )
 
-        # The git_repo fixture already has a fake remote ref so the initial
-        # commit is seen as "pushed".  No unpushed commits → cleanup proceeds.
         result = _cleanup_worktree(info)
-        assert result is True  # Cleaned up despite dirty working tree
-        assert not Path(info["path"]).exists()
+        assert result is False
+        assert Path(info["path"]).exists()
+
+    def test_pushed_but_unmerged_worktree_kept(self, git_repo):
+        """A remotely reachable task commit is preserved until it merges to main."""
+        info = _setup_worktree(str(git_repo))
+        assert info is not None
+
+        (Path(info["path"]) / "work.txt").write_text("real work")
+        subprocess.run(["git", "add", "work.txt"], cwd=info["path"], capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "agent work"],
+            cwd=info["path"], capture_output=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", f"refs/remotes/origin/{info['branch']}", "HEAD"],
+            cwd=info["path"], capture_output=True,
+        )
+
+        result = _cleanup_worktree(info)
+        assert result is False
+        assert Path(info["path"]).exists()
 
     def test_worktree_with_unpushed_commits_kept(self, git_repo):
         """Worktree with unpushed commits is preserved."""

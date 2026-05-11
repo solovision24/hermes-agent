@@ -17,6 +17,10 @@ def git_repo(tmp_path):
     (repo / "README.md").write_text("# Test Repo\n")
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+        cwd=repo, check=True, capture_output=True,
+    )
     return repo
 
 
@@ -126,5 +130,58 @@ class TestWorktreeIncludeSecurity:
             linked_dir = Path(info["path"]) / ".venv"
             assert linked_dir.is_symlink()
             assert (linked_dir / "lib" / "marker.txt").read_text() == "venv marker"
+        finally:
+            _force_remove_worktree(info)
+
+
+class TestRealWorktreeCleanupSafety:
+    def test_real_cleanup_removes_only_clean_merged_worktree(self, git_repo):
+        import cli as cli_mod
+
+        info = cli_mod._setup_worktree(str(git_repo))
+        assert info is not None
+        cli_mod._cleanup_worktree(info)
+
+        assert not Path(info["path"]).exists()
+        branch_list = subprocess.run(
+            ["git", "branch", "--list", info["branch"]],
+            cwd=git_repo, check=True, capture_output=True, text=True,
+        )
+        assert info["branch"] not in branch_list.stdout
+
+    def test_real_cleanup_keeps_dirty_worktree(self, git_repo):
+        import cli as cli_mod
+
+        info = cli_mod._setup_worktree(str(git_repo))
+        assert info is not None
+        try:
+            (Path(info["path"]) / "artifact.txt").write_text("keep me")
+            cli_mod._cleanup_worktree(info)
+            assert Path(info["path"]).exists()
+        finally:
+            _force_remove_worktree(info)
+
+    def test_real_cleanup_keeps_pushed_unmerged_worktree(self, git_repo):
+        import cli as cli_mod
+
+        info = cli_mod._setup_worktree(str(git_repo))
+        assert info is not None
+        try:
+            (Path(info["path"]) / "work.txt").write_text("real work")
+            subprocess.run(
+                ["git", "add", "work.txt"],
+                cwd=info["path"], check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "agent work"],
+                cwd=info["path"], check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "update-ref", f"refs/remotes/origin/{info['branch']}", "HEAD"],
+                cwd=info["path"], check=True, capture_output=True,
+            )
+
+            cli_mod._cleanup_worktree(info)
+            assert Path(info["path"]).exists()
         finally:
             _force_remove_worktree(info)

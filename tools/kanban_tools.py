@@ -782,7 +782,9 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    "\"cleanup_status\": \"pending|skipped|done\", "
+                    "\"cleanup_reason\": \"...\", \"worktree_path\": \"...\", "
+                    "\"branch\": \"...\", \"findings\": [...]}. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
             },

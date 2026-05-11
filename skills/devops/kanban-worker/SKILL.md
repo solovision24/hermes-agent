@@ -21,7 +21,7 @@ Your workspace kind determines how you should behave inside `$HERMES_KANBAN_WORK
 |---|---|---|
 | `scratch` | Fresh tmp dir, yours alone | Read/write freely; it gets GC'd when the task is archived. |
 | `dir:<path>` | Shared persistent directory | Other runs will read what you write. Treat it like long-lived state. Path is guaranteed absolute (the kernel rejects relative paths). |
-| `worktree` | Git worktree at the resolved path | If `.git` doesn't exist, run `git worktree add <path> <branch>` from the main repo first, then cd and work normally. Commit work here. |
+| `worktree` | Git worktree at the resolved path | If `.git` doesn't exist, run `git worktree add <path> <branch>` from the main repo first, then cd and work normally. Commit work here. On completion/finalization, report `cleanup_status`, `cleanup_reason`, `worktree_path`, and `branch`; do not remove the worktree until it is clean, inactive, remotely verified, and merged/preserved. |
 
 ## Tenant isolation
 
@@ -42,6 +42,10 @@ kanban_complete(
         "changed_files": ["rate_limiter.py", "tests/test_rate_limiter.py"],
         "tests_run": 14,
         "tests_passed": 14,
+        "cleanup_status": "pending",
+        "cleanup_reason": "review-required; remove worktree/local branch only after PR is merged or explicitly closed/parked",
+        "worktree_path": "/path/to/worktree",
+        "branch": "agent/rate-limiter",
         "decisions": ["user_id primary, IP fallback for unauthenticated requests"],
     },
 )
@@ -60,6 +64,10 @@ kanban_comment(
         "tests_run": 14,
         "tests_passed": 14,
         "diff_path": "/path/to/worktree",  # or PR url if pushed
+        "cleanup_status": "pending",
+        "cleanup_reason": "review-required; worktree/branch kept until PR is merged/closed or explicitly parked",
+        "worktree_path": "/path/to/worktree",
+        "branch": "agent/rate-limiter",
         "decisions": ["user_id primary, IP fallback for unauthenticated requests"],
     }, indent=2),
 )
