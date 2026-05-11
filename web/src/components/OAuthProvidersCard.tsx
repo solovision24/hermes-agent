@@ -140,15 +140,15 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
             return (
               <div
                 key={p.id}
-                className="flex items-center justify-between gap-4 py-3"
+                className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4"
               >
-                <div className="flex items-start gap-3 min-w-0 flex-1">
+                <div className="flex min-w-0 flex-1 items-start gap-3">
                   {p.status.logged_in ? (
                     <ShieldCheck className="h-5 w-5 text-success shrink-0 mt-0.5" />
                   ) : (
                     <ShieldOff className="h-5 w-5 text-muted-foreground shrink-0 mt-0.5" />
                   )}
-                  <div className="flex flex-col min-w-0 gap-0.5">
+                  <div className="flex min-w-0 flex-col gap-0.5">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-medium text-sm">{p.name}</span>
                       <Badge
@@ -174,7 +174,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                       )}
                     </div>
                     {p.status.logged_in && p.status.token_preview && (
-                      <code className="text-xs font-mono-ui truncate">
+                      <code className="max-w-full break-all text-xs font-mono-ui">
                         <span className="opacity-50">token </span>
                         {p.status.token_preview}
                         {p.status.source_label && (
@@ -202,7 +202,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1.5 shrink-0">
+                <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
                   {p.docs_url && (
                     <a
                       href={p.docs_url}

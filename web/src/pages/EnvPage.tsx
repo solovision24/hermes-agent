@@ -132,16 +132,16 @@ function EnvVarRow({
   // Compact inline row for unset, non-editing keys (used inside provider groups)
   if (compact && !info.is_set && !isEditing) {
     return (
-      <div className="flex items-center justify-between gap-3 py-1.5 opacity-50 hover:opacity-100 transition-opacity">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="font-mono-ui text-[0.7rem] text-muted-foreground">
+      <div className="flex flex-col gap-2 py-1.5 opacity-50 transition-opacity hover:opacity-100 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+          <span className="break-all font-mono-ui text-[0.7rem] text-muted-foreground">
             {varKey}
           </span>
           <span className="text-[0.65rem] text-muted-foreground/60 truncate hidden sm:block">
             {info.description}
           </span>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
           {info.url && (
             <a
               href={info.url}
@@ -168,16 +168,16 @@ function EnvVarRow({
   // Non-compact unset row
   if (!info.is_set && !isEditing) {
     return (
-      <div className="flex items-center justify-between gap-3 border border-border/50 px-4 py-2.5 opacity-60 hover:opacity-100 transition-opacity">
-        <div className="flex items-center gap-3 min-w-0">
-          <Label className="font-mono-ui text-[0.7rem] text-muted-foreground">
+      <div className="flex flex-col gap-2 border border-border/50 px-4 py-2.5 opacity-60 transition-opacity hover:opacity-100 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-3">
+          <Label className="break-all font-mono-ui text-[0.7rem] text-muted-foreground">
             {varKey}
           </Label>
           <span className="text-[0.65rem] text-muted-foreground/60 truncate hidden sm:block">
             {info.description}
           </span>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
           {info.url && (
             <a
               href={info.url}
@@ -203,10 +203,10 @@ function EnvVarRow({
 
   // Full expanded row for set keys or keys being edited
   return (
-    <div className="grid gap-2 border border-border p-4">
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="flex items-center gap-2">
-          <Label className="font-mono-ui text-[0.7rem]">{varKey}</Label>
+    <div className="grid min-w-0 gap-2 border border-border p-4">
+      <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <Label className="break-all font-mono-ui text-[0.7rem]">{varKey}</Label>
           <Badge tone={info.is_set ? "success" : "outline"}>
             {info.is_set ? t.common.set : t.env.notSet}
           </Badge>
@@ -223,7 +223,7 @@ function EnvVarRow({
         )}
       </div>
 
-      <p className="text-xs text-muted-foreground">{info.description}</p>
+      <p className="break-words text-xs text-muted-foreground">{info.description}</p>
 
       {info.tools.length > 0 && (
         <div className="flex flex-wrap gap-1">
@@ -240,9 +240,9 @@ function EnvVarRow({
       )}
 
       {!isEditing && (
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div
-            className={`flex-1 border border-border px-3 py-2 font-mono-ui text-xs ${
+            className={`min-w-0 flex-1 overflow-x-auto break-all border border-border px-3 py-2 font-mono-ui text-xs ${
               isRevealed
                 ? "bg-background text-foreground select-all"
                 : "bg-muted/30 text-muted-foreground"
@@ -288,7 +288,7 @@ function EnvVarRow({
       )}
 
       {isEditing && (
-        <div className="flex items-center gap-2">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           <Input
             autoFocus
             type="text"
@@ -304,7 +304,7 @@ function EnvVarRow({
                   )
                 : t.env.enterValue
             }
-            className="flex-1 font-mono-ui text-xs"
+            className="w-full min-w-0 flex-1 font-mono-ui text-xs"
           />
           <Button
             size="sm"
@@ -383,15 +383,15 @@ function ProviderGroupCard({
       <ListItem
         onClick={() => setExpanded(!expanded)}
         aria-expanded={expanded}
-        className="justify-between gap-3 px-4 py-3 hover:bg-primary/5"
+        className="min-w-0 flex-wrap justify-between gap-3 px-4 py-3 hover:bg-primary/5"
       >
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex min-w-0 flex-wrap items-center gap-3">
           {expanded ? (
             <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
           ) : (
             <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
           )}
-          <span className="font-semibold text-sm tracking-wide">
+          <span className="min-w-0 break-words font-semibold text-sm tracking-wide">
             {group.name === "Other" ? t.common.other : group.name}
           </span>
           {hasAnyConfigured && (
@@ -400,7 +400,7 @@ function ProviderGroupCard({
             </Badge>
           )}
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 sm:shrink-0">
           {keyUrl && (
             <a
               href={keyUrl}
@@ -683,8 +683,8 @@ export default function EnvPage() {
         loading={keyClear.isDeleting}
       />
 
-      <div className="flex items-center justify-between">
-        <div className="flex flex-col gap-1">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 flex-col gap-1">
           <p className="text-sm text-muted-foreground">
             {t.env.description} <code>~/.hermes/.env</code>
           </p>
@@ -810,7 +810,6 @@ export default function EnvPage() {
 /* ------------------------------------------------------------------ */
 
 function CollapsibleUnset({
-  category: _category,
   unsetEntries,
   edits,
   setEdits,

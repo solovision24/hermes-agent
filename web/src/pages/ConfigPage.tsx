@@ -404,14 +404,14 @@ export default function ConfigPage() {
       <PluginSlot name="config:top" />
       <Toast toast={toast} />
 
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2">
-          <Settings2 className="h-4 w-4 text-muted-foreground" />
-          <code className="text-xs text-muted-foreground bg-muted/50 px-2 py-0.5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+        <div className="flex min-w-0 items-center gap-2">
+          <Settings2 className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <code className="min-w-0 truncate text-xs text-muted-foreground bg-muted/50 px-2 py-0.5">
             {t.config.configPath}
           </code>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex max-w-full flex-wrap items-center justify-end gap-1.5">
           <Button
             ghost
             size="icon"
@@ -531,7 +531,7 @@ export default function ConfigPage() {
                   {t.config.sections}
                 </div>
 
-                <div className="flex sm:flex-col gap-1 sm:gap-px p-2 sm:pt-1 overflow-x-auto sm:overflow-x-visible scrollbar-none sm:max-h-[calc(100vh-260px)] sm:overflow-y-auto">
+                <div className="flex max-w-full flex-wrap gap-1 overflow-hidden p-2 sm:max-h-[calc(100vh-260px)] sm:flex-col sm:flex-nowrap sm:gap-px sm:overflow-x-visible sm:overflow-y-auto sm:pt-1">
                   {categories.map((cat) => {
                     const isActive = !isSearching && activeCategory === cat;
 
@@ -543,7 +543,7 @@ export default function ConfigPage() {
                           setSearchQuery("");
                           setActiveCategory(cat);
                         }}
-                        className="rounded-sm whitespace-nowrap px-2 py-1 text-[11px]"
+                        className="max-w-full min-w-0 rounded-sm whitespace-nowrap px-2 py-1 text-[11px]"
                       >
                         <CategoryIcon
                           category={cat}

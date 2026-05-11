@@ -150,44 +150,52 @@ export default function LogsPage() {
       <div
         role="toolbar"
         aria-label={t.logs.title}
-        className="flex flex-wrap items-center gap-x-6 gap-y-2"
+        className="flex max-w-full flex-wrap items-center gap-x-6 gap-y-2 overflow-hidden"
       >
-        <FilterGroup label={t.logs.file}>
-          <Segmented
-            value={file}
-            onChange={setFile}
-            options={toOptions(FILES)}
-          />
-        </FilterGroup>
+        <div className="max-w-full overflow-hidden pb-1 [&_.inline-flex]:flex-wrap [&>div]:flex-wrap">
+          <FilterGroup label={t.logs.file}>
+            <Segmented
+              value={file}
+              onChange={setFile}
+              options={toOptions(FILES)}
+            />
+          </FilterGroup>
+        </div>
 
-        <FilterGroup label={t.logs.level}>
-          <Segmented
-            value={level}
-            onChange={setLevel}
-            options={toOptions(LEVELS)}
-          />
-        </FilterGroup>
+        <div className="max-w-full overflow-hidden pb-1 [&_.inline-flex]:flex-wrap [&>div]:flex-wrap">
+          <FilterGroup label={t.logs.level}>
+            <Segmented
+              value={level}
+              onChange={setLevel}
+              options={toOptions(LEVELS)}
+            />
+          </FilterGroup>
+        </div>
 
-        <FilterGroup label={t.logs.component}>
-          <Segmented
-            value={component}
-            onChange={setComponent}
-            options={toOptions(COMPONENTS)}
-          />
-        </FilterGroup>
+        <div className="max-w-full overflow-hidden pb-1 [&_.inline-flex]:flex-wrap [&>div]:flex-wrap">
+          <FilterGroup label={t.logs.component}>
+            <Segmented
+              value={component}
+              onChange={setComponent}
+              options={toOptions(COMPONENTS)}
+            />
+          </FilterGroup>
+        </div>
 
-        <FilterGroup label={t.logs.lines}>
-          <Segmented
-            value={String(lineCount)}
-            onChange={(v) =>
-              setLineCount(Number(v) as (typeof LINE_COUNTS)[number])
-            }
-            options={LINE_COUNTS.map((n) => ({
-              value: String(n),
-              label: String(n),
-            }))}
-          />
-        </FilterGroup>
+        <div className="max-w-full overflow-hidden pb-1 [&_.inline-flex]:flex-wrap [&>div]:flex-wrap">
+          <FilterGroup label={t.logs.lines}>
+            <Segmented
+              value={String(lineCount)}
+              onChange={(v) =>
+                setLineCount(Number(v) as (typeof LINE_COUNTS)[number])
+              }
+              options={LINE_COUNTS.map((n) => ({
+                value: String(n),
+                label: String(n),
+              }))}
+            />
+          </FilterGroup>
+        </div>
       </div>
 
       <Card>
