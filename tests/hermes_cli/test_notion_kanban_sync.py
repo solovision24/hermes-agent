@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
 import pytest
 
 from hermes_cli import kanban_db as kb
@@ -53,7 +54,12 @@ class FakeNotion(sync.NotionClient):
         self.updated.append((page_id, properties))
 
     def create_page_for_hermes_task(self, task, *, schema):
-        raise AssertionError("not expected")
+        page_id = f"created-{task.id}"
+        page = notion_page(page_id, task.title, sync.hermes_status_to_notion(task.status), hermes_task_id=task.id)
+        page["properties"]["Source"] = {"type": "rich_text", "rich_text": [{"plain_text": f"Hermes Kanban sync: {task.id}"}]}
+        self.created_pages.append(page)
+        self.pages.append(page)
+        return page
 
     def append_activity(self, page_id, text):
         self.activity.append((page_id, text))
@@ -91,7 +97,7 @@ def test_new_notion_running_imports_as_ready_not_ghost_running(kanban_home, tmp_
     notion = FakeNotion([notion_page("page-running", "import me", "Running")])
     engine = sync.NotionKanbanSync(notion=notion, report_dir=tmp_path / "reports", state_path=tmp_path / "state.json")
 
-    stats, _ = engine.run_once(dry_run=False, max_creates=5)
+    stats, _ = engine.run_once(dry_run=False, max_creates=5, sync_mode="two_way")
 
     assert stats.hermes_tasks_created == 1
     with kb.connect() as conn:
@@ -115,7 +121,7 @@ def test_existing_task_ignores_notion_running_transition(kanban_home, tmp_path):
     notion = FakeNotion([notion_page("page-paired", "paired", "Running", hermes_task_id=task_id)])
     engine = sync.NotionKanbanSync(notion=notion, report_dir=tmp_path / "reports", state_path=tmp_path / "state.json")
 
-    stats, _ = engine.run_once(dry_run=False)
+    stats, _ = engine.run_once(dry_run=False, sync_mode="two_way")
 
     assert stats.conflicts == 1
     with kb.connect() as conn:
@@ -139,7 +145,7 @@ def test_new_notion_task_with_invalid_assigned_agent_imports_to_triage_without_a
         state_path=tmp_path / "state.json",
     )
 
-    stats, _ = engine.run_once(dry_run=False, max_creates=5)
+    stats, _ = engine.run_once(dry_run=False, max_creates=5, sync_mode="two_way")
 
     assert stats.hermes_tasks_created == 1
     assert stats.conflicts == 1
@@ -177,7 +183,7 @@ def test_existing_task_ignores_invalid_notion_assigned_agent(kanban_home, tmp_pa
         state_path=tmp_path / "state.json",
     )
 
-    stats, _ = engine.run_once(dry_run=False)
+    stats, _ = engine.run_once(dry_run=False, sync_mode="two_way")
 
     assert stats.conflicts == 1
     with kb.connect() as conn:
@@ -189,3 +195,65 @@ def test_existing_task_ignores_invalid_notion_assigned_agent(kanban_home, tmp_pa
     props = notion.updated[-1][1]
     sync_error = props["Sync Error"]["rich_text"][0]["text"]["content"]
     assert "kept Hermes assignee 'dev'" in sync_error
+
+
+def test_default_mode_is_outbound_only_and_refuses_notion_import(kanban_home, tmp_path):
+    notion = FakeNotion([notion_page("page-new", "do not import", "Ready")])
+    engine = sync.NotionKanbanSync(notion=notion, report_dir=tmp_path / "reports", state_path=tmp_path / "state.json")
+
+    stats, report_path = engine.run_once(dry_run=False)
+
+    assert stats.hermes_tasks_created == 0
+    assert stats.notion_to_hermes_updates == 0
+    with kb.connect() as conn:
+        assert kb.list_tasks(conn, include_archived=True) == []
+    payload = json.loads(report_path.read_text())
+    assert payload["sync_mode"] == "outbound_only"
+    assert payload["outbound_only"] is True
+
+
+def test_outbound_only_dry_run_reports_no_inbound_mutation(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dry-run mirror", assignee="dev")
+    notion = FakeNotion([notion_page("page-new", "do not import", "Ready")])
+    engine = sync.NotionKanbanSync(notion=notion, report_dir=tmp_path / "reports", state_path=tmp_path / "state.json")
+
+    stats, report_path = engine.run_once(dry_run=True, sync_mode="outbound_only", hermes_task_ids={task_id})
+
+    assert stats.hermes_tasks_created == 0
+    assert stats.notion_to_hermes_updates == 0
+    assert stats.notion_pages_would_create == 1
+    assert stats.hermes_to_notion_would_update == 1
+    payload = json.loads(report_path.read_text())
+    assert payload["sync_mode"] == "outbound_only"
+    assert payload["outbound_only"] is True
+    assert payload["stats"]["hermes_tasks_created"] == 0
+    assert payload["stats"]["notion_to_hermes_updates"] == 0
+
+
+def test_outbound_only_still_creates_notion_pages_for_hermes_tasks(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="mirror me", assignee="dev")
+    notion = FakeNotion([])
+    engine = sync.NotionKanbanSync(notion=notion, report_dir=tmp_path / "reports", state_path=tmp_path / "state.json")
+
+    stats, _ = engine.run_once(dry_run=False, sync_mode="outbound_only", hermes_task_ids={task_id})
+
+    assert stats.hermes_tasks_created == 0
+    assert stats.notion_to_hermes_updates == 0
+    assert stats.notion_pages_created == 1
+    assert stats.hermes_to_notion_updates == 1
+    assert notion.created_pages[0]["properties"]["Hermes Task ID"]["rich_text"][0]["plain_text"] == task_id
+
+
+def test_configured_sync_mode_defaults_outbound_and_requires_explicit_import(monkeypatch):
+    monkeypatch.delenv("HERMES_NOTION_KANBAN_SYNC_MODE", raising=False)
+    monkeypatch.delenv("HERMES_NOTION_KANBAN_ALLOW_INBOUND", raising=False)
+    monkeypatch.setattr(sync, "load_config", lambda: {})
+
+    assert sync.configured_sync_mode() == "outbound_only"
+    assert sync.configured_sync_mode(enable_notion_import=True) == "two_way"
+
+    monkeypatch.setattr(sync, "load_config", lambda: {"notion_kanban_sync": {"mode": "two_way"}})
+    assert sync.configured_sync_mode() == "two_way"
+    assert sync.configured_sync_mode(outbound_only=True) == "outbound_only"

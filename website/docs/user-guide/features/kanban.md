@@ -19,6 +19,20 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
+### Notion Task Board mirrors are outbound-only by default
+
+If you mirror Hermes Kanban into a Notion Task Board, Hermes Kanban remains the source of truth. The bundled Notion sync defaults to `notion_kanban_sync.mode: outbound_only`, which means it may publish Hermes task state to Notion but will not create or update Hermes tasks from Notion rows. This prevents stale Notion rows and scheduled Notion cleanup jobs from spawning duplicate workers or mutating dispatcher-owned runtime state.
+
+To enable Notion → Hermes imports, an operator must opt in explicitly:
+
+```yaml
+# config.yaml
+notion_kanban_sync:
+  mode: two_way      # explicit opt-in; default is outbound_only
+```
+
+One-off runs can also pass `--enable-notion-import` or `--sync-mode two_way`. Automation and cron jobs that discover follow-up work should create/comment/block Hermes Kanban tasks directly (CLI, slash command, dashboard, or `kanban_*` tools) rather than writing new Notion Task Board rows and waiting for sync to import them.
+
 This is the shape that covers the workloads `delegate_task` can't:
 
 - **Research triage** — parallel researchers + analyst + writer, human-in-the-loop.
