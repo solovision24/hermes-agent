@@ -1440,6 +1440,14 @@ DEFAULT_CONFIG = {
     # todos to ready, and fires `hermes -p <assignee> chat -q ...` for
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
+    # Optional SoLoRecall block mirror for Hermes Kanban. Hermes Kanban is the
+    # default source of truth: outbound_only publishes Hermes -> SoLoRecall and
+    # refuses SoLoRecall -> Hermes creates/updates unless an operator explicitly
+    # switches mode to two_way.
+    "solorecall_kanban_sync": {
+        "mode": "outbound_only",
+    },
+
     "kanban": {
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,

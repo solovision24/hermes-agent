@@ -98,6 +98,9 @@ All variables go in `~/.hermes/.env`. You can also set them with `hermes config 
 | `HERMES_KANBAN_BOARD` | Pin the active kanban board for this process. Takes precedence over `~/.hermes/kanban/current`; the dispatcher injects this into worker subprocess env so workers physically cannot see tasks on other boards. Defaults to `default`. Slug validation: lowercase alphanumerics + hyphens + underscores, 1-64 chars |
 | `HERMES_KANBAN_DB` | Pin the kanban database file path directly (highest precedence; beats `HERMES_KANBAN_BOARD` and `HERMES_KANBAN_HOME`). The dispatcher injects this into worker subprocess env so profile workers converge on the dispatcher's board |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | Pin the kanban workspaces root directly (highest precedence for workspaces; beats `HERMES_KANBAN_HOME`). The dispatcher injects this into worker subprocess env |
+| `SOLORECALL_API_KEY` | SoLoRecall API key used by `hermes_cli.solorecall_kanban_sync`. Keep this in `~/.hermes/.env`; do not pass it on the command line |
+| `HERMES_SOLORECALL_KANBAN_SYNC_MODE` | Override the SoLoRecall Kanban mirror mode for `hermes_cli.solorecall_kanban_sync`: `outbound_only` (default; Hermes → SoLoRecall only) or `two_way` (explicitly allow SoLoRecall → Hermes imports/updates) |
+| `HERMES_SOLORECALL_KANBAN_ALLOW_INBOUND` | Legacy/ops escape hatch: when `HERMES_SOLORECALL_KANBAN_SYNC_MODE` is unset, truthy values (`1`, `true`, `yes`, `on`, `two_way`) opt that process into SoLoRecall → Hermes imports. Prefer `solorecall_kanban_sync.mode: two_way` or `--enable-solorecall-import` for durable config |
 
 ## Provider Auth (OAuth)
 

@@ -69,6 +69,31 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+## SoLoRecall mirror
+
+Hermes includes an operational SoLoRecall sink at `hermes_cli.solorecall_kanban_sync`. It mirrors Kanban tasks as SoLoRecall blocks using `SOLORECALL_API_KEY` from `~/.hermes/.env` and writes audit artifacts under `~/.hermes/reports/hermes-solorecall-sync/`.
+
+Safety defaults match the Notion mirror pattern: Hermes Kanban remains the source of truth, `--dry-run` is the default, no hard deletes are performed, and SoLoRecall → Hermes imports/updates are refused unless two-way mode is explicitly enabled.
+
+```bash
+python -m hermes_cli.solorecall_kanban_sync --dry-run
+python -m hermes_cli.solorecall_kanban_sync --apply --limit 25
+python -m hermes_cli.solorecall_kanban_sync --apply --daemon --interval 180
+```
+
+Enable inbound SoLoRecall changes only when intended:
+
+```yaml
+solorecall_kanban_sync:
+  mode: two_way
+```
+
+or for one run:
+
+```bash
+python -m hermes_cli.solorecall_kanban_sync --apply --enable-solorecall-import
+```
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
