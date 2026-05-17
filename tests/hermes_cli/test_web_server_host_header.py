@@ -146,3 +146,61 @@ class TestHostHeaderMiddleware:
         resp = client.get("/api/status")
         # Should get through to the status endpoint, not a 400
         assert resp.status_code != 400
+
+
+def test_start_server_disables_uvicorn_proxy_headers(monkeypatch):
+    """Cloudflare Tunnel sets X-Forwarded-For; the dashboard WebSocket
+    loopback check must see the actual TCP peer (cloudflared on 127.0.0.1),
+    not a uvicorn-rewritten public client IP.
+    """
+    from hermes_cli import web_server
+
+    called = {}
+
+    def fake_run(app, **kwargs):
+        called["app"] = app
+        called.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=9119,
+        open_browser=False,
+        embedded_chat=True,
+    )
+
+    assert called["app"] is web_server.app
+    assert called["host"] == "127.0.0.1"
+    assert called["port"] == 9119
+    assert called["proxy_headers"] is False
+    assert web_server.app.state.bound_host == "127.0.0.1"
+
+
+def test_dashboard_action_waiter_reaps_exited_process_and_preserves_status(tmp_path):
+    """Dashboard-spawned actions must be waited on even if nobody polls.
+
+    Regression coverage for leaked ``[python] <defunct>`` children under
+    ``hermes dashboard``: the waiter should call wait(), close the log fd,
+    remove the live proc handle, and retain the final status for the UI.
+    """
+    import subprocess
+    import sys
+
+    from hermes_cli import web_server
+
+    name = "gateway-restart"
+    proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(7)"])
+    log_file = (tmp_path / "action.log").open("ab")
+
+    web_server._ACTION_PROCS[name] = proc
+    web_server._ACTION_PROC_STATUS[name] = {"pid": proc.pid, "running": True}
+    web_server._watch_hermes_action(name, proc, log_file)
+
+    assert proc.returncode == 7
+    assert name not in web_server._ACTION_PROCS
+    assert web_server._ACTION_PROC_STATUS[name]["running"] is False
+    assert web_server._ACTION_PROC_STATUS[name]["exit_code"] == 7
+    assert web_server._ACTION_PROC_STATUS[name]["pid"] == proc.pid
+    assert "completed_at" in web_server._ACTION_PROC_STATUS[name]
+    assert log_file.closed

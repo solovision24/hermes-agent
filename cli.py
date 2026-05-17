@@ -3827,7 +3827,7 @@ class HermesCLI:
                 resolved_id = self.session_id
             if resolved_id and resolved_id != self.session_id:
                 ChatConsole().print(
-                    f"[{_DIM}]Session {_escape(self.session_id)} was compressed into "
+                    f"[dim]Session {_escape(self.session_id)} was compressed into "
                     f"{_escape(resolved_id)}; resuming the descendant with your "
                     f"transcript.[/]"
                 )

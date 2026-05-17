@@ -1,3 +1,5 @@
+import { buildWebSocketUrl } from "@/lib/api";
+
 /**
  * Browser WebSocket client for the tui_gateway JSON-RPC protocol.
  *
@@ -115,10 +117,7 @@ export class GatewayClient {
       );
     }
 
-    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(
-      `${scheme}//${location.host}/api/ws?token=${encodeURIComponent(resolved)}`,
-    );
+    const ws = new WebSocket(buildWebSocketUrl("/api/ws", { token: resolved }));
     this.ws = ws;
 
     // Register message + close BEFORE awaiting open — the server emits

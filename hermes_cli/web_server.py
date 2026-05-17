@@ -647,10 +647,44 @@ _ACTION_LOG_FILES: Dict[str, str] = {
 # ``name`` → most recently spawned Popen handle.  Used so ``status`` can
 # report liveness and exit code without shelling out to ``ps``.
 _ACTION_PROCS: Dict[str, subprocess.Popen] = {}
+_ACTION_PROC_STATUS: Dict[str, Dict[str, Any]] = {}
+_ACTION_PROC_LOCK = threading.Lock()
+
+
+def _watch_hermes_action(name: str, proc: subprocess.Popen, log_file) -> None:
+    """Wait for a dashboard-spawned action so exited children are reaped.
+
+    ``Popen.poll()`` only reaps when the status endpoint is called. Dashboard
+    actions such as gateway restart/update can finish while nobody polls them,
+    leaving ``[python] <defunct>`` children under ``hermes dashboard``. A tiny
+    waiter thread keeps the public "latest action" status while guaranteeing
+    the kernel child is collected and the inherited log fd is closed.
+    """
+    try:
+        exit_code = proc.wait()
+    except Exception:
+        _log.debug("dashboard action waiter failed for %s", name, exc_info=True)
+        exit_code = None
+    finally:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
+    with _ACTION_PROC_LOCK:
+        status = _ACTION_PROC_STATUS.setdefault(name, {})
+        if status.get("pid") == proc.pid:
+            status.update({
+                "running": False,
+                "exit_code": exit_code,
+                "completed_at": time.time(),
+            })
+        if _ACTION_PROCS.get(name) is proc:
+            _ACTION_PROCS.pop(name, None)
 
 
 def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
-    """Spawn ``hermes <subcommand>`` detached and record the Popen handle.
+    """Spawn ``hermes <subcommand>`` detached, record it, and reap on exit.
 
     Uses the running interpreter's ``hermes_cli.main`` module so the action
     inherits the same venv/PYTHONPATH the web server is using.
@@ -681,7 +715,19 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
-    _ACTION_PROCS[name] = proc
+    with _ACTION_PROC_LOCK:
+        _ACTION_PROCS[name] = proc
+        _ACTION_PROC_STATUS[name] = {
+            "running": True,
+            "exit_code": None,
+            "pid": proc.pid,
+            "started_at": time.time(),
+        }
+    threading.Thread(
+        target=_watch_hermes_action,
+        args=(name, proc, log_file),
+        daemon=True,
+    ).start()
     return proc
 
 
@@ -739,21 +785,35 @@ async def get_action_status(name: str, lines: int = 200):
     log_path = _ACTION_LOG_DIR / log_file_name
     tail = _tail_lines(log_path, min(max(lines, 1), 2000))
 
-    proc = _ACTION_PROCS.get(name)
-    if proc is None:
-        running = False
-        exit_code: Optional[int] = None
-        pid: Optional[int] = None
-    else:
+    with _ACTION_PROC_LOCK:
+        proc = _ACTION_PROCS.get(name)
+        status = dict(_ACTION_PROC_STATUS.get(name, {}))
+    if proc is not None:
         exit_code = proc.poll()
         running = exit_code is None
         pid = proc.pid
+        if exit_code is not None:
+            with _ACTION_PROC_LOCK:
+                current = _ACTION_PROC_STATUS.setdefault(name, {})
+                if current.get("pid") == proc.pid:
+                    current.update({
+                        "running": False,
+                        "exit_code": exit_code,
+                        "completed_at": current.get("completed_at", time.time()),
+                    })
+            status.update({"running": running, "exit_code": exit_code, "pid": pid})
+    else:
+        running = bool(status.get("running", False))
+        exit_code = status.get("exit_code")
+        pid = status.get("pid")
 
     return {
         "name": name,
         "running": running,
         "exit_code": exit_code,
         "pid": pid,
+        "started_at": status.get("started_at"),
+        "completed_at": status.get("completed_at"),
         "lines": tail,
     }
 
@@ -4231,4 +4291,10 @@ def start_server(
         threading.Thread(target=_open, daemon=True).start()
 
     print(f"  Hermes Web UI → http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    # Do not let uvicorn trust/consume X-Forwarded-* headers for the local
+    # dashboard listener.  Cloudflare Tunnel adds X-Forwarded-For, and uvicorn's
+    # default proxy handling can rewrite ws.client.host to the public browser IP
+    # before our WebSocket loopback gate runs.  The dashboard remains bound to
+    # loopback; _ws_client_is_allowed should see the real TCP peer (cloudflared
+    # on 127.0.0.1), not forwarded client metadata.
+    uvicorn.run(app, host=host, port=port, log_level="warning", proxy_headers=False)

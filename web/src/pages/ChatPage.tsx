@@ -9,7 +9,7 @@
  *              │ onResize    terminal resize → `\x1b[RESIZE:cols;rows]`   .
  *              │ write(data) PTY output bytes → VT100 parser              .
  *              ▼                                                          .
- *     WebSocket /api/pty?token=<session>                                  .
+ *     WebSocket <base>/api/pty?token=<session>                           .
  *          ▼                                                              .
  *     FastAPI pty_ws  (hermes_cli/web_server.py)                          .
  *          ▼                                                              .
@@ -33,7 +33,7 @@ import { useSearchParams } from "react-router-dom";
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, buildWebSocketUrl } from "@/lib/api";
 import { PluginSlot } from "@/plugins";
 
 function buildWsUrl(
@@ -41,10 +41,7 @@ function buildWsUrl(
   resume: string | null,
   channel: string,
 ): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const qs = new URLSearchParams({ token, channel });
-  if (resume) qs.set("resume", resume);
-  return `${proto}//${window.location.host}/api/pty?${qs.toString()}`;
+  return buildWebSocketUrl("/api/pty", { token, channel, resume });
 }
 
 // Channel id ties this chat tab's PTY child (publisher) to its sidebar

@@ -29,6 +29,7 @@ import { Card } from "@/components/ui/card";
 
 import { ModelPickerDialog } from "@/components/ModelPickerDialog";
 import { ToolCall, type ToolEntry } from "@/components/ToolCall";
+import { buildWebSocketUrl } from "@/lib/api";
 import { GatewayClient, type ConnectionState } from "@/lib/gatewayClient";
 
 import { cn } from "@/lib/utils";
@@ -157,11 +158,7 @@ export function ChatSidebar({ channel, className }: ChatSidebarProps) {
       return;
     }
 
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const qs = new URLSearchParams({ token, channel });
-    const ws = new WebSocket(
-      `${proto}//${window.location.host}/api/events?${qs.toString()}`,
-    );
+    const ws = new WebSocket(buildWebSocketUrl("/api/events", { token, channel }));
 
     // `unmounting` suppresses the banner during cleanup — `ws.close()`
     // from the effect's return fires a close event with code 1005 that

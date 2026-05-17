@@ -617,6 +617,31 @@ class TestPreloadResumedSession:
 class TestInitAgentSkipsPreloaded:
     """_init_agent() should skip DB load when history is already populated."""
 
+    def test_init_agent_handles_compressed_resume_notice_markup(self):
+        """Compressed-session resume notice should use valid Rich markup."""
+        cli = _make_cli(resume="head_session")
+        messages = [{"role": "user", "content": "hi"}]
+        mock_db = MagicMock()
+        mock_db.get_session.side_effect = [
+            {"id": "head_session", "title": None},
+            {"id": "child_session", "title": None},
+        ]
+        mock_db.resolve_resume_session_id.return_value = "child_session"
+        mock_db.get_messages_as_conversation.return_value = messages
+        mock_db._conn = MagicMock()
+        cli._session_db = mock_db
+
+        mock_agent = MagicMock()
+        with (
+            patch.object(cli, "_ensure_runtime_credentials", return_value=True),
+            patch.object(cli_mod, "AIAgent", return_value=mock_agent) as mock_agent_cls,
+        ):
+            assert cli._init_agent() is True
+
+        assert cli.session_id == "child_session"
+        assert cli.conversation_history == messages
+        mock_agent_cls.assert_called_once()
+
     def test_init_agent_skips_db_when_preloaded(self):
         """If conversation_history is already set, _init_agent should not
         reload from the DB."""

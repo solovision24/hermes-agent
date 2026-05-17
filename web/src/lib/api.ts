@@ -17,6 +17,22 @@ function readBasePath(): string {
 export const HERMES_BASE_PATH = readBasePath();
 const BASE = HERMES_BASE_PATH;
 
+export function buildWebSocketUrl(
+  path: string,
+  params: Record<string, string | null | undefined> = {},
+): string {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const qs = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value != null) qs.set(key, value);
+  }
+
+  const query = qs.toString();
+  return `${scheme}//${window.location.host}${BASE}${normalizedPath}${query ? `?${query}` : ""}`;
+}
+
 import type { DashboardTheme } from "@/themes/types";
 
 // Ephemeral session token for protected endpoints.
