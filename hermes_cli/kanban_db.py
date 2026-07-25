@@ -2578,7 +2578,10 @@ def create_task(
     for attempt in range(2):
         task_id = _new_task_id()
         try:
-            with write_txn(conn):
+            # Some atomic lifecycle operations create a follow-up card while
+            # they already own the write transaction. SQLite has no nested
+            # BEGIN support, so reuse that transaction when present.
+            with (contextlib.nullcontext() if conn.in_transaction else write_txn(conn)):
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3676,6 +3679,177 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def submit_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: str,
+    summary: str,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Atomically hand an implementation run to an independent reviewer.
+
+    The task keeps its implementation history in ``task_runs`` while its active
+    assignee becomes ``reviewer``.  The original assignee is recorded in the
+    handoff event/closing run so a later changes-requested remediation can be
+    routed without guessing.  This deliberately never writes ``running``:
+    only the dispatcher may claim the review lane.
+    """
+    reviewer = _canonical_assignee(reviewer)
+    if not reviewer:
+        raise ValueError("reviewer is required")
+    if not summary or not summary.strip():
+        raise ValueError("review summary is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        original_assignee = str(row["assignee"] or "")
+        params: tuple[Any, ...]
+        where = "id = ? AND status = 'running'"
+        params = (reviewer, task_id)
+        if expected_run_id is not None:
+            where += " AND current_run_id = ?"
+            params = (reviewer, task_id, int(expected_run_id))
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE " + where,
+            params,
+        )
+        if cur.rowcount != 1:
+            return False
+        handoff_metadata = dict(metadata or {})
+        handoff_metadata.setdefault("reviewer", reviewer)
+        handoff_metadata.setdefault("original_assignee", original_assignee)
+        run_id = _end_run(
+            conn, task_id, outcome="submitted_for_review", status="review",
+            summary=summary.strip(), metadata=handoff_metadata,
+        )
+        _append_event(
+            conn, task_id, "review_submitted",
+            {"reviewer": reviewer, "original_assignee": original_assignee,
+             "summary": summary.strip().splitlines()[0][:400], "metadata": handoff_metadata},
+            run_id=run_id,
+        )
+    return True
+
+
+def request_review_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: str,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> Optional[str]:
+    """Close a review run and create a separately-dispatchable remediation card.
+
+    Returns the remediation id.  A new card is safer than mutating the review
+    card back to running: it preserves independent review evidence and routes
+    work through the normal ready -> running dispatcher claim.
+    """
+    if not summary or not summary.strip():
+        raise ValueError("changes-requested summary is required")
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None or row["status"] != "running":
+            return None
+
+        # The preceding implementation run has the provenance. Prefer the
+        # review_submitted event because the current review run has no handoff.
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_submitted' "
+            "ORDER BY id DESC LIMIT 1", (task_id,)
+        ).fetchone()
+        payload = json.loads(event["payload"]) if event and event["payload"] else {}
+        implementer = payload.get("original_assignee")
+        if not implementer:
+            return None
+        remediation_key = f"review-remediation:{task_id}:{int(time.time())}"
+        remediation_id = create_task(
+            conn, title=f"Address review feedback: {row['title']}",
+            body=(f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"),
+            assignee=implementer, tenant=row["tenant"], priority=row["priority"],
+            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
+            branch_name=row["branch_name"], project_id=row["project_id"],
+            skills=json.loads(row["skills"]) if row["skills"] else None,
+            idempotency_key=remediation_key, created_by=row["assignee"] or "reviewer",
+        )
+        # Close the reviewer run before touching terminal evidence. The source
+        # review card remains done; remediation is the only new runnable work.
+        review_metadata = dict(metadata or {})
+        review_metadata.update({"approved": False, "remediation_task_id": remediation_id,
+                                "original_assignee": implementer})
+        where = "id = ? AND status = 'running'"
+        args: tuple[Any, ...] = (summary.strip(), int(time.time()), task_id)
+        if expected_run_id is not None:
+            where += " AND current_run_id = ?"
+            args += (int(expected_run_id),)
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'done', result = ?, completed_at = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE " + where,
+            args,
+        )
+        if cur.rowcount != 1:
+            return None
+        run_id = _end_run(conn, task_id, outcome="changes_requested", status="done",
+                          summary=summary.strip(), metadata=review_metadata)
+        _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
+    recompute_ready(conn)
+    return remediation_id
+
+
+def ingest_pull_request(
+    conn: sqlite3.Connection,
+    *, repository: str,
+    number: int,
+    head_sha: str,
+    title: str,
+    reviewer: Optional[str] = None,
+    url: Optional[str] = None,
+    draft: bool = False,
+    checks_passed: Optional[bool] = None,
+    mergeable: Optional[bool] = None,
+    metadata: Optional[dict] = None,
+) -> str:
+    """Idempotently materialize an external GitHub PR as a Kanban review card."""
+    if not repository or not head_sha or int(number) <= 0:
+        raise ValueError("repository, positive number, and head_sha are required")
+    key = f"github-pr:{repository}:{int(number)}:{head_sha}"
+    status = "review"
+    if draft:
+        status = "triage"
+    elif checks_passed is False or mergeable is False:
+        status = "blocked"
+    body = f"External GitHub PR: {repository}#{int(number)}\nHead: {head_sha}"
+    if url:
+        body += f"\nURL: {url}"
+    details = {"source": "github_pull_request", "repository": repository,
+               "number": int(number), "head_sha": head_sha, "url": url,
+               "draft": draft, "checks_passed": checks_passed, "mergeable": mergeable,
+               **(metadata or {})}
+    existing = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'", (key,)
+    ).fetchone()
+    if existing:
+        with write_txn(conn):
+            _append_event(conn, existing["id"], "github_pr_ingested", details)
+        return str(existing["id"])
+    task_id = create_task(
+        conn, title=f"Review PR #{int(number)}: {title}", body=body,
+        assignee=reviewer, idempotency_key=key, created_by="github-webhook",
+        initial_status="blocked" if status == "blocked" else "running",
+    )
+    with write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                     "worker_pid = NULL WHERE id = ?", (status, task_id))
+        _append_event(conn, task_id, "github_pr_ingested", details)
+    return task_id
 
 
 def heartbeat_claim(
@@ -7822,10 +7996,11 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # Review tasks are submitted by an implementation worker or external PR
+    # ingestion. The dispatcher claims them exactly like normal work, but with
+    # the reviewer assignee set by the atomic handoff. Rejected reviews create
+    # a separate remediation task; a review card is never written directly
+    # back to running.
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
@@ -7873,12 +8048,21 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        # Keep task-attached skills (which are explicit and portable). When a
+        # review task has none, use the configurable generic default instead
+        # of a historical, often-uninstalled ``sdlc-review`` skill.
+        if not claimed.skills:
+            try:
+                from hermes_cli.config import load_config
+                configured = (load_config().get("kanban") or {}).get("review_skill")
+            except Exception:
+                configured = None
+            if isinstance(configured, str) and configured.strip():
+                claimed.skills = [configured.strip()]
+            elif isinstance(configured, (list, tuple)):
+                claimed.skills = [str(s).strip() for s in configured if str(s).strip()]
+            else:
+                claimed.skills = ["github-code-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

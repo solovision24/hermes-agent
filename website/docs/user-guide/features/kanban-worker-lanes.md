@@ -56,15 +56,23 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review-required convention
+## Native review workflow
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+For code-changing tasks that need independent review, an implementation worker calls
+`kanban_submit_review(reviewer=..., summary=..., metadata=...)`. The kernel closes
+the implementation run with its evidence, preserves the original assignee, assigns
+the active card to the reviewer, and leaves it in `review` for the dispatcher to
+claim. `kanban_block` is reserved for genuine dependency, input, capability, or
+transient blockers.
 
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
+The reviewer finishes accepted work with `kanban_complete(...)`. For changes, it
+calls `kanban_review_changes(summary=..., metadata=...)`: the reviewed card keeps
+the review evidence and reaches `done`, while a separate ready remediation card is
+routed to the original implementer. No worker or reviewer writes `running` directly.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+External GitHub `pull_request` callers can use `hermes kanban ingest-pr` with
+repository, PR number, and head SHA. Repeated events dedupe to one card; drafts
+route to triage and failed checks/conflicts route to blocked rather than review.
 
 ## Logs and audit trail
 

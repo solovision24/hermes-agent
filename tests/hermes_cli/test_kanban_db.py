@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -3908,10 +3909,10 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t).status == "review"
 
 
-def test_dispatch_review_spawns_with_correct_skills(
+def test_dispatch_review_spawns_with_default_review_skill(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Review tasks get a resolvable built-in review skill before spawning."""
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -3924,7 +3925,74 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == ["github-code-review"]
+
+
+def test_submit_review_preserves_implementer_and_routes_reviewer(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="PR https://example.test/1",
+            metadata={"commit": "abc"}, expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task.status == "review"
+        assert task.assignee == "reviewer"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_submitted'",
+            (task_id,),
+        ).fetchone()
+    payload = json.loads(event["payload"])
+    assert payload["original_assignee"] == "dev"
+    assert payload["reviewer"] == "reviewer"
+
+
+def test_review_changes_creates_ready_remediation_without_running_write(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        remediation_id = kb.request_review_changes(
+            conn, task_id, summary="fix failing test", expected_run_id=review.current_run_id,
+        )
+        remediation = kb.get_task(conn, remediation_id)
+        review_task = kb.get_task(conn, task_id)
+    assert remediation is not None
+    assert remediation.assignee == "dev"
+    assert remediation.status == "ready"
+    assert review_task.status == "done"
+
+
+def test_ingest_pull_request_is_idempotent_and_routes_external_states(kanban_home):
+    with kb.connect() as conn:
+        first = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=7, head_sha="deadbeef",
+            title="External change", reviewer="reviewer", checks_passed=True,
+        )
+        second = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=7, head_sha="deadbeef",
+            title="External change", reviewer="reviewer", checks_passed=True,
+        )
+        blocked = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=8, head_sha="badc0de",
+            title="Broken checks", reviewer="reviewer", checks_passed=False,
+        )
+        draft = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=9, head_sha="cafebabe",
+            title="Draft", reviewer="reviewer", draft=True,
+        )
+        assert kb.get_task(conn, first).status == "review"
+        assert kb.get_task(conn, blocked).status == "blocked"
+        assert kb.get_task(conn, draft).status == "triage"
+    assert first == second
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):

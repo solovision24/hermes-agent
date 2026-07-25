@@ -677,6 +677,77 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    """Atomically close this implementation run into the review lane."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reviewer = args.get("reviewer")
+    summary = args.get("summary")
+    metadata = args.get("metadata")
+    if not reviewer or not str(reviewer).strip():
+        return tool_error("reviewer is required")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object/dict")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.submit_for_review(
+                conn, tid, reviewer=str(reviewer), summary=str(summary),
+                metadata=_stamp_worker_session_metadata(tid, metadata),
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(f"could not submit {tid} for review (it must be this worker's running task)")
+            task = kb.get_task(conn, tid)
+            return _ok(task_id=tid, status=task.status if task else "review", reviewer=str(reviewer))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_review failed")
+        return tool_error(f"kanban_submit_review: {e}")
+
+
+def _handle_review_changes(args: dict, **kw) -> str:
+    """Finish a review with changes requested and route a remediation card."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary")
+    metadata = args.get("metadata")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object/dict")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            remediation = kb.request_review_changes(
+                conn, tid, summary=str(summary), metadata=metadata,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not remediation:
+                return tool_error("could not request review changes (missing provenance or task is not this review run)")
+            return _ok(task_id=tid, status="done", remediation_task_id=remediation)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_changes: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_changes failed")
+        return tool_error(f"kanban_review_changes: {e}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -1521,6 +1592,39 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": (
+        "Atomically submit the current implementation task for independent review. "
+        "This records implementation evidence, preserves the original assignee, "
+        "assigns the review run to reviewer, and leaves the card in review for "
+        "the dispatcher to claim. Use this for code/review handoffs; use "
+        "kanban_block only for actual input, capability, dependency, or transient blockers."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reviewer": {"type": "string", "description": "Profile that must independently review this task."},
+        "summary": {"type": "string", "description": "Implementation evidence: PR URL, commit, tests, and relevant decisions."},
+        "metadata": {"type": "object", "description": "Structured review handoff evidence."},
+        "board": _board_schema_prop(),
+    }, "required": ["reviewer", "summary"]},
+}
+
+KANBAN_REVIEW_CHANGES_SCHEMA = {
+    "name": "kanban_review_changes",
+    "description": (
+        "Finish the current review with changes requested. This records review "
+        "evidence and creates a separate ready remediation task for the original "
+        "implementer; it never writes a task directly to running."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "summary": {"type": "string", "description": "Concrete review findings and required changes."},
+        "metadata": {"type": "object", "description": "Structured findings, PR/revision identifiers, and review evidence."},
+        "board": _board_schema_prop(),
+    }, "required": ["summary"]},
+}
+
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
@@ -1946,6 +2050,24 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_changes",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_CHANGES_SCHEMA,
+    handler=_handle_review_changes,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )
 
 registry.register(

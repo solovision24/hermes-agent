@@ -2879,6 +2879,10 @@ DEFAULT_CONFIG = {
         # assignee to any installed profile. When unset, falls back to the
         # default profile. A task never ends up with assignee=None.
         "default_assignee": "",
+        # Optional review skill(s) force-loaded for review cards without
+        # task-attached skills. The built-in dispatcher default is
+        # github-code-review; set this to a string or list for local policy.
+        "review_skill": None,
         # Per-profile concurrency cap (#21582). When set to a positive int,
         # no single profile can have more than N workers running at once,
         # even if the global max_in_progress / max_spawn caps would allow

@@ -586,6 +586,8 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
 | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
 | `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
+| `review <id> --assignee <profile> --summary <evidence>` | Atomically submit a running implementation task for independent review. `--metadata` accepts structured JSON. |
+| `ingest-pr` | Idempotently materialize an external GitHub pull request as a review card, keyed by repository/PR/head SHA. Drafts route to triage; failed checks/conflicts route to blocked. |
 | `list` / `ls` | List tasks on the active board. Filter with `--mine`, `--assignee`, `--status`, `--tenant`, `--archived`, `--json`. |
 | `show <id>` | Show a task with comments and events. `--json` for machine output. |
 | `assign <id> <profile>` | Assign or reassign. Use `none` to unassign. Refused while task is running. |

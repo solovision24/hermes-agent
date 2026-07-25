@@ -368,6 +368,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    # --- review / external PR ingestion ---
+    p_review = sub.add_parser("review", help="Submit a running task to an independent reviewer")
+    p_review.add_argument("task_id")
+    p_review.add_argument("--assignee", required=True, help="Reviewer profile")
+    p_review.add_argument("--summary", required=True, help="Review handoff evidence")
+    p_review.add_argument("--metadata", default=None, help="Structured JSON evidence")
+
+    p_ingest_pr = sub.add_parser(
+        "ingest-pr", help="Idempotently create/update a Review card from a GitHub pull_request event"
+    )
+    p_ingest_pr.add_argument("--repository", required=True, help="owner/repo")
+    p_ingest_pr.add_argument("--number", required=True, type=int, help="Pull request number")
+    p_ingest_pr.add_argument("--head-sha", required=True, help="PR head SHA")
+    p_ingest_pr.add_argument("--title", required=True, help="PR title")
+    p_ingest_pr.add_argument("--assignee", default=None, help="Reviewer profile")
+    p_ingest_pr.add_argument("--url", default=None, help="PR URL")
+    p_ingest_pr.add_argument("--draft", action="store_true")
+    p_ingest_pr.add_argument("--checks-passed", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--mergeable", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--metadata", default=None, help="Additional JSON payload metadata")
+    p_ingest_pr.add_argument("--json", action="store_true")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -959,6 +981,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "review":   _cmd_review,
+            "ingest-pr": _cmd_ingest_pr,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1389,6 +1413,59 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _parse_metadata_arg(raw: Optional[str], *, flag: str = "--metadata") -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{flag}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{flag} must be a JSON object")
+    return value
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    try:
+        metadata = _parse_metadata_arg(args.metadata)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok = kb.submit_for_review(
+            conn, args.task_id, reviewer=args.assignee, summary=args.summary,
+            metadata=metadata, expected_run_id=_worker_run_id_for(args.task_id),
+        )
+        if not ok:
+            print("cannot submit task for review (it must be a running task)", file=sys.stderr)
+            return 1
+    print(f"Submitted {args.task_id} for review by {args.assignee}")
+    return 0
+
+
+def _cmd_ingest_pr(args: argparse.Namespace) -> int:
+    try:
+        metadata = _parse_metadata_arg(args.metadata)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    bool_or_none = lambda value: None if value is None else value == "true"
+    with kb.connect_closing() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository=args.repository, number=args.number,
+            head_sha=args.head_sha, title=args.title, reviewer=args.assignee,
+            url=args.url, draft=bool(args.draft),
+            checks_passed=bool_or_none(args.checks_passed),
+            mergeable=bool_or_none(args.mergeable), metadata=metadata,
+        )
+        task = kb.get_task(conn, task_id)
+    if args.json:
+        print(json.dumps(_task_to_dict(task), ensure_ascii=False))
+    else:
+        print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
     return 0
 
 
