@@ -195,6 +195,14 @@ def test_run_slash_review_and_ingest_pr_reject_bad_metadata(kanban_home):
     )
 
 
+def test_run_slash_ingest_pr_unseen_terminal_json_is_noop(kanban_home):
+    payload = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 89 --head-sha missing "
+        "--title closed --action closed --json"
+    ))
+    assert payload == {"task_id": None, "status": "no-op"}
+
+
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

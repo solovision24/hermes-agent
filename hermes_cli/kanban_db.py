@@ -3824,7 +3824,7 @@ def ingest_pull_request(
     mergeable: Optional[bool] = None,
     metadata: Optional[dict] = None,
     action: str = "open",
-) -> str:
+) -> Optional[str]:
     """Atomically upsert an external GitHub PR into one canonical card."""
     if not repository or not head_sha or int(number) <= 0:
         raise ValueError("repository, positive number, and head_sha are required")
@@ -3849,37 +3849,71 @@ def ingest_pull_request(
                       "metadata": metadata or {}}, ensure_ascii=False, sort_keys=True)
         + "\n--- END UNTRUSTED DATA ---"
     )
+    # Keep webhook metadata inside a fence.  In particular, callers must not
+    # be able to overwrite the canonical identity or lifecycle fields that
+    # downstream dispatch/review tooling relies on.
     details = {"source": "github_pull_request", "repository": repository,
                "number": int(number), "head_sha": head_sha, "url": url,
                "draft": draft, "checks_passed": checks_passed, "mergeable": mergeable,
-               **(metadata or {})}
+               "action": action, "metadata": metadata or {}}
+    desired_title = f"Review PR #{int(number)}: {title}"
+    desired_assignee = _canonical_assignee(reviewer)
     with write_txn(conn):
+        # ``repository`` is legal to contain SQL LIKE wildcards (notably an
+        # underscore), so do not use a prefix LIKE match for PR identity.
+        # Keys are generated canonically by this function; exact prefix
+        # comparison cannot turn one repository into another.
         rows = conn.execute(
-            "SELECT id, idempotency_key FROM tasks WHERE idempotency_key LIKE ? "
-            "AND status != 'archived' ORDER BY created_at DESC", (key_prefix + "%",)
+            "SELECT id, idempotency_key, status, title, body, assignee, claim_lock, "
+            "current_run_id FROM tasks WHERE substr(idempotency_key, 1, length(?)) = ? "
+            "ORDER BY created_at DESC", (key_prefix, key_prefix)
         ).fetchall()
         same_head = next((row for row in rows if row["idempotency_key"] == key), None)
+        active_rows = [row for row in rows if row["status"] != "archived"]
         if action in {"closed", "merged"}:
-            for row in rows:
+            if not active_rows:
+                # A terminal event can arrive before its open event or be
+                # replayed after archival.  Both are harmless no-ops.
+                return str(same_head["id"]) if same_head else None
+            for row in active_rows:
                 conn.execute("UPDATE tasks SET status='archived', completed_at=?, result=? WHERE id=?",
                              (int(time.time()), f"GitHub PR {action}", row["id"]))
                 _append_event(conn, row["id"], f"github_pr_{action}", details)
-            return str(same_head["id"] if same_head else (rows[0]["id"] if rows else ""))
-        if same_head:
+            return str(same_head["id"] if same_head else active_rows[0]["id"])
+        if same_head and same_head["status"] != "archived":
             task_id = str(same_head["id"])
+            if same_head["status"] == "running":
+                # Never let a same-head webhook replay orphan an in-flight
+                # reviewer.  Title/body are presentation-only and may be
+                # refreshed, while assignee, lifecycle state, claim, and run
+                # pointer remain the worker's authoritative ownership.
+                if same_head["title"] != desired_title or same_head["body"] != body:
+                    conn.execute("UPDATE tasks SET title=?, body=? WHERE id=?",
+                                 (desired_title, body, task_id))
+                    _append_event(conn, task_id, "github_pr_metadata_updated", details)
+                return task_id
+            if (
+                same_head["title"] == desired_title
+                and same_head["body"] == body
+                and same_head["assignee"] == desired_assignee
+                and same_head["status"] == status
+            ):
+                # Exact duplicate delivery is a true no-op, including its
+                # event stream, so retries are harmless and observable state
+                # is stable.
+                return task_id
             conn.execute(
-                "UPDATE tasks SET title=?, body=?, assignee=?, status=?, claim_lock=NULL, "
-                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
-                (f"Review PR #{int(number)}: {title}", body, _canonical_assignee(reviewer), status, task_id),
+                "UPDATE tasks SET title=?, body=?, assignee=?, status=? WHERE id=?",
+                (desired_title, body, desired_assignee, status, task_id),
             )
             _append_event(conn, task_id, "github_pr_ingested", details)
             return task_id
-        for row in rows:
+        for row in active_rows:
             conn.execute("UPDATE tasks SET status='archived', completed_at=?, result=? WHERE id=?",
                          (int(time.time()), "Superseded by new GitHub PR head", row["id"]))
             _append_event(conn, row["id"], "github_pr_superseded", {**details, "superseded_by": head_sha})
         task_id = create_task(
-            conn, title=f"Review PR #{int(number)}: {title}", body=body,
+            conn, title=desired_title, body=body,
             assignee=reviewer, idempotency_key=key, created_by="github-webhook",
             initial_status=status,
         )

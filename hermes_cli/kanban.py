@@ -1467,11 +1467,17 @@ def _cmd_ingest_pr(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 2
-        task = kb.get_task(conn, task_id)
+        task = kb.get_task(conn, task_id) if task_id is not None else None
     if args.json:
-        print(json.dumps(_task_to_dict(task), ensure_ascii=False))
+        print(json.dumps(
+            _task_to_dict(task) if task is not None else {"task_id": None, "status": "no-op"},
+            ensure_ascii=False,
+        ))
     else:
-        print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
+        if task_id is None:
+            print("Ignored GitHub PR terminal event (no matching card)")
+        else:
+            print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
     return 0
 
 
