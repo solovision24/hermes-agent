@@ -3829,8 +3829,8 @@ def ingest_pull_request(
     if not repository or not head_sha or int(number) <= 0:
         raise ValueError("repository, positive number, and head_sha are required")
     action = str(action or "open").strip().lower()
-    if action not in {"open", "synchronize", "closed", "merged"}:
-        raise ValueError("action must be one of open, synchronize, closed, merged")
+    if action not in {"open", "reopened", "synchronize", "closed", "merged"}:
+        raise ValueError("action must be one of open, reopened, synchronize, closed, merged")
     key_prefix = f"github-pr:{repository}:{int(number)}:"
     key = f"{key_prefix}{head_sha}"
     status = "review"
@@ -3880,6 +3880,30 @@ def ingest_pull_request(
                              (int(time.time()), f"GitHub PR {action}", row["id"]))
                 _append_event(conn, row["id"], f"github_pr_{action}", details)
             return str(same_head["id"] if same_head else active_rows[0]["id"])
+        if action == "reopened" and same_head and same_head["status"] == "archived":
+            # GitHub can reopen a PR without changing its head SHA. Reuse its
+            # archived canonical card rather than creating a second row with
+            # the same idempotency key. Archive any stale active head first so
+            # the PR has exactly one active canonical card after reactivation.
+            for row in active_rows:
+                conn.execute(
+                    "UPDATE tasks SET status='archived', completed_at=?, result=? WHERE id=?",
+                    (int(time.time()), "Superseded by reopened GitHub PR head", row["id"]),
+                )
+                _append_event(
+                    conn, row["id"], "github_pr_superseded",
+                    {**details, "superseded_by": head_sha},
+                )
+            task_id = str(same_head["id"])
+            conn.execute(
+                "UPDATE tasks SET title=?, body=?, assignee=?, status=?, "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "current_run_id=NULL, started_at=NULL, completed_at=NULL, result=NULL "
+                "WHERE id=?",
+                (desired_title, body, desired_assignee, status, task_id),
+            )
+            _append_event(conn, task_id, "github_pr_reopened", details)
+            return task_id
         if same_head and same_head["status"] != "archived":
             task_id = str(same_head["id"])
             if same_head["status"] == "running":

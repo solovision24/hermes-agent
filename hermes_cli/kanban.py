@@ -387,7 +387,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_ingest_pr.add_argument("--draft", action="store_true")
     p_ingest_pr.add_argument("--checks-passed", choices=("true", "false"), default=None)
     p_ingest_pr.add_argument("--mergeable", choices=("true", "false"), default=None)
-    p_ingest_pr.add_argument("--action", choices=("open", "synchronize", "closed", "merged"),
+    p_ingest_pr.add_argument("--action", choices=("open", "reopened", "synchronize", "closed", "merged"),
                              default="open", help="GitHub pull_request lifecycle action")
     p_ingest_pr.add_argument("--metadata", default=None, help="Additional JSON payload metadata")
     p_ingest_pr.add_argument("--json", action="store_true")

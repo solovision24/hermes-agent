@@ -186,6 +186,34 @@ def test_run_slash_review_and_ingest_pr_json_lifecycle(kanban_home):
     assert archived["status"] == "archived"
 
 
+def test_run_slash_ingest_pr_reopened_same_head_reactivates_card(kanban_home):
+    initial = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title initial --assignee reviewer --checks-passed true --json"
+    ))
+    archived = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title closed --action closed --json"
+    ))
+    reopened = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title reopened --assignee reviewer --checks-passed false --action reopened --json"
+    ))
+    duplicate = json.loads(kc.run_slash(
+        "ingest-pr --repository acme/widget --number 90 --head-sha deadbeef "
+        "--title reopened --assignee reviewer --checks-passed false --action reopened --json"
+    ))
+    assert archived["id"] == initial["id"]
+    assert reopened["id"] == initial["id"] == duplicate["id"]
+    assert reopened["status"] == duplicate["status"] == "blocked"
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived'",
+            ("github-pr:acme/widget:90:deadbeef",),
+        ).fetchall()
+    assert [row["id"] for row in rows] == [initial["id"]]
+
+
 def test_run_slash_review_and_ingest_pr_reject_bad_metadata(kanban_home):
     assert "must be a JSON object" in kc.run_slash(
         "ingest-pr --repository acme/widget --number 1 --head-sha abc --title x --metadata '[]'"

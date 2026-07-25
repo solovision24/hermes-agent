@@ -4142,6 +4142,46 @@ def test_ingest_pull_request_same_head_unclaimed_blocked_promotes_to_review(kanb
     assert task.current_run_id is None
 
 
+def test_ingest_pull_request_reopened_same_head_reactivates_canonical_card(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="initial", reviewer="reviewer", checks_passed=True,
+        )
+        assert task_id is not None
+        assert kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="closed", action="closed",
+        ) == task_id
+        assert kb.get_task(conn, task_id).status == "archived"
+
+        reopened = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="reopened", reviewer="replacement", checks_passed=False,
+            action="reopened",
+        )
+        duplicate = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=15, head_sha="same",
+            title="reopened", reviewer="replacement", checks_passed=False,
+            action="reopened",
+        )
+        task = kb.get_task(conn, reopened)
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE idempotency_key = ?",
+            ("github-pr:acme/widget:15:same",),
+        ).fetchall()
+        reopened_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'github_pr_reopened'",
+            (task_id,),
+        ).fetchone()[0]
+    assert reopened == task_id == duplicate
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.assignee == "replacement"
+    assert [(row["id"], row["status"]) for row in rows] == [(task_id, "blocked")]
+    assert reopened_events == 1
+
+
 def test_review_changes_cas_failure_creates_no_remediation(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="dev")
