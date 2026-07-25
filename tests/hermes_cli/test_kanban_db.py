@@ -3928,6 +3928,26 @@ def test_dispatch_review_spawns_with_default_review_skill(
     assert spawned_tasks[0].skills == ["github-code-review"]
 
 
+def test_dispatch_review_resolves_target_profile_skills_or_blocks(kanban_home, monkeypatch):
+    from hermes_cli import profiles
+    reviewer = kanban_home / "profiles" / "reviewer"
+    skill = reviewer / "skills" / "github-code-review"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: github-code-review\n---\n", encoding="utf-8")
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "reviewer")
+    spawned = []
+    with kb.connect() as conn:
+        good = kb.create_task(conn, title="good", assignee="reviewer")
+        _set_task_status(conn, good, "review")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: spawned.append(task) or 1)
+        assert result.spawned and spawned[0].skills == ["github-code-review"]
+        bad = kb.create_task(conn, title="bad", assignee="reviewer", skills=["missing-skill"])
+        _set_task_status(conn, bad, "review")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 1)
+        assert bad in result.auto_blocked
+        assert kb.get_task(conn, bad).status == "blocked"
+
+
 def test_submit_review_preserves_implementer_and_routes_reviewer(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="dev")
