@@ -387,6 +387,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_ingest_pr.add_argument("--draft", action="store_true")
     p_ingest_pr.add_argument("--checks-passed", choices=("true", "false"), default=None)
     p_ingest_pr.add_argument("--mergeable", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--action", choices=("open", "synchronize", "closed", "merged"),
+                             default="open", help="GitHub pull_request lifecycle action")
     p_ingest_pr.add_argument("--metadata", default=None, help="Additional JSON payload metadata")
     p_ingest_pr.add_argument("--json", action="store_true")
 
@@ -1454,13 +1456,17 @@ def _cmd_ingest_pr(args: argparse.Namespace) -> int:
         return 2
     bool_or_none = lambda value: None if value is None else value == "true"
     with kb.connect_closing() as conn:
-        task_id = kb.ingest_pull_request(
-            conn, repository=args.repository, number=args.number,
-            head_sha=args.head_sha, title=args.title, reviewer=args.assignee,
-            url=args.url, draft=bool(args.draft),
-            checks_passed=bool_or_none(args.checks_passed),
-            mergeable=bool_or_none(args.mergeable), metadata=metadata,
-        )
+        try:
+            task_id = kb.ingest_pull_request(
+                conn, repository=args.repository, number=args.number,
+                head_sha=args.head_sha, title=args.title, reviewer=args.assignee,
+                url=args.url, draft=bool(args.draft),
+                checks_passed=bool_or_none(args.checks_passed),
+                mergeable=bool_or_none(args.mergeable), metadata=metadata, action=args.action,
+            )
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
         task = kb.get_task(conn, task_id)
     if args.json:
         print(json.dumps(_task_to_dict(task), ensure_ascii=False))

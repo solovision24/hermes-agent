@@ -3995,6 +3995,53 @@ def test_ingest_pull_request_is_idempotent_and_routes_external_states(kanban_hom
     assert first == second
 
 
+def test_ingest_pull_request_upserts_state_and_supersedes_old_head(kanban_home):
+    with kb.connect() as conn:
+        first = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="old",
+            title="draft", reviewer="reviewer", draft=True,
+        )
+        assert kb.get_task(conn, first).status == "triage"
+        same = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="old",
+            title="ready", reviewer="new-reviewer", url="https://example.test/10",
+            checks_passed=True, metadata={"revision": 2},
+        )
+        updated = kb.get_task(conn, same)
+        assert same == first
+        assert updated.status == "review"
+        assert updated.assignee == "new-reviewer"
+        assert "UNTRUSTED GITHUB PR DATA" in updated.body
+        newest = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="new",
+            title="new head", reviewer="reviewer", checks_passed=True,
+            action="synchronize",
+        )
+        assert kb.get_task(conn, first).status == "archived"
+        assert kb.get_task(conn, newest).status == "review"
+        closed = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=10, head_sha="new",
+            title="closed", reviewer="reviewer", action="merged",
+        )
+        assert closed == newest
+        assert kb.get_task(conn, newest).status == "archived"
+
+
+def test_review_changes_cas_failure_creates_no_remediation(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.submit_for_review(conn, task_id, reviewer="reviewer", summary="ready")
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, task_id, summary="fix", expected_run_id=review.current_run_id + 1,
+        ) is None
+        assert len(kb.list_tasks(conn, limit=100)) == 1
+        assert kb.get_task(conn, task_id).status == "running"
+
+
 def test_dispatch_review_skips_unassigned(kanban_home):
     """Unassigned review tasks go to skipped_unassigned, not spawned."""
     with kb.connect() as conn:
