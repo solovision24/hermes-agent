@@ -4081,6 +4081,97 @@ def test_submit_review_delegates_to_running_webhook_review(kanban_home):
     assert review_runs == 1
 
 
+def test_delegated_webhook_review_routes_changes_to_original_implementer(kanban_home):
+    """A webhook review retains native provenance when it requests changes."""
+    head_sha = "e" * 40
+    pr_url = "https://github.com/acme/widget/pull/45"
+    with kb.connect() as conn:
+        webhook_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=45, head_sha=head_sha,
+            title="external", reviewer="reviewer", url=pr_url,
+            checks_passed=True,
+        )
+        assert webhook_id is not None
+        webhook_review = kb.claim_review_task(conn, webhook_id)
+        assert webhook_review is not None
+        implementation_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, implementation_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="ready",
+            metadata={"pr_url": pr_url, "head_sha": head_sha},
+            expected_run_id=implementation.current_run_id,
+        )
+        remediation_id = kb.request_review_changes(
+            conn, webhook_id, summary="fix failing test",
+            expected_run_id=webhook_review.current_run_id,
+        )
+        remediation = kb.get_task(conn, remediation_id)
+
+    assert remediation is not None
+    assert remediation.assignee == "dev"
+    assert remediation.status == "ready"
+
+
+def test_webhook_expands_native_abbreviated_sha_to_github_head(kanban_home):
+    """A full webhook head reuses and canonicalizes a native short SHA review."""
+    short_sha = "f" * 12
+    full_sha = short_sha + "a" * 28
+    pr_url = "https://github.com/acme/widget/pull/46"
+    with kb.connect() as conn:
+        implementation_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, implementation_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="ready",
+            metadata={"pr_url": pr_url, "head_sha": short_sha},
+            expected_run_id=implementation.current_run_id,
+        )
+        ingested_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=46, head_sha=full_sha,
+            title="implementation", reviewer="reviewer", url=pr_url,
+            checks_passed=True,
+        )
+        task = kb.get_task(conn, implementation_id)
+        canonicalized = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'github_pr_head_canonicalized'",
+            (implementation_id,),
+        ).fetchone()
+
+    assert ingested_id == implementation_id
+    assert task is not None and task.status == "review"
+    assert json.loads(canonicalized["payload"])["canonical_identity"].endswith(full_sha)
+
+
+def test_native_abbreviated_sha_delegates_to_running_full_webhook_review(kanban_home):
+    """A native short SHA also correlates when GitHub arrived first."""
+    short_sha = "b" * 12
+    full_sha = short_sha + "c" * 28
+    pr_url = "https://github.com/acme/widget/pull/47"
+    with kb.connect() as conn:
+        webhook_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=47, head_sha=full_sha,
+            title="external", reviewer="reviewer", url=pr_url,
+            checks_passed=True,
+        )
+        assert webhook_id is not None
+        webhook_review = kb.claim_review_task(conn, webhook_id)
+        assert webhook_review is not None
+        implementation_id = kb.create_task(conn, title="implementation", assignee="dev")
+        implementation = kb.claim_task(conn, implementation_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="ready",
+            metadata={"pr_url": pr_url, "head_sha": short_sha},
+            expected_run_id=implementation.current_run_id,
+        )
+        implementation_task = kb.get_task(conn, implementation_id)
+
+    assert implementation_task is not None
+    assert implementation_task.status == "done"
+
+
 def test_claim_review_task_allows_only_one_malformed_duplicate_identity(kanban_home):
     """The claim CAS backstop prevents historical duplicate review runs."""
     head_sha = "c" * 40
