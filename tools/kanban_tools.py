@@ -1605,7 +1605,7 @@ KANBAN_SUBMIT_REVIEW_SCHEMA = {
         "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
         "reviewer": {"type": "string", "description": "Profile that must independently review this task."},
         "summary": {"type": "string", "description": "Implementation evidence: PR URL, commit, tests, and relevant decisions."},
-        "metadata": {"type": "object", "description": "Structured review handoff evidence."},
+        "metadata": {"type": "object", "description": "Structured review handoff evidence. For a GitHub PR, include pr_url (https://github.com/owner/repo/pull/N) and head_sha (or commit) so webhook and native review handoffs deduplicate to one reviewer run."},
         "board": _board_schema_prop(),
     }, "required": ["reviewer", "summary"]},
 }

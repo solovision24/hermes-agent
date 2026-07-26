@@ -3969,6 +3969,162 @@ def test_submit_review_preserves_implementer_and_routes_reviewer(kanban_home):
     assert payload["reviewer"] == "reviewer"
 
 
+def test_submit_review_then_webhook_reuses_implementation_review_card(kanban_home):
+    """A webhook replay must not create a second review after submission."""
+    head_sha = "a" * 40
+    pr_url = "https://github.com/acme/widget/pull/41"
+    with kb.connect() as conn:
+        implementation_id = kb.create_task(
+            conn, title="implementation", assignee="dev",
+        )
+        implementation = kb.claim_task(conn, implementation_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="ready",
+            metadata={"pr_url": pr_url, "head_sha": head_sha},
+            expected_run_id=implementation.current_run_id,
+        )
+
+        ingested_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=41, head_sha=head_sha,
+            title="implementation", reviewer="reviewer", url=pr_url,
+            checks_passed=True,
+        )
+        active = [
+            task for task in kb.list_tasks(conn, limit=100)
+            if task.status != "archived"
+        ]
+
+    assert ingested_id == implementation_id
+    assert [task.id for task in active] == [implementation_id]
+    assert active[0].status == "review"
+
+
+def test_webhook_then_submit_review_consolidates_unclaimed_external_card(kanban_home):
+    """Implementation submission adopts an unclaimed webhook review card."""
+    head_sha = "b" * 40
+    pr_url = "https://github.com/acme/widget/pull/42"
+    with kb.connect() as conn:
+        webhook_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=42, head_sha=head_sha,
+            title="external", reviewer="reviewer", url=pr_url,
+            checks_passed=True,
+        )
+        assert webhook_id is not None
+        implementation_id = kb.create_task(
+            conn, title="implementation", assignee="dev",
+        )
+        implementation = kb.claim_task(conn, implementation_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="ready",
+            metadata={"pr_url": pr_url, "head_sha": head_sha},
+            expected_run_id=implementation.current_run_id,
+        )
+        implementation_task = kb.get_task(conn, implementation_id)
+        webhook_task = kb.get_task(conn, webhook_id)
+        active = [
+            task for task in kb.list_tasks(conn, limit=100)
+            if task.status != "archived"
+        ]
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_canonicalized'",
+            (implementation_id,),
+        ).fetchone()
+
+    assert implementation_task is not None
+    assert implementation_task.status == "review"
+    assert implementation_task.assignee == "reviewer"
+    assert webhook_task is not None and webhook_task.status == "archived"
+    assert [task.id for task in active] == [implementation_id]
+    assert json.loads(event["payload"])["superseded_task_id"] == webhook_id
+
+
+def test_submit_review_delegates_to_running_webhook_review(kanban_home):
+    """A live webhook review remains the sole reviewer execution."""
+    head_sha = "d" * 40
+    pr_url = "https://github.com/acme/widget/pull/44"
+    with kb.connect() as conn:
+        webhook_id = kb.ingest_pull_request(
+            conn, repository="acme/widget", number=44, head_sha=head_sha,
+            title="external", reviewer="reviewer", url=pr_url,
+            checks_passed=True,
+        )
+        assert webhook_id is not None
+        webhook_review = kb.claim_review_task(conn, webhook_id)
+        assert webhook_review is not None
+
+        implementation_id = kb.create_task(
+            conn, title="implementation", assignee="dev",
+        )
+        implementation = kb.claim_task(conn, implementation_id)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, implementation_id, reviewer="reviewer", summary="ready",
+            metadata={"pr_url": pr_url, "head_sha": head_sha},
+            expected_run_id=implementation.current_run_id,
+        )
+        implementation_task = kb.get_task(conn, implementation_id)
+        delegated = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_delegated'",
+            (implementation_id,),
+        ).fetchone()
+        review_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? AND status = 'running'",
+            (webhook_id,),
+        ).fetchone()[0]
+
+    assert implementation_task is not None and implementation_task.status == "done"
+    assert json.loads(delegated["payload"])["canonical_task_id"] == webhook_id
+    assert review_runs == 1
+
+
+def test_claim_review_task_allows_only_one_malformed_duplicate_identity(kanban_home):
+    """The claim CAS backstop prevents historical duplicate review runs."""
+    head_sha = "c" * 40
+    pr_url = "https://github.com/acme/widget/pull/43"
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="first", assignee="reviewer")
+        second = kb.create_task(conn, title="second", assignee="reviewer")
+        _set_task_status(conn, first, "review")
+        _set_task_status(conn, second, "review")
+        for task_id in (first, second):
+            kb._append_event(
+                conn, task_id, "review_submitted",
+                {"metadata": {"pr_url": pr_url, "head_sha": head_sha}},
+            )
+
+    def claim_competing(task_id: str, claimer: str):
+        with kb.connect() as competing_conn:
+            return kb.claim_review_task(
+                competing_conn, task_id, claimer=claimer,
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(
+            lambda args: claim_competing(*args),
+            ((first, "reviewer:one"), (second, "reviewer:two")),
+        ))
+
+    with kb.connect() as conn:
+        rejected_event = conn.execute(
+            "SELECT task_id, payload FROM task_events "
+            "WHERE task_id IN (?, ?) AND kind = 'review_claim_deduplicated'",
+            (first, second),
+        ).fetchone()
+        review_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id IN (?, ?)",
+            (first, second),
+        ).fetchone()[0]
+
+    assert sum(claim is not None for claim in claims) == 1
+    assert review_runs == 1
+    assert rejected_event is not None
+    assert json.loads(rejected_event["payload"])["canonical_task_id"] in {first, second}
+
+
 def test_review_changes_creates_ready_remediation_without_running_write(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="dev")
