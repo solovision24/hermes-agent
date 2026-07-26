@@ -2,6 +2,11 @@ name: Contributor Attribution Check
 
 on:
   workflow_call:
+    inputs:
+      base_sha:
+        description: PR base commit used to scope contributor attribution.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,8 +22,9 @@ jobs:
 
       - name: Check for unmapped contributor emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Scope to this PR's actual base. PRs targeting stable/release
+          # branches must not compare their history against origin/main.
+          MERGE_BASE=$(git merge-base "${{ inputs.base_sha }}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)

@@ -3486,6 +3486,101 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+_GITHUB_PR_URL_RE = re.compile(
+    r"^https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_GITHUB_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
+
+
+def _canonical_github_pr_identity(
+    repository: object, number: object, head_sha: object,
+) -> Optional[str]:
+    """Return the stable GitHub review identity when all fields validate."""
+    repo = str(repository or "").strip()
+    sha = str(head_sha or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        return None
+    if not _GITHUB_HEAD_SHA_RE.fullmatch(sha):
+        return None
+    try:
+        pr_number = int(str(number))
+    except (TypeError, ValueError):
+        return None
+    if pr_number <= 0:
+        return None
+    return f"github-pr:{repo.casefold()}:{pr_number}:{sha.casefold()}"
+
+
+def _github_pr_identity_parts(identity: object) -> Optional[tuple[str, int, str]]:
+    """Validate and split a stored GitHub PR review identity."""
+    parts = str(identity or "").split(":")
+    if len(parts) != 4 or parts[0] != "github-pr":
+        return None
+    canonical = _canonical_github_pr_identity(parts[1], parts[2], parts[3])
+    if not canonical:
+        return None
+    _, repository, number, sha = canonical.split(":")
+    return repository, int(number), sha
+
+
+def _github_pr_identities_match(left: object, right: object) -> bool:
+    """Match equivalent GitHub heads, including a native abbreviated SHA."""
+    left_parts = _github_pr_identity_parts(left)
+    right_parts = _github_pr_identity_parts(right)
+    if not left_parts or not right_parts or left_parts[:2] != right_parts[:2]:
+        return False
+    left_sha, right_sha = left_parts[2], right_parts[2]
+    return left_sha.startswith(right_sha) or right_sha.startswith(left_sha)
+
+
+def _review_identity_from_metadata(metadata: Optional[dict]) -> Optional[str]:
+    """Parse a validated GitHub PR identity from review handoff metadata."""
+    if not isinstance(metadata, dict):
+        return None
+    pr_url = metadata.get("pr_url") or metadata.get("pull_request_url") or metadata.get("url")
+    if not isinstance(pr_url, str):
+        return None
+    match = _GITHUB_PR_URL_RE.fullmatch(pr_url.strip())
+    if not match:
+        return None
+    head_sha = metadata.get("head_sha") or metadata.get("commit") or metadata.get("sha")
+    return _canonical_github_pr_identity(
+        f"{match.group(1)}/{match.group(2)}", match.group(3), head_sha,
+    )
+
+
+def _review_identity_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Read a review identity from the canonical key or its handoff evidence."""
+    row = conn.execute(
+        "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    key = str(row["idempotency_key"] or "") if row else ""
+    if key.startswith("github-pr:"):
+        parts = _github_pr_identity_parts(key)
+        if parts:
+            return _canonical_github_pr_identity(*parts)
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_submitted' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not event or not event["payload"]:
+        return None
+    try:
+        payload = json.loads(event["payload"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    identity = payload.get("identity")
+    if isinstance(identity, str) and identity.startswith("github-pr:"):
+        parts = _github_pr_identity_parts(identity)
+        if parts:
+            return _canonical_github_pr_identity(*parts)
+    return _review_identity_from_metadata(payload.get("metadata"))
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3631,6 +3726,27 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        identity = _review_identity_for_task(conn, task_id)
+        if identity:
+            # Earlier versions only deduplicated webhook deliveries.  Keep a
+            # final claim-time guard for historical/manual rows that escaped
+            # that correlation: SQLite serializes this transaction, so a
+            # concurrent contender observes the first reviewer as running.
+            for candidate in conn.execute(
+                "SELECT id FROM tasks WHERE status = 'running' AND id != ?",
+                (task_id,),
+            ):
+                if _github_pr_identities_match(
+                    _review_identity_for_task(conn, str(candidate["id"])), identity,
+                ):
+                    _append_event(
+                        conn, task_id, "review_claim_deduplicated",
+                        {
+                            "canonical_task_id": str(candidate["id"]),
+                            "identity": identity,
+                        },
+                    )
+                    return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3705,6 +3821,7 @@ def submit_for_review(
         raise ValueError("reviewer is required")
     if not summary or not summary.strip():
         raise ValueError("review summary is required")
+    review_identity = _review_identity_from_metadata(metadata)
     with write_txn(conn):
         row = conn.execute(
             "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,)
@@ -3712,14 +3829,104 @@ def submit_for_review(
         if row is None or row["status"] != "running":
             return False
         original_assignee = str(row["assignee"] or "")
+        canonical_task_id: Optional[str] = None
+        if review_identity:
+            canonical = conn.execute(
+                "SELECT id, status, claim_lock FROM tasks "
+                "WHERE idempotency_key = ? AND id != ? AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (review_identity, task_id),
+            ).fetchone()
+            if canonical is None:
+                identity_parts = _github_pr_identity_parts(review_identity)
+                if identity_parts:
+                    repository, number, _ = identity_parts
+                    prefix = f"github-pr:{repository}:{number}:"
+                    candidates = conn.execute(
+                        "SELECT id, idempotency_key, status, claim_lock FROM tasks WHERE id != ? "
+                        "AND status != 'archived' "
+                        "AND lower(substr(idempotency_key, 1, length(?))) = ? "
+                        "ORDER BY created_at DESC",
+                        (task_id, prefix, prefix),
+                    ).fetchall()
+                    equivalents = [
+                        candidate for candidate in candidates
+                        if _github_pr_identities_match(candidate["idempotency_key"], review_identity)
+                    ]
+                    if len(equivalents) == 1:
+                        canonical = equivalents[0]
+            if canonical:
+                canonical_task_id = str(canonical["id"])
+                if canonical["status"] == "running" or canonical["claim_lock"]:
+                    # The webhook card is already executing its review. Close
+                    # this implementation run truthfully instead of creating a
+                    # second review lane; the durable event records where its
+                    # evidence was delegated.
+                    handoff_metadata = dict(metadata or {})
+                    handoff_metadata.update({
+                        "reviewer": reviewer,
+                        "original_assignee": original_assignee,
+                        "canonical_task_id": canonical_task_id,
+                        "canonical_identity": review_identity,
+                    })
+                    where = "id = ? AND status = 'running'"
+                    params: tuple[Any, ...] = (task_id,)
+                    if expected_run_id is not None:
+                        where += " AND current_run_id = ?"
+                        params = (task_id, int(expected_run_id))
+                    cur = conn.execute(
+                        "UPDATE tasks SET status='done', claim_lock=NULL, "
+                        "claim_expires=NULL, worker_pid=NULL WHERE " + where,
+                        params,
+                    )
+                    if cur.rowcount != 1:
+                        return False
+                    run_id = _end_run(
+                        conn, task_id, outcome="review_delegated", status="done",
+                        summary=summary.strip(), metadata=handoff_metadata,
+                    )
+                    _append_event(
+                        conn, task_id, "review_delegated",
+                        {"canonical_task_id": canonical_task_id,
+                         "identity": review_identity,
+                         "original_assignee": original_assignee,
+                         "summary": summary.strip().splitlines()[0][:400]},
+                        run_id=run_id,
+                    )
+                    # The running webhook review becomes the only review
+                    # lifecycle. Copy the implementer provenance onto it so a
+                    # later changes-requested result routes remediation back
+                    # to the implementation owner rather than failing closed.
+                    _append_event(
+                        conn, canonical_task_id, "review_submitted",
+                        {"reviewer": reviewer, "original_assignee": original_assignee,
+                         "summary": summary.strip().splitlines()[0][:400],
+                         "metadata": handoff_metadata, "identity": review_identity,
+                         "delegated_from_task_id": task_id},
+                    )
+                    return True
+                # An unclaimed webhook card is only an ingestion envelope.
+                # Keep its audit trail, but make the implementation card the
+                # canonical review lifecycle so its run history and original
+                # assignee remain attached to the work that produced the PR.
+                conn.execute(
+                    "UPDATE tasks SET status='archived', completed_at=?, result=? "
+                    "WHERE id=? AND status != 'running'",
+                    (int(time.time()), "Consolidated into implementation review", canonical_task_id),
+                )
+                _append_event(
+                    conn, canonical_task_id, "review_canonicalized",
+                    {"canonical_task_id": task_id, "identity": review_identity,
+                     "reason": "implementation_submission"},
+                )
         params: tuple[Any, ...]
         where = "id = ? AND status = 'running'"
-        params = (reviewer, task_id)
+        params = (reviewer, review_identity, task_id)
         if expected_run_id is not None:
             where += " AND current_run_id = ?"
-            params = (reviewer, task_id, int(expected_run_id))
+            params = (reviewer, review_identity, task_id, int(expected_run_id))
         cur = conn.execute(
-            "UPDATE tasks SET status = 'review', assignee = ?, claim_lock = NULL, "
+            "UPDATE tasks SET status = 'review', assignee = ?, idempotency_key = COALESCE(?, idempotency_key), claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL WHERE " + where,
             params,
         )
@@ -3735,9 +3942,19 @@ def submit_for_review(
         _append_event(
             conn, task_id, "review_submitted",
             {"reviewer": reviewer, "original_assignee": original_assignee,
-             "summary": summary.strip().splitlines()[0][:400], "metadata": handoff_metadata},
+             "summary": summary.strip().splitlines()[0][:400], "metadata": handoff_metadata,
+             "identity": review_identity,
+             "superseded_task_id": canonical_task_id},
             run_id=run_id,
         )
+        if canonical_task_id:
+            _append_event(
+                conn, task_id, "review_canonicalized",
+                {"superseded_task_id": canonical_task_id,
+                 "identity": review_identity,
+                 "original_assignee": original_assignee},
+                run_id=run_id,
+            )
     return True
 
 
@@ -3777,14 +3994,29 @@ def request_review_changes(
         implementer = payload.get("original_assignee")
         if not implementer:
             return None
+        # A running webhook review may have been delegated from an implementation
+        # task. In that case the webhook is canonical only for review lifecycle;
+        # the remediation must inherit the implementation workspace context.
+        implementation_row = row
+        delegated_from_task_id = payload.get("delegated_from_task_id")
+        if isinstance(delegated_from_task_id, str) and delegated_from_task_id:
+            candidate = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (delegated_from_task_id,)
+            ).fetchone()
+            if candidate is not None:
+                implementation_row = candidate
         remediation_key = f"review-remediation:{task_id}:{row['current_run_id']}"
         remediation_id = create_task(
             conn, title=f"Address review feedback: {row['title']}",
             body=(f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"),
-            assignee=implementer, tenant=row["tenant"], priority=row["priority"],
-            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"], project_id=row["project_id"],
-            skills=json.loads(row["skills"]) if row["skills"] else None,
+            assignee=implementer,
+            tenant=implementation_row["tenant"], priority=implementation_row["priority"],
+            workspace_kind=implementation_row["workspace_kind"],
+            workspace_path=implementation_row["workspace_path"],
+            branch_name=implementation_row["branch_name"],
+            project_id=implementation_row["project_id"],
+            skills=json.loads(implementation_row["skills"])
+            if implementation_row["skills"] else None,
             idempotency_key=remediation_key, created_by=row["assignee"] or "reviewer",
         )
         # Close the reviewer run before touching terminal evidence. The source
@@ -3831,8 +4063,12 @@ def ingest_pull_request(
     action = str(action or "open").strip().lower()
     if action not in {"open", "reopened", "synchronize", "closed", "merged"}:
         raise ValueError("action must be one of open, reopened, synchronize, closed, merged")
-    key_prefix = f"github-pr:{repository}:{int(number)}:"
-    key = f"{key_prefix}{head_sha}"
+    raw_key_prefix = f"github-pr:{repository}:{int(number)}:"
+    canonical_identity = _canonical_github_pr_identity(repository, number, head_sha)
+    # Preserve legacy/non-GitHub-shaped deliveries, but use the validated
+    # canonical identity when available so submit_for_review can correlate
+    # independently-produced handoff evidence with webhook ingestion.
+    key = canonical_identity or f"{raw_key_prefix}{head_sha}"
     status = "review"
     if draft:
         status = "triage"
@@ -3864,11 +4100,35 @@ def ingest_pull_request(
         # Keys are generated canonically by this function; exact prefix
         # comparison cannot turn one repository into another.
         rows = conn.execute(
-            "SELECT id, idempotency_key, status, title, body, assignee, claim_lock, "
+            "SELECT id, idempotency_key, status, title, body, assignee, created_by, claim_lock, "
             "current_run_id FROM tasks WHERE substr(idempotency_key, 1, length(?)) = ? "
-            "ORDER BY created_at DESC", (key_prefix, key_prefix)
+            "ORDER BY created_at DESC", (raw_key_prefix, raw_key_prefix)
         ).fetchall()
-        same_head = next((row for row in rows if row["idempotency_key"] == key), None)
+        if canonical_identity:
+            # An implementation task carries the same canonical key but not
+            # necessarily the webhook's raw-prefix casing. Include it without
+            # widening the prefix scan to a LIKE expression.
+            identity_parts = _github_pr_identity_parts(canonical_identity)
+            if identity_parts:
+                repository_name, pr_number, _ = identity_parts
+                canonical_prefix = f"github-pr:{repository_name}:{pr_number}:"
+                canonical_rows = conn.execute(
+                    "SELECT id, idempotency_key, status, title, body, assignee, created_by, claim_lock, "
+                    "current_run_id FROM tasks WHERE "
+                    "lower(substr(idempotency_key, 1, length(?))) = ?",
+                    (canonical_prefix, canonical_prefix),
+                ).fetchall()
+                for canonical_row in canonical_rows:
+                    if all(canonical_row["id"] != row["id"] for row in rows):
+                        rows.append(canonical_row)
+        exact_head = next((row for row in rows if row["idempotency_key"] == key), None)
+        equivalent_heads = [
+            row for row in rows
+            if _github_pr_identities_match(row["idempotency_key"], key)
+        ]
+        same_head = exact_head or (
+            equivalent_heads[0] if len(equivalent_heads) == 1 else None
+        )
         active_rows = [row for row in rows if row["status"] != "archived"]
         if action in {"closed", "merged"}:
             if not active_rows:
@@ -3906,6 +4166,21 @@ def ingest_pull_request(
             return task_id
         if same_head and same_head["status"] != "archived":
             task_id = str(same_head["id"])
+            if same_head["created_by"] != "github-webhook":
+                # The implementation handoff owns its evidence/body. The
+                # webhook has already been correlated by identity, so it must
+                # not overwrite that audit trail or create another card.
+                if same_head["idempotency_key"] != key:
+                    conn.execute(
+                        "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                        (key, task_id),
+                    )
+                    _append_event(
+                        conn, task_id, "github_pr_head_canonicalized",
+                        {**details, "previous_identity": same_head["idempotency_key"],
+                         "canonical_identity": key},
+                    )
+                return task_id
             if same_head["status"] == "running":
                 # Never let a same-head webhook replay orphan an in-flight
                 # reviewer.  Title/body are presentation-only and may be
