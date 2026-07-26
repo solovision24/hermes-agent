@@ -4082,7 +4082,7 @@ def test_submit_review_delegates_to_running_webhook_review(kanban_home):
 
 
 def test_delegated_webhook_review_routes_changes_to_original_implementer(kanban_home):
-    """A webhook review retains native provenance when it requests changes."""
+    """A delegated webhook review retains its implementation execution context."""
     head_sha = "e" * 40
     pr_url = "https://github.com/acme/widget/pull/45"
     with kb.connect() as conn:
@@ -4094,7 +4094,24 @@ def test_delegated_webhook_review_routes_changes_to_original_implementer(kanban_
         assert webhook_id is not None
         webhook_review = kb.claim_review_task(conn, webhook_id)
         assert webhook_review is not None
-        implementation_id = kb.create_task(conn, title="implementation", assignee="dev")
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as project_conn:
+            project_id = pdb.create_project(
+                project_conn,
+                name="Widget",
+                folders=["/repo"],
+            )
+        implementation_id = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path="/repo/.worktrees/implementation",
+            branch_name="feature/implementation",
+            project_id=project_id,
+            skills=["github-code-review"],
+        )
         implementation = kb.claim_task(conn, implementation_id)
         assert implementation is not None
         assert kb.submit_for_review(
@@ -4111,6 +4128,11 @@ def test_delegated_webhook_review_routes_changes_to_original_implementer(kanban_
     assert remediation is not None
     assert remediation.assignee == "dev"
     assert remediation.status == "ready"
+    assert remediation.workspace_kind == "worktree"
+    assert remediation.workspace_path == "/repo/.worktrees/implementation"
+    assert remediation.branch_name == "feature/implementation"
+    assert remediation.project_id == project_id
+    assert remediation.skills == ["github-code-review"]
 
 
 def test_webhook_expands_native_abbreviated_sha_to_github_head(kanban_home):

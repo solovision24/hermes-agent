@@ -3994,14 +3994,29 @@ def request_review_changes(
         implementer = payload.get("original_assignee")
         if not implementer:
             return None
+        # A running webhook review may have been delegated from an implementation
+        # task. In that case the webhook is canonical only for review lifecycle;
+        # the remediation must inherit the implementation workspace context.
+        implementation_row = row
+        delegated_from_task_id = payload.get("delegated_from_task_id")
+        if isinstance(delegated_from_task_id, str) and delegated_from_task_id:
+            candidate = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (delegated_from_task_id,)
+            ).fetchone()
+            if candidate is not None:
+                implementation_row = candidate
         remediation_key = f"review-remediation:{task_id}:{row['current_run_id']}"
         remediation_id = create_task(
             conn, title=f"Address review feedback: {row['title']}",
             body=(f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"),
-            assignee=implementer, tenant=row["tenant"], priority=row["priority"],
-            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"], project_id=row["project_id"],
-            skills=json.loads(row["skills"]) if row["skills"] else None,
+            assignee=implementer,
+            tenant=implementation_row["tenant"], priority=implementation_row["priority"],
+            workspace_kind=implementation_row["workspace_kind"],
+            workspace_path=implementation_row["workspace_path"],
+            branch_name=implementation_row["branch_name"],
+            project_id=implementation_row["project_id"],
+            skills=json.loads(implementation_row["skills"])
+            if implementation_row["skills"] else None,
             idempotency_key=remediation_key, created_by=row["assignee"] or "reviewer",
         )
         # Close the reviewer run before touching terminal evidence. The source
