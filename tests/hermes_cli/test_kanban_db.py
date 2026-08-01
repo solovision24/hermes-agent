@@ -438,7 +438,7 @@ def test_respawn_guard_allows_requeued_review_worker_after_pr(kanban_home, monke
         assert kb.detect_crashed_workers(conn) == [tid]
         requeued = kb.get_task(conn, tid)
         assert requeued is not None
-        assert requeued.status == "ready"
+        assert requeued.status == "review"
         assert kb.check_respawn_guard(conn, tid) is None
 
 

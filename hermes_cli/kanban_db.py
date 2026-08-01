@@ -7611,12 +7611,32 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            # A reviewer crash must return to the native review column.  Do
+            # not flatten it into an implementation-style ``ready`` card:
+            # the review dispatcher owns the claim/spawn semantics and will
+            # create the next run with the sdlc-review skill.
+            latest_claim = conn.execute(
+                """
+                SELECT json_extract(payload, '$.source_status') AS source_status
+                  FROM task_events
+                 WHERE task_id = ? AND kind = 'claimed'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            requeued_review = bool(
+                latest_claim and latest_claim["source_status"] == "review"
+            )
+            requeue_status = "review" if requeued_review else "ready"
+            if requeued_review:
+                event_payload["source_status"] = "review"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (requeue_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7703,8 +7723,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
                 if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
+                    # Below-budget: the task is already back at ``ready`` or
+                    # its native ``review`` column (respawn allowed) with
+                    # ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
@@ -8531,12 +8552,10 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        requeued_review = _latest_claim_was_review(conn, row["id"])
         claimed = claim_task(
             conn,
             row["id"],
             ttl_seconds=ttl_seconds,
-            source_status="review" if requeued_review else None,
         )
         if claimed is None:
             continue
@@ -8559,11 +8578,6 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        if requeued_review:
-            # A reviewer crash is requeued to ready so the normal reclaim
-            # path can release its claim. Preserve the native review lane
-            # when that ready card is claimed again.
-            claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
