@@ -507,6 +507,63 @@ def test_review_respawn_guard_honors_rate_limit_cooldown(kanban_home, monkeypatc
 
 
 
+def test_dispatch_review_lane_honors_rate_limit_cooldown(kanban_home, monkeypatch):
+    """The native review dispatcher must defer quota-wall reviewers."""
+    import json
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    now = 5_000_000
+    spawned: list[tuple[str, list[str]]] = []
+
+    def spawn(task, _workspace):
+        spawned.append((task.id, list(task.skills or [])))
+        return None
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="review", assignee="reviewer", initial_status="review",
+        )
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert result.spawned == []
+        assert (tid, "rate_limit_cooldown") in result.respawn_guarded
+        assert spawned == []
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='respawn_guarded' ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"]) == {
+            "reason": "rate_limit_cooldown", "lane": "review",
+        }
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert len(result.spawned) == 1
+        assert result.spawned[0][0] == tid
+        assert spawned == [(tid, ["sdlc-review"])]
+
+
 # ---------------------------------------------------------------------------
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------
