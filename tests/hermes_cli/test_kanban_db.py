@@ -359,6 +359,42 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_keeps_ordinary_pr_retry_protected(kanban_home):
+    """A normal implementation retry still cannot duplicate its open PR."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implementation", assignee="dev")
+        kb.add_comment(conn, tid, "dev", "PR: https://github.com/acme/repo/pull/42")
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_respawn_guard_does_not_trap_native_review_card(kanban_home):
+    """The canonical PR must not prevent a native review card from running."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review", assignee="reviewer", initial_status="review")
+        kb.add_comment(conn, tid, "dev", "PR: https://github.com/acme/repo/pull/42")
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_allows_requeued_review_worker_after_pr(kanban_home, monkeypatch):
+    """A crashed reviewer requeued to ready retains reviewer execution intent."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review", assignee="reviewer", initial_status="review")
+        kb.add_comment(conn, tid, "dev", "PR: https://github.com/acme/repo/pull/42")
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_review_task(conn, tid, claimer=f"{host}:reviewer")
+        assert claimed is not None
+        _kb._set_worker_pid(conn, tid, 98765)
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.detect_crashed_workers(conn) == [tid]
+        requeued = kb.get_task(conn, tid)
+        assert requeued is not None
+        assert requeued.status == "ready"
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 
 
 

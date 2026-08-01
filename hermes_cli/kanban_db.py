@@ -4270,7 +4270,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review", "assignee": trow["assignee"] if trow else None},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -8029,11 +8029,33 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT status, last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
+
+    # Native review cards are already routed to the reviewer lane and must not
+    # be treated as duplicate implementation work merely because the
+    # canonical PR is present in the card's comments.  A reviewer crash is
+    # requeued as ``ready`` by ``detect_crashed_workers``; retain that intent
+    # in the claimed event's ``source_status`` so the next reviewer attempt
+    # can pass the same guard after the status transition.
+    if row["status"] == "review":
+        return None
+    review_claim = conn.execute(
+        """
+        SELECT e.created_at
+          FROM task_events e
+         WHERE e.task_id = ?
+           AND e.kind = 'claimed'
+           AND json_extract(e.payload, '$.source_status') = 'review'
+           AND json_extract(e.payload, '$.assignee') = (SELECT assignee FROM tasks WHERE id = ?)
+         ORDER BY e.created_at DESC, e.id DESC
+         LIMIT 1
+        """,
+        (task_id, task_id),
+    ).fetchone()
 
     now = int(time.time())
 
@@ -8106,10 +8128,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # A PR opened for a native review belongs to the reviewer, not a
+            # duplicate implementation retry.  Only bypass when the review
+            # claim is newer than the PR comment, so an ordinary implementation
+            # task with an unrelated historical review event remains guarded.
+            if review_claim and review_claim["created_at"] >= c["created_at"]:
+                return None
             return "active_pr"
 
     return None
