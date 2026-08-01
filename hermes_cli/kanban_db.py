@@ -4232,6 +4232,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    source_status: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4332,11 +4333,11 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
-            run_id=run_id,
-        )
+        claim_payload = {"lock": lock, "expires": expires, "run_id": run_id}
+        if source_status is not None:
+            claim_payload["source_status"] = source_status
+            claim_payload["assignee"] = trow["assignee"] if trow else None
+        _append_event(conn, task_id, "claimed", claim_payload, run_id=run_id)
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4417,7 +4418,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review", "assignee": trow["assignee"] if trow else None},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -7757,12 +7758,32 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            # A reviewer crash must return to the native review column.  Do
+            # not flatten it into an implementation-style ``ready`` card:
+            # the review dispatcher owns the claim/spawn semantics and will
+            # create the next run with the sdlc-review skill.
+            latest_claim = conn.execute(
+                """
+                SELECT json_extract(payload, '$.source_status') AS source_status
+                  FROM task_events
+                 WHERE task_id = ? AND kind = 'claimed'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            requeued_review = bool(
+                latest_claim and latest_claim["source_status"] == "review"
+            )
+            requeue_status = "review" if requeued_review else "ready"
+            if requeued_review:
+                event_payload["source_status"] = "review"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (requeue_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7849,8 +7870,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
                 if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
+                    # Below-budget: the task is already back at ``ready`` or
+                    # its native ``review`` column (respawn allowed) with
+                    # ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
@@ -7990,7 +8012,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -8000,7 +8022,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -8127,6 +8149,21 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _latest_claim_was_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether the most recent claim came from the review lane."""
+    row = conn.execute(
+        """
+        SELECT json_extract(payload, '$.source_status') AS source_status
+          FROM task_events
+         WHERE task_id = ? AND kind = 'claimed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    return bool(row and row["source_status"] == "review")
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -8176,11 +8213,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT status, last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
+
+    # Native review cards are already routed to the reviewer lane and must not
+    # be treated as duplicate implementation work merely because the
+    # canonical PR is present in the card's comments.  A reviewer crash is
+    # requeued as ``review``; retain the claimed event's ``source_status`` so
+    # a ready retry can pass the same PR guard after a status transition.
+    review_claim = (
+        row["status"] == "review" or _latest_claim_was_review(conn, task_id)
+    )
 
     now = int(time.time())
 
@@ -8220,6 +8266,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
+    # A newly submitted review has no prior review claim to identify it, but
+    # it is still not an implementation retry.  Apply the rate-limit check
+    # above, then leave the native review lane alone.
+    if row["status"] == "review":
+        return None
+
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
@@ -8253,10 +8305,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # A PR opened for a native review belongs to the reviewer, not a
+            # duplicate implementation retry.  Only bypass when the review
+            # claim is newer than the PR comment, so an ordinary implementation
+            # task with an unrelated historical review event remains guarded.
+            if review_claim:
+                return None
             return "active_pr"
 
     return None
@@ -8646,7 +8704,11 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+        )
         if claimed is None:
             continue
         try:
@@ -8734,6 +8796,19 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Review cards bypass the ready-task loop, so apply the respawn guard
+        # here as well.  Otherwise a rate-limited reviewer is claimed again
+        # on every dispatcher tick during its cooldown.
+        guard_reason = check_respawn_guard(conn, row["id"])
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "respawn_guarded",
+                        {"reason": guard_reason, "lane": "review"},
+                    )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
