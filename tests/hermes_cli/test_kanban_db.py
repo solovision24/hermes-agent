@@ -375,6 +375,53 @@ def test_respawn_guard_does_not_trap_native_review_card(kanban_home):
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_dispatch_requeues_review_worker_into_review_lane(kanban_home, monkeypatch):
+    """A crashed reviewer keeps review routing when ready is dispatched."""
+    import json
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    spawned: list[tuple[str, list[str]]] = []
+
+    def spawn(task, _workspace):
+        spawned.append((task.id, list(task.skills or [])))
+        return None
+
+    with kb.connect() as conn:
+        review_id = kb.create_task(
+            conn, title="review", assignee="reviewer", initial_status="review",
+        )
+        kb.add_comment(conn, review_id, "dev", "PR: https://github.com/acme/repo/pull/42")
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_review_task(conn, review_id, claimer=f"{host}:reviewer")
+        _kb._set_worker_pid(conn, review_id, 98765)
+        implementation_id = kb.create_task(
+            conn, title="implementation", assignee="dev",
+        )
+        kb.add_comment(
+            conn, implementation_id, "dev",
+            "PR: https://github.com/acme/repo/pull/43",
+        )
+
+        assert kb.detect_crashed_workers(conn) == [review_id]
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+        assert len(result.spawned) == 1
+        assert result.spawned[0][0] == review_id
+        assert spawned == [(review_id, ["sdlc-review"])]
+        assert (implementation_id, "active_pr") in result.respawn_guarded
+        claim = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (review_id,),
+        ).fetchone()
+        assert claim is not None
+        assert json.loads(claim["payload"])["source_status"] == "review"
+
+
 def test_respawn_guard_allows_requeued_review_worker_after_pr(kanban_home, monkeypatch):
     """A crashed reviewer requeued to ready retains reviewer execution intent."""
     import hermes_cli.kanban_db as _kb

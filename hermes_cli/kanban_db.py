@@ -4085,6 +4085,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    source_status: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4185,11 +4186,11 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
-            run_id=run_id,
-        )
+        claim_payload = {"lock": lock, "expires": expires, "run_id": run_id}
+        if source_status is not None:
+            claim_payload["source_status"] = source_status
+            claim_payload["assignee"] = trow["assignee"] if trow else None
+        _append_event(conn, task_id, "claimed", claim_payload, run_id=run_id)
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -7980,6 +7981,21 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _latest_claim_was_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether the most recent claim came from the review lane."""
+    row = conn.execute(
+        """
+        SELECT json_extract(payload, '$.source_status') AS source_status
+          FROM task_events
+         WHERE task_id = ? AND kind = 'claimed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    return bool(row and row["source_status"] == "review")
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -8043,19 +8059,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # can pass the same guard after the status transition.
     if row["status"] == "review":
         return None
-    review_claim = conn.execute(
-        """
-        SELECT e.created_at
-          FROM task_events e
-         WHERE e.task_id = ?
-           AND e.kind = 'claimed'
-           AND json_extract(e.payload, '$.source_status') = 'review'
-           AND json_extract(e.payload, '$.assignee') = (SELECT assignee FROM tasks WHERE id = ?)
-         ORDER BY e.created_at DESC, e.id DESC
-         LIMIT 1
-        """,
-        (task_id, task_id),
-    ).fetchone()
+    review_claim = _latest_claim_was_review(conn, task_id)
 
     now = int(time.time())
 
@@ -8136,7 +8140,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # duplicate implementation retry.  Only bypass when the review
             # claim is newer than the PR comment, so an ordinary implementation
             # task with an unrelated historical review event remains guarded.
-            if review_claim and review_claim["created_at"] >= c["created_at"]:
+            if review_claim:
                 return None
             return "active_pr"
 
@@ -8527,7 +8531,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        requeued_review = _latest_claim_was_review(conn, row["id"])
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            source_status="review" if requeued_review else None,
+        )
         if claimed is None:
             continue
         try:
@@ -8549,6 +8559,11 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if requeued_review:
+            # A reviewer crash is requeued to ready so the normal reclaim
+            # path can release its claim. Preserve the native review lane
+            # when that ready card is claimed again.
+            claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
