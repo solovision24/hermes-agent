@@ -796,6 +796,52 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    """Route a completed implementation to the canonical review lane."""
+    tid = _default_task_id(args.get("task_id"))
+    reviewer = str(args.get("reviewer") or "").strip()
+    summary = str(args.get("summary") or "").strip()
+    if not tid or not reviewer or not summary:
+        return tool_error("task_id, reviewer, and summary are required")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.submit_for_review(
+                conn, tid, reviewer=reviewer, summary=summary,
+                metadata=args.get("metadata"), expected_run_id=_worker_run_id(tid),
+            )
+            return _ok(task_id=tid, status="review") if ok else tool_error(
+                f"could not submit {tid} for review (not the active implementation run)"
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        return tool_error(f"kanban_submit_review: {e}")
+
+
+def _handle_review_changes(args: dict, **kw) -> str:
+    """Close a review and create an implementer remediation card."""
+    tid = _default_task_id(args.get("task_id"))
+    summary = str(args.get("summary") or "").strip()
+    if not tid or not summary:
+        return tool_error("task_id and summary are required")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            remediation = kb.request_review_changes(
+                conn, tid, summary=summary, metadata=args.get("metadata"),
+                expected_run_id=_worker_run_id(tid),
+            )
+            return _ok(task_id=tid, status="done", remediation_task_id=remediation) \
+                if remediation else tool_error(
+                    f"could not request changes for {tid} (not the active review run)"
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        return tool_error(f"kanban_review_changes: {e}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1671,6 +1717,44 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": (
+        "Submit the active implementation run to the Review lane. Preserve "
+        "evidence in metadata and name the independent reviewer. Use this "
+        "instead of kanban_block for normal code-review handoff."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "reviewer": {"type": "string", "description": "Reviewer profile."},
+            "summary": {"type": "string", "description": "Review handoff summary."},
+            "metadata": {"type": "object", "description": "Evidence: PR URL, commit, tests, changed files."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["reviewer", "summary"],
+    },
+}
+
+KANBAN_REVIEW_CHANGES_SCHEMA = {
+    "name": "kanban_review_changes",
+    "description": (
+        "Record review findings, complete the active Review card, and create "
+        "one idempotent remediation task assigned to the original implementer."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "summary": {"type": "string", "description": "Requested changes and evidence."},
+            "metadata": {"type": "object", "description": "Structured review findings."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2081,6 +2165,24 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_changes",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_CHANGES_SCHEMA,
+    handler=_handle_review_changes,
+    check_fn=_check_kanban_mode,
+    emoji="🛠",
 )
 
 registry.register(
