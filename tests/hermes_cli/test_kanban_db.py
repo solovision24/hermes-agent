@@ -442,6 +442,65 @@ def test_respawn_guard_allows_requeued_review_worker_after_pr(kanban_home, monke
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_reviewer_crash_breaker_blocks_native_review_lane(kanban_home):
+    """Repeated reviewer crashes must trip the breaker instead of respawning."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="review", assignee="reviewer", initial_status="review",
+        )
+
+        assert kb._record_task_failure(
+            conn, tid, "reviewer crashed once", outcome="crashed",
+            failure_limit=2,
+        ) is False
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+        assert task.consecutive_failures == 1
+
+        assert kb._record_task_failure(
+            conn, tid, "reviewer crashed twice", outcome="crashed",
+            failure_limit=2,
+        ) is True
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 2
+
+
+def test_review_respawn_guard_honors_rate_limit_cooldown(kanban_home, monkeypatch):
+    """A rate-limited reviewer must be deferred while its quota cools down."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="review", assignee="reviewer", initial_status="review",
+        )
+        claimed = kb.claim_review_task(conn, tid)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued", tid),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kb.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 
 
 

@@ -7865,7 +7865,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -7875,7 +7875,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -8075,12 +8075,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # Native review cards are already routed to the reviewer lane and must not
     # be treated as duplicate implementation work merely because the
     # canonical PR is present in the card's comments.  A reviewer crash is
-    # requeued as ``ready`` by ``detect_crashed_workers``; retain that intent
-    # in the claimed event's ``source_status`` so the next reviewer attempt
-    # can pass the same guard after the status transition.
-    if row["status"] == "review":
-        return None
-    review_claim = _latest_claim_was_review(conn, task_id)
+    # requeued as ``review``; retain the claimed event's ``source_status`` so
+    # a ready retry can pass the same PR guard after a status transition.
+    review_claim = (
+        row["status"] == "review" or _latest_claim_was_review(conn, task_id)
+    )
 
     now = int(time.time())
 
@@ -8118,6 +8117,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # stamped on the task; this path intentionally retries forever
         # (cheaply, spaced by the cooldown) until quota returns or a real
         # crash/completion supersedes it.
+        return None
+
+    # A newly submitted review has no prior review claim to identify it, but
+    # it is still not an implementation retry.  Apply the rate-limit check
+    # above, then leave the native review lane alone.
+    if row["status"] == "review":
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
