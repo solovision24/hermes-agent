@@ -3946,6 +3946,57 @@ def _synthesize_ended_run(
     return int(cur.lastrowid or 0)
 
 
+def ingest_pull_request(
+    conn: sqlite3.Connection, *, repository: str, number: int, head_sha: str,
+    title: str, reviewer: Optional[str] = None, url: Optional[str] = None,
+    draft: bool = False, checks_passed: Optional[bool] = None,
+    mergeable: Optional[bool] = None, metadata: Optional[dict] = None,
+    action: str = "open",
+) -> str:
+    """Idempotently materialize an external GitHub PR as a Review card."""
+    if not repository or not head_sha or int(number) <= 0:
+        raise ValueError("repository, positive number, and head_sha are required")
+    action = str(action or "open").strip().lower()
+    if action not in {"open", "reopened", "synchronize", "closed", "merged"}:
+        raise ValueError("action must be one of open, reopened, synchronize, closed, merged")
+    key = f"github-pr:{repository}:{int(number)}:{head_sha}"
+    status = "triage" if draft else "blocked" if checks_passed is False or mergeable is False else "review"
+    if action in {"closed", "merged"}:
+        status = "done"
+    body = f"External GitHub PR: {repository}#{int(number)}\nHead: {head_sha}"
+    if url:
+        body += f"\nURL: {url}"
+    details = dict(metadata or {})
+    details.update({"adapter": "github_pr_native_ingest", "source": "github_pull_request",
+                    "repository": repository, "number": int(number), "head_sha": head_sha,
+                    "url": url, "draft": draft, "checks_passed": checks_passed,
+                    "mergeable": mergeable, "action": action})
+    existing = conn.execute(
+        "SELECT id, status FROM tasks WHERE idempotency_key = ? AND status != 'archived'", (key,)
+    ).fetchone()
+    if existing:
+        with write_txn(conn):
+            # A check_suite delivery for the same head SHA is the authoritative
+            # update for checks/conflicts.  Do not let a duplicate PR delivery
+            # with omitted check fields accidentally clear a real block.
+            should_update_status = action in {"closed", "merged", "reopened"}
+            should_update_status = should_update_status or checks_passed is not None or mergeable is not None
+            if should_update_status and existing["status"] != status:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                    (status, existing["id"]),
+                )
+            _append_event(conn, existing["id"], "github_pr_ingested", details)
+        return str(existing["id"])
+    task_id = create_task(conn, title=f"Review PR #{int(number)}: {title}", body=body,
+                          assignee=reviewer, idempotency_key=key, created_by="github-webhook",
+                          initial_status="blocked" if status == "blocked" else "running")
+    with write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE id = ?", (status, task_id))
+        _append_event(conn, task_id, "github_pr_ingested", details)
+    return task_id
+
+
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------

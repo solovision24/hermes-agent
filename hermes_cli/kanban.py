@@ -401,6 +401,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    p_ingest_pr = sub.add_parser(
+        "ingest-pr", help="Idempotently create/update a Review card from a GitHub pull_request event"
+    )
+    p_ingest_pr.add_argument("--repository", required=True, help="owner/repo")
+    p_ingest_pr.add_argument("--number", required=True, type=int, help="Pull request number")
+    p_ingest_pr.add_argument("--head-sha", required=True, help="PR head SHA")
+    p_ingest_pr.add_argument("--title", required=True, help="PR title")
+    p_ingest_pr.add_argument("--assignee", default=None, help="Reviewer profile")
+    p_ingest_pr.add_argument("--url", default=None, help="PR URL")
+    p_ingest_pr.add_argument("--draft", action="store_true")
+    p_ingest_pr.add_argument("--checks-passed", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--mergeable", choices=("true", "false"), default=None)
+    p_ingest_pr.add_argument("--action", choices=("open", "reopened", "synchronize", "closed", "merged"), default="open")
+    p_ingest_pr.add_argument("--metadata", default=None, help="Additional JSON payload metadata")
+    p_ingest_pr.add_argument("--json", action="store_true")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -1059,6 +1075,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "ingest-pr": _cmd_ingest_pr,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1116,6 +1133,34 @@ def kanban_command(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+def _cmd_ingest_pr(args: argparse.Namespace) -> int:
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must be a JSON object", file=sys.stderr)
+            return 2
+    else:
+        metadata = None
+    def as_bool(value):
+        return None if value is None else value == "true"
+    with kb.connect_closing() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository=args.repository, number=args.number, head_sha=args.head_sha,
+            title=args.title, reviewer=args.assignee, url=args.url, draft=args.draft,
+            checks_passed=as_bool(args.checks_passed), mergeable=as_bool(args.mergeable),
+            metadata=metadata, action=args.action,
+        )
+        task = kb.get_task(conn, task_id)
+    if args.json:
+        print(json.dumps(_task_to_dict(task), ensure_ascii=False))
+    else:
+        print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
+    return 0
 
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""

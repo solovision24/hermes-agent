@@ -24,6 +24,47 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def test_ingest_pr_clean_is_review_and_deduplicated(kanban_home):
+    args = (
+        "ingest-pr --repository acme/widget --number 7 "
+        "--head-sha deadbeef --title 'External change' --assignee reviewer "
+        "--metadata '{\"adapter\":\"spoofed\"}' --json"
+    )
+    first = json.loads(kc.run_slash(args))
+    second = json.loads(kc.run_slash(args))
+    assert first["id"] == second["id"]
+    assert first["status"] == "review"
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'github_pr_ingested' ORDER BY id DESC LIMIT 1",
+            (first["id"],),
+        ).fetchone()
+    assert json.loads(row["payload"])["adapter"] == "github_pr_native_ingest"
+
+
+def test_ingest_pr_failed_checks_are_blocked(kanban_home):
+    raw = kc.run_slash(
+        "ingest-pr --repository acme/widget --number 8 --head-sha badc0de "
+        "--title 'Broken checks' --checks-passed false --json"
+    )
+    assert json.loads(raw)["status"] == "blocked"
+
+
+def test_ingest_pr_same_head_updates_review_after_checks_pass(kanban_home):
+    key = "--repository acme/widget --number 9 --head-sha samehead --title 'Checks' --json"
+    assert json.loads(kc.run_slash(f"ingest-pr {key} --checks-passed false"))["status"] == "blocked"
+    updated = json.loads(kc.run_slash(f"ingest-pr {key} --checks-passed true --mergeable true --action synchronize"))
+    assert updated["status"] == "review"
+
+
+def test_ingest_pr_closed_updates_existing_review(kanban_home):
+    key = "--repository acme/widget --number 10 --head-sha closedhead --title 'Closed' --json"
+    created = json.loads(kc.run_slash(f"ingest-pr {key}"))
+    closed = json.loads(kc.run_slash(f"ingest-pr {key} --action closed"))
+    assert closed["id"] == created["id"]
+    assert closed["status"] == "done"
+
+
 # ---------------------------------------------------------------------------
 # Workspace flag parsing
 # ---------------------------------------------------------------------------
