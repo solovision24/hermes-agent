@@ -1,4 +1,7 @@
-"""Two-way sync between Hermes Kanban and the SoLoVision Notion Task Board.
+"""Mirror Hermes Kanban into the SoLoVision Notion Task Board.
+
+Hermes Kanban is the source of truth by default. Notion-to-Hermes imports
+remain available only when two-way sync is explicitly enabled.
 
 This module is intentionally runnable as a quiet operational script:
 
@@ -29,11 +32,14 @@ import requests
 
 from hermes_constants import get_default_hermes_root
 from hermes_cli import kanban_db
+from hermes_cli.config import load_config
 
 TASK_BOARD_DATABASE_ID = "8e85701f-81a6-490f-a859-5c0bc9e52827"
 NOTION_READ_VERSION = "2025-09-03"
 NOTION_WRITE_VERSION = "2022-06-28"
 REPORT_SUBDIR = "hermes-notion-sync"
+DEFAULT_SYNC_MODE = "outbound_only"
+SYNC_MODES = ("outbound_only", "two_way")
 CANONICAL_NOTION_STATUSES = ("Triage", "Todo", "Ready", "Running", "Blocked", "Done", "Archived")
 
 NOTION_TO_CANONICAL = {
@@ -137,6 +143,47 @@ class NotionTask:
     hermes_task_id: str | None
     hermes_status: str | None
 
+
+
+def normalize_sync_mode(value: Any, *, default: str = DEFAULT_SYNC_MODE) -> str:
+    raw = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "outbound": "outbound_only",
+        "outboundonly": "outbound_only",
+        "hermes_to_notion": "outbound_only",
+        "readonly_notion": "outbound_only",
+        "read_only_notion": "outbound_only",
+        "two_way": "two_way",
+        "twoway": "two_way",
+        "bidirectional": "two_way",
+        "notion_to_hermes": "two_way",
+        "inbound_enabled": "two_way",
+    }
+    mode = aliases.get(raw, raw)
+    return mode if mode in SYNC_MODES else default
+
+
+def configured_sync_mode(*, explicit_mode: str | None = None, outbound_only: bool = False, enable_notion_import: bool = False) -> str:
+    if outbound_only:
+        return "outbound_only"
+    if enable_notion_import:
+        return "two_way"
+    if explicit_mode:
+        return normalize_sync_mode(explicit_mode)
+    env_mode = os.environ.get("HERMES_NOTION_KANBAN_SYNC_MODE")
+    if env_mode:
+        return normalize_sync_mode(env_mode)
+    env_allow = os.environ.get("HERMES_NOTION_KANBAN_ALLOW_INBOUND")
+    if env_allow and env_allow.strip().lower() in {"1", "true", "yes", "on", "two_way"}:
+        return "two_way"
+    try:
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+    notion_cfg = cfg.get("notion_kanban_sync") if isinstance(cfg, dict) else {}
+    if isinstance(notion_cfg, dict):
+        return normalize_sync_mode(notion_cfg.get("mode"))
+    return DEFAULT_SYNC_MODE
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -780,8 +827,11 @@ class NotionKanbanSync:
         hermes_task_ids: set[str] | None = None,
         created_since: str | None = None,
         quiet: bool = False,
+        sync_mode: str | None = None,
     ) -> tuple[SyncStats, Path]:
         stats = SyncStats()
+        effective_sync_mode = normalize_sync_mode(sync_mode)
+        outbound_only = effective_sync_mode == "outbound_only"
         db_schema = self.notion.retrieve_database()
         raw_pages = self.notion.query_tasks(limit=limit, since=since)
         notion_tasks = [parse_notion_task(page) for page in raw_pages if not page.get("archived")]
@@ -829,6 +879,8 @@ class NotionKanbanSync:
             report_payload = {
                 "generated_at": _now_iso(),
                 "dry_run": dry_run,
+                "sync_mode": effective_sync_mode,
+                "outbound_only": outbound_only,
                 "status_migration_only": True,
                 "board": self.board or kanban_db.get_current_board(),
                 "database_id": self.notion.database_id,
@@ -851,19 +903,20 @@ class NotionKanbanSync:
             by_notion_page = {notion_page_id_from_task(task): task for task in tasks if notion_page_id_from_task(task)}
             by_task_id = {task.id: task for task in tasks}
 
-            for notion_task in notion_tasks:
-                self._sync_notion_task(
-                    conn,
-                    notion_task,
-                    profiles,
-                    by_notion_page,
-                    by_task_id,
-                    dry_run=dry_run,
-                    status_migration=status_migration,
-                    max_creates=max_creates,
-                    created_task_ids=created_task_ids,
-                    stats=stats,
-                )
+            if not outbound_only:
+                for notion_task in notion_tasks:
+                    self._sync_notion_task(
+                        conn,
+                        notion_task,
+                        profiles,
+                        by_notion_page,
+                        by_task_id,
+                        dry_run=dry_run,
+                        status_migration=status_migration,
+                        max_creates=max_creates,
+                        created_task_ids=created_task_ids,
+                        stats=stats,
+                    )
 
             # Refresh task list after any Notion-created tasks, then push Hermes runtime state to Notion.
             # Pair by the embedded/idempotency Notion page id when present, and fall back to
@@ -925,6 +978,8 @@ class NotionKanbanSync:
         report_payload = {
             "generated_at": _now_iso(),
             "dry_run": dry_run,
+            "sync_mode": effective_sync_mode,
+            "outbound_only": outbound_only,
             "board": self.board or kanban_db.get_current_board(),
             "database_id": self.notion.database_id,
             "ensure": ensure,
@@ -1202,12 +1257,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--daemon", action="store_true")
     parser.add_argument("--interval", type=int, default=180)
     parser.add_argument("--quiet", action="store_true", help="suppress no-change output in apply mode")
+    parser.add_argument(
+        "--sync-mode",
+        choices=SYNC_MODES,
+        default=None,
+        help="source-of-truth mode; default comes from config notion_kanban_sync.mode and is outbound_only",
+    )
+    parser.add_argument(
+        "--outbound-only",
+        action="store_true",
+        help="publish Hermes Kanban state to Notion, but do not create/update Hermes tasks from Notion",
+    )
+    parser.add_argument(
+        "--enable-notion-import",
+        action="store_true",
+        help="explicitly enable two-way mode so Notion can create/update Hermes Kanban tasks",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     dry_run = not args.apply or args.dry_run
+    sync_mode = configured_sync_mode(
+        explicit_mode=args.sync_mode,
+        outbound_only=args.outbound_only,
+        enable_notion_import=args.enable_notion_import,
+    )
     notion = NotionClient(load_notion_key(), database_id=args.database_id)
     sync = NotionKanbanSync(
         notion=notion,
@@ -1227,6 +1303,7 @@ def main(argv: list[str] | None = None) -> int:
             hermes_task_ids=set(args.hermes_task_id) or None,
             created_since=args.created_since,
             quiet=args.quiet,
+            sync_mode=sync_mode,
         )
         if not args.daemon:
             return 2 if stats.errors else 0
