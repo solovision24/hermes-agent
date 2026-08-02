@@ -848,10 +848,18 @@ def _handle_review_changes(args: dict, **kw) -> str:
                 conn, tid, summary=summary, metadata=args.get("metadata"),
                 expected_run_id=_worker_run_id(tid),
             )
-            return _ok(task_id=tid, status="done", parent_status="done", remediation_task_id=remediation) \
-                if remediation else tool_error(
+            if not remediation:
+                return tool_error(
                     f"could not request changes for {tid} (not the active review run)"
                 )
+            remediation_task = kb.get_task(conn, remediation)
+            return _ok(
+                task_id=tid,
+                status="done",
+                parent_status="done",
+                remediation_task_id=remediation,
+                remediation_status=remediation_task.status if remediation_task else None,
+            )
         finally:
             conn.close()
     except Exception as e:

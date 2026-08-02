@@ -1,6 +1,7 @@
 """Behavioral tests for the upstream-aligned native review lifecycle."""
 
 from pathlib import Path
+from argparse import Namespace
 
 import pytest
 
@@ -84,6 +85,34 @@ def test_review_changes_creates_one_idempotent_remediation_child(board):
         assert run["status"] == "done"
         assert run["outcome"] == "changes_requested"
         assert run["ended_at"] is not None
+
+
+def test_review_changes_remediation_is_ready_after_parent_done(board, capsys):
+    from hermes_cli import kanban as cli
+
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+
+        args = Namespace(
+            task_id=task_id, summary=["Fix", "the", "regression"], metadata=None
+        )
+        assert cli._cmd_review_changes(args) == 0
+        assert "remediation status: ready" in capsys.readouterr().out
+        remediation = conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id=?", (task_id,)
+        ).fetchone()
+        assert remediation is not None
+        child = kb.get_task(conn, remediation["child_id"])
+        assert child is not None
+        assert child.status == "ready"
 
 
 def test_remediation_child_can_be_reviewed_again(board, monkeypatch):

@@ -4251,13 +4251,18 @@ def claim_task(
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
-        # regardless of which writer (create_task, link_tasks, unblock_task,
-        # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
-        # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        # parent is not yet 'done'. Review remediation children are the
+        # deliberate exception: their parent ended with ``changes_requested``
+        # and the child is the new implementation cycle.
+        child_row = conn.execute(
+            "SELECT idempotency_key FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        is_review_remediation = bool(
+            child_row and str(child_row["idempotency_key"] or "").startswith("review-remediation:")
+        )
+        unsuccessful_outcomes = _UNSUCCESSFUL_PARENT_OUTCOMES - (
+            {"changes_requested"} if is_review_remediation else set()
+        )
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
@@ -4266,9 +4271,9 @@ def claim_task(
             "ORDER BY latest.id DESC LIMIT 1)) "
             "WHERE l.child_id = ? "
             "AND (p.status NOT IN ('done', 'archived') "
-            "OR r.outcome IN (" + ",".join("?" * len(_UNSUCCESSFUL_PARENT_OUTCOMES)) + ")) "
+            "OR r.outcome IN (" + ",".join("?" * len(unsuccessful_outcomes)) + ")) "
             "LIMIT 1",
-            (task_id, *_UNSUCCESSFUL_PARENT_OUTCOMES),
+            (task_id, *unsuccessful_outcomes),
         ).fetchone()
         if undone:
             conn.execute(
@@ -4628,6 +4633,7 @@ def request_review_changes(
             workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
             branch_name=row["branch_name"], project_id=row["project_id"],
             skills=json.loads(row["skills"]) if row["skills"] else None,
+            parents=(task_id,),
             idempotency_key=remediation_key,
         )
         review_metadata = dict(metadata or {})
@@ -4655,6 +4661,17 @@ def request_review_changes(
         if run_id is None:
             raise RuntimeError("review run disappeared while requesting changes")
         _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
+        # The remediation child is the one intentional exception to the
+        # unsuccessful-parent dependency guard: its parent is done precisely
+        # because review requested a new implementation cycle. Promote this
+        # child atomically so both public review-changes surfaces can report
+        # the ready handoff without making unrelated dependents ready.
+        promoted = conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id=? AND status='todo'",
+            (remediation_id,),
+        )
+        if promoted.rowcount == 1:
+            _append_event(conn, remediation_id, "promoted", None)
     recompute_ready(conn)
     return remediation_id
 

@@ -446,6 +446,45 @@ def test_create_review_status_enters_review_and_is_claimable(worker_env):
         conn.close()
 
 
+def test_review_changes_tool_reports_ready_remediation_status(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    conn = kb.connect()
+    try:
+        implementation = kb.get_task(conn, worker_env)
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn,
+            worker_env,
+            reviewer="reviewer",
+            summary="ready",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/8",
+                "repo": "acme/repo",
+                "number": 8,
+                "head_sha": "a" * 40,
+                "verification_evidence": {"tests": ["focused"]},
+            },
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, worker_env, claimer="worker:reviewer")
+        assert review is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    result = json.loads(kt._handle_review_changes({"summary": "fix it"}))
+    assert result["ok"] is True
+    assert result["task_id"] == worker_env
+    assert result["status"] == "done"
+    assert result["parent_status"] == "done"
+    assert result["remediation_task_id"]
+    assert result["remediation_status"] == "ready"
+
+
 def test_review_tool_schema_and_runtime_handoff(worker_env, monkeypatch):
     from hermes_cli import profiles
     from hermes_cli import kanban_db as kb

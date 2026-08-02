@@ -2255,7 +2255,15 @@ def _cmd_review_changes(args: argparse.Namespace) -> int:
     if not remediation:
         print(f"cannot request changes for {args.task_id}", file=sys.stderr)
         return 1
-    print(f"Review changes recorded; original task is done; remediation task: {remediation}")
+    remediation_status = "unknown"
+    with kb.connect_closing() as conn:
+        remediation_task = kb.get_task(conn, remediation)
+        if remediation_task is not None:
+            remediation_status = remediation_task.status
+    print(
+        "Review changes recorded; original task is done; "
+        f"remediation task: {remediation}; remediation status: {remediation_status}"
+    )
     return 0
 
 
