@@ -4696,57 +4696,81 @@ def request_review_changes(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Complete a review with findings and create one remediation card."""
+    """Return the same card to its implementer for a changes-requested re-review."""
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
-    _assert_worker_task_ownership(task_id)
     with write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None or row["status"] != "running":
             return None
-        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        current_run_id = row["current_run_id"]
+        if not current_run_id:
+            return None
+        if expected_run_id is not None and current_run_id != int(expected_run_id):
+            return None
+        run = conn.execute(
+            "SELECT profile, status, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (current_run_id, task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["status"] != "running"
+            or run["ended_at"] is not None
+            or _canonical_assignee(run["profile"]) != _canonical_assignee(row["assignee"])
+        ):
+            return None
+        claim = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, current_run_id),
+        ).fetchone()
+        try:
+            claim_payload = json.loads(claim["payload"]) if claim and claim["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            claim_payload = {}
+        if (
+            claim_payload.get("source_status") != "review"
+            or _canonical_assignee(claim_payload.get("assignee"))
+            != _canonical_assignee(row["assignee"])
+        ):
             return None
         event = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? AND kind='review_submitted' "
-            "ORDER BY id DESC LIMIT 1", (task_id,)
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_submitted' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
         ).fetchone()
         handoff = json.loads(event["payload"]) if event and event["payload"] else {}
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
-        remediation_key = f"review-remediation:{task_id}:{row['current_run_id']}"
-        remediation_id = create_task(
-            conn, title=f"Address review feedback: {row['title']}",
-            body=f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}",
-            assignee=implementer, created_by=row["assignee"] or "reviewer",
-            tenant=row["tenant"], priority=row["priority"],
-            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"], project_id=row["project_id"],
-            skills=json.loads(row["skills"]) if row["skills"] else None,
-            idempotency_key=remediation_key,
-        )
         review_metadata = dict(metadata or {})
-        review_metadata.update({"approved": False, "remediation_task_id": remediation_id,
-                                "original_assignee": implementer})
-        where = "id=? AND status='running'"
-        params: tuple[Any, ...] = (summary.strip(), int(time.time()), task_id)
-        if expected_run_id is not None:
-            where += " AND current_run_id=?"
-            params += (int(expected_run_id),)
+        review_metadata.update({
+            "approved": False,
+            "reviewer": row["assignee"],
+            "original_assignee": implementer,
+            "original_implementer": implementer,
+            "review_identity": handoff.get("review_identity"),
+            "changes_requested": True,
+        })
         cur = conn.execute(
-            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL WHERE " + where,
-            params,
+            "UPDATE tasks SET status='ready', assignee=?, result=?, completed_at=NULL, "
+            "consecutive_failures=0, last_failure_error=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=? "
+            "AND status='running' AND current_run_id IS NOT NULL",
+            (implementer, summary.strip(), task_id),
         )
         if cur.rowcount != 1:
             return None
         run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status="done",
+            conn, task_id, outcome="changes_requested", status="ready",
             summary=summary.strip(), metadata=review_metadata,
         )
+        if run_id is None:
+            raise RuntimeError("review run disappeared while requesting changes")
         _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
-    recompute_ready(conn)
-    return remediation_id
+    return task_id
 
 
 def heartbeat_claim(
@@ -9052,7 +9076,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
