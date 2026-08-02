@@ -60,28 +60,15 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 For code-changing tasks, implementation is handed to an independent reviewer rather than masquerading as a human blocker:
 
-- Call `kanban_submit_review(reviewer=..., summary=..., metadata=...)`. `metadata` is required and must contain the canonical open PR URL (`pr_url`), matching `repo` and `number`, the exact immutable 40-character `head_sha`, and non-empty `verification_evidence`. The reviewer defaults to `orion` and must be a different, spawnable profile from the implementer.
+- Call `kanban_submit_review(reviewer=..., summary=..., metadata=...)` with the PR identity (`pr_url`, matching `repo`/`number`, and the full immutable `head_sha`), changed files, tests, and other evidence. The reviewer must be a different, spawnable profile from the implementer.
 - The task moves from `running` to `review`, preserving the implementation run and assigning the reviewer. The dispatcher claims review cards separately, so the implementer is not respawned.
+- Native handoff and GitHub webhook ingestion reconcile by `repo/number/head_sha` in either arrival order. A webhook-first card and a native-first card become one active card; implementation runs and events are retained, and webhook replays do not steal an active reviewer claim.
+- For the CLI, use `hermes kanban submit-review <task> <summary words...>` for the default `orion` reviewer. To select another reviewer, use the unambiguous `--reviewer <profile>` flag; the first summary word is never interpreted as a reviewer.
 - A reviewer approves with `kanban_complete(summary=..., metadata={"approved": true, ...})`.
-- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the same card returns to `ready` for the original implementer, preserving findings and history. A later implementation submission sends that card through Review again.
+- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the review card completes with findings and one idempotent remediation task is created for the original implementer.
 - Use `kanban_block(reason=...)` only for genuine human input, credentials, capability, dependency, or transient failures. Scheduled tasks remain time-gated and distinct from blocked work.
 
 The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks) and the explicit Review-lane handoff.
-
-### Upstream boundary matrix
-
-This integration is intentionally explicit about which behavior is upstream and which is the SoLo compatibility surface:
-
-| Contract | Upstream-released behavior | SoLo compatibility extension | Pending upstream reference |
-| --- | --- | --- | --- |
-| Review/Scheduled lanes | `review` is claimable by the dispatcher; `scheduled` is time-gated and is not dispatchable | none; preserve these status semantics | — |
-| Request review | no general first-class request transition in the released base | `kanban_submit_review`, CLI handoff, immutable PR evidence, reviewer validation | Issue [#42896](https://github.com/NousResearch/hermes-agent/issues/42896); open PR #75451 |
-| Changes requested | reviewer completion remains a normal terminal outcome | same-card `review → ready → review` re-review with implementer provenance | Do not assume pending PR behavior until released |
-| GitHub PR ingestion | native PR ingestion from active base PR #8 is preserved | repo/PR/full-SHA dedupe, webhook/native ordering, merged/closed reconciliation, new-head supersession | — |
-
-The compatibility extension never turns review-required work into `blocked`, and it does not add a polling watchdog. A failed or stale reviewer claim is recovered into the Review lane and the next spawned reviewer force-loads `sdlc-review`.
-
-For a read-only local prerequisite check, run `python scripts/check_native_review_conformance.py`. It reads the active `◆` marker from `hermes profile list` and verifies the default reviewer is on disk in `hermes kanban assignees`.
 
 ## Logs and audit trail
 

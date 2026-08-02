@@ -615,6 +615,8 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `claim <id>` | Atomically claim a ready task. Prints resolved workspace path. |
 | `comment <id> "<text>"` | Append a comment. The next worker that claims the task reads it as part of its `kanban_show()` response. |
 | `complete <id>` | Mark task done. Flags: `--result`, `--summary`, `--metadata`. |
+| `submit-review <id> <summary...>` | Submit a running implementation to Review with reviewer `orion`; pass `--reviewer <profile>` for an explicit reviewer. The PR metadata must include the canonical URL, matching repo/number, full head SHA, and verification evidence. |
+| `ingest-pr` | Idempotently create/update a Review card from a GitHub pull-request event. Requires `--repository`, `--number`, `--head-sha`, and `--title`; supports `--action open|reopened|synchronize|closed|merged`. |
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Return a blocked or scheduled task to ready (or `todo` if dependencies are still open). |

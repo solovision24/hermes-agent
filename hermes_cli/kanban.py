@@ -406,14 +406,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_ingest_pr.add_argument("--repository", required=True, help="owner/repo")
     p_ingest_pr.add_argument("--number", required=True, type=int, help="Pull request number")
-    p_ingest_pr.add_argument("--head-sha", required=True, help="PR head SHA")
+    p_ingest_pr.add_argument("--head-sha", required=True, help="Full PR head SHA")
     p_ingest_pr.add_argument("--title", required=True, help="PR title")
     p_ingest_pr.add_argument("--assignee", default=None, help="Reviewer profile")
     p_ingest_pr.add_argument("--url", default=None, help="PR URL")
     p_ingest_pr.add_argument("--draft", action="store_true")
     p_ingest_pr.add_argument("--checks-passed", choices=("true", "false"), default=None)
     p_ingest_pr.add_argument("--mergeable", choices=("true", "false"), default=None)
-    p_ingest_pr.add_argument("--action", choices=("open", "reopened", "synchronize", "closed", "merged"), default="open")
+    p_ingest_pr.add_argument(
+        "--action", choices=("open", "reopened", "synchronize", "closed", "merged"),
+        default="open",
+    )
     p_ingest_pr.add_argument("--metadata", default=None, help="Additional JSON payload metadata")
     p_ingest_pr.add_argument("--json", action="store_true")
 
@@ -622,12 +625,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_submit_review.add_argument("task_id")
     p_submit_review.add_argument(
-        "reviewer_or_summary", nargs="?",
-        help="Reviewer profile (legacy form) or first summary word",
+        "summary", nargs="+", help="Review handoff summary (default reviewer: orion)"
     )
-    p_submit_review.add_argument("summary", nargs="*", help="Review handoff summary")
     p_submit_review.add_argument(
-        "--reviewer", default=None, help="Reviewer profile (default: orion)"
+        "--reviewer", default="orion", help="Reviewer profile (default: orion)"
     )
     p_submit_review.add_argument("--metadata", default=None, help="JSON evidence object")
 
@@ -1140,34 +1141,6 @@ def kanban_command(args: argparse.Namespace) -> int:
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _cmd_ingest_pr(args: argparse.Namespace) -> int:
-    if args.metadata:
-        try:
-            metadata = json.loads(args.metadata)
-        except json.JSONDecodeError as exc:
-            print(f"kanban: --metadata: {exc}", file=sys.stderr)
-            return 2
-        if not isinstance(metadata, dict):
-            print("kanban: --metadata must be a JSON object", file=sys.stderr)
-            return 2
-    else:
-        metadata = None
-    def as_bool(value):
-        return None if value is None else value == "true"
-    with kb.connect_closing() as conn:
-        task_id = kb.ingest_pull_request(
-            conn, repository=args.repository, number=args.number, head_sha=args.head_sha,
-            title=args.title, reviewer=args.assignee, url=args.url, draft=args.draft,
-            checks_passed=as_bool(args.checks_passed), mergeable=as_bool(args.mergeable),
-            metadata=metadata, action=args.action,
-        )
-        task = kb.get_task(conn, task_id)
-    if args.json:
-        print(json.dumps(_task_to_dict(task), ensure_ascii=False))
-    else:
-        print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
-    return 0
-
 def _profile_author() -> str:
     """Best-effort author name for an interactive CLI call."""
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
@@ -1195,6 +1168,9 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "submit-review",
+    "review-changes",
+    "ingest-pr",
     "edit",
     "block",
     "schedule",
@@ -2194,6 +2170,45 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ingest_pr(args: argparse.Namespace) -> int:
+    if args.metadata:
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must be a JSON object", file=sys.stderr)
+            return 2
+    else:
+        metadata = None
+
+    def as_bool(value: Optional[str]) -> Optional[bool]:
+        return None if value is None else value == "true"
+
+    with kb.connect_closing() as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository=args.repository,
+            number=args.number,
+            head_sha=args.head_sha,
+            title=args.title,
+            reviewer=args.assignee,
+            url=args.url,
+            draft=args.draft,
+            checks_passed=as_bool(args.checks_passed),
+            mergeable=as_bool(args.mergeable),
+            metadata=metadata,
+            action=args.action,
+        )
+        task = kb.get_task(conn, task_id) if task_id else None
+    if args.json:
+        print(json.dumps(_task_to_dict(task) if task else None, ensure_ascii=False))
+    else:
+        print(f"Ingested GitHub PR as {task_id} ({task.status if task else 'unknown'})")
+    return 0
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
@@ -2212,25 +2227,12 @@ def _cmd_submit_review(args: argparse.Namespace) -> int:
         metadata = json.loads(args.metadata)
         if not isinstance(metadata, dict):
             raise ValueError("--metadata must be a JSON object")
-    first = args.reviewer_or_summary
-    if args.reviewer is not None:
-        reviewer = args.reviewer
-        summary_words = ([first] if first else []) + list(args.summary)
-    elif args.summary:
-        # Preserve the original positional form: <task> <reviewer> <summary...>.
-        reviewer = first
-        summary_words = list(args.summary)
-    else:
-        reviewer = "orion"
-        summary_words = [first] if first else []
-    if not reviewer or not summary_words:
-        raise ValueError("reviewer and summary are required")
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         run_id = task.current_run_id if task else None
         if not kb.submit_for_review(
-            conn, args.task_id, reviewer=reviewer,
-            summary=" ".join(summary_words), metadata=metadata,
+            conn, args.task_id, reviewer=args.reviewer,
+            summary=" ".join(args.summary), metadata=metadata,
             expected_run_id=run_id,
         ):
             print(f"cannot submit {args.task_id} for review", file=sys.stderr)
@@ -2255,7 +2257,7 @@ def _cmd_review_changes(args: argparse.Namespace) -> int:
     if not remediation:
         print(f"cannot request changes for {args.task_id}", file=sys.stderr)
         return 1
-    print(f"Review changes recorded on the same card; re-review task: {remediation}")
+    print(f"Review changes recorded; remediation task: {remediation}")
     return 0
 
 
