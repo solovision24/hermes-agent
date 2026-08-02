@@ -13,6 +13,7 @@ REVIEW_METADATA = {
     "number": 1,
     "head_sha": "a" * 40,
     "verification_evidence": {"tests_passed": 3},
+    "exact_head_checks": True,
 }
 
 
@@ -52,7 +53,7 @@ def test_implementation_handoff_is_claimable_by_reviewer(board):
         assert review.assignee == "reviewer"
 
 
-def test_review_changes_returns_same_card_to_implementer(board):
+def test_review_changes_creates_one_idempotent_remediation_child(board):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")
         implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
@@ -66,26 +67,26 @@ def test_review_changes_returns_same_card_to_implementer(board):
         remediation_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test", expected_run_id=review.current_run_id
         )
-        assert remediation_id == task_id
+        assert remediation_id != task_id
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.assignee == "dev"
-        assert task.status == "ready"
+        assert task.assignee == "reviewer"
+        assert task.status == "done"
         rows = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks",
         ).fetchone()
-        assert rows["n"] == 1
+        assert rows["n"] == 2
         run = conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs "
             "WHERE task_id=? ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        assert run["status"] == "ready"
+        assert run["status"] == "done"
         assert run["outcome"] == "changes_requested"
         assert run["ended_at"] is not None
 
 
-def test_changes_requested_reuses_same_card_for_implementer_and_re_review(board, monkeypatch):
+def test_remediation_child_can_be_reviewed_again(board, monkeypatch):
     from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -100,25 +101,26 @@ def test_changes_requested_reuses_same_card_for_implementer_and_re_review(board,
         review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
         assert review is not None
 
-        assert kb.request_review_changes(
+        remediation_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test",
             metadata={"approved": False}, expected_run_id=review.current_run_id,
-        ) == task_id
+        )
+        assert remediation_id != task_id
 
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.status == "ready"
-        assert task.assignee == "dev"
-        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
+        assert task.status == "done"
+        assert task.assignee == "reviewer"
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 2
 
-        fix = kb.claim_task(conn, task_id, claimer="worker:dev")
+        fix = kb.claim_task(conn, remediation_id, claimer="worker:dev")
         assert fix is not None
         assert kb.submit_for_review(
-            conn, task_id, reviewer="reviewer", summary="fixed",
+            conn, remediation_id, reviewer="reviewer", summary="fixed",
             metadata={**REVIEW_METADATA, "head_sha": "b" * 40},
             expected_run_id=fix.current_run_id,
         )
-        assert kb.get_task(conn, task_id).status == "review"
+        assert kb.get_task(conn, remediation_id).status == "review"
 
 
 def test_dev_implementation_rerun_cannot_use_historical_review_submission(board):
@@ -132,21 +134,19 @@ def test_dev_implementation_rerun_cannot_use_historical_review_submission(board)
         )
         review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
         assert review is not None
-        assert kb.request_review_changes(
+        remediation_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test",
             expected_run_id=review.current_run_id,
-        ) == task_id
+        )
+        assert remediation_id != task_id
 
-        rerun = kb.claim_task(conn, task_id, claimer="worker:dev")
-        assert rerun is not None
         assert kb.request_review_changes(
             conn, task_id, summary="I found another issue",
-            expected_run_id=rerun.current_run_id,
         ) is None
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.status == "running"
-        assert task.assignee == "dev"
+        assert task.status == "done"
+        assert task.assignee == "reviewer"
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM task_events "
             "WHERE task_id=? AND kind='review_changes_requested'",
@@ -286,6 +286,29 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
         assert run.metadata["approved"] is True
 
 
+@pytest.mark.parametrize("exact_head_checks", [None, False])
+def test_review_approval_requires_exact_head_checks(board, exact_head_checks):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        metadata = {"approved": True, "checks_passed": True}
+        if exact_head_checks is not None:
+            metadata["exact_head_checks"] = exact_head_checks
+        with pytest.raises(ValueError, match="exact_head_checks=true"):
+            kb.complete_task(
+                conn, task_id, summary="missing exact-head proof",
+                metadata=metadata, expected_run_id=review.current_run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+
+
 def test_changes_requested_event_cannot_complete_or_promote_dependency(board):
     """The incident event shape is never a successful dependency signal."""
     with board as conn:
@@ -299,7 +322,7 @@ def test_changes_requested_event_cannot_complete_or_promote_dependency(board):
         )
         review = kb.claim_review_task(conn, parent, claimer="worker:reviewer")
         assert review is not None
-        assert kb.request_review_changes(
+        remediation_id = kb.request_review_changes(
             conn,
             parent,
             summary="changes required",
@@ -310,18 +333,11 @@ def test_changes_requested_event_cannot_complete_or_promote_dependency(board):
                 "checks_passed": False,
             },
             expected_run_id=review.current_run_id,
-        ) == parent
+        )
+        assert remediation_id != parent
         assert kb.get_task(conn, child).status == "todo"
 
-        rerun = kb.claim_task(conn, parent, claimer="worker:dev")
-        assert rerun is not None
-        with pytest.raises(ValueError, match="submit_for_review"):
-            kb.complete_task(
-                conn, parent, summary="not approved",
-                metadata={"approved": False, "changes_requested": True},
-                expected_run_id=rerun.current_run_id,
-            )
-        assert kb.get_task(conn, parent).status == "running"
+        assert kb.get_task(conn, parent).status == "done"
 
 
 def test_changes_requested_run_outcome_does_not_satisfy_dependency(board):
@@ -342,6 +358,10 @@ def test_changes_requested_run_outcome_does_not_satisfy_dependency(board):
         )
         conn.commit()
         assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child,))
+        conn.commit()
+        assert kb.claim_task(conn, child, claimer="worker:dev") is None
         assert kb.get_task(conn, child).status == "todo"
 
         scheduled_id = kb.create_task(conn, title="later", assignee="dev")

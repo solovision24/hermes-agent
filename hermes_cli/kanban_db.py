@@ -4126,6 +4126,14 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+_UNSUCCESSFUL_PARENT_OUTCOMES = frozenset({
+    "changes_requested",
+    "submitted_for_review",
+    "github_pr_superseded",
+    "github_pr_closed",
+})
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4178,19 +4186,15 @@ def recompute_ready(
                 "SELECT t.status, r.outcome "
                 "FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
-                "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+                "LEFT JOIN task_runs r ON r.id = COALESCE(t.current_run_id, "
+                "(SELECT latest.id FROM task_runs latest WHERE latest.task_id = t.id "
+                "ORDER BY latest.id DESC LIMIT 1)) "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            unsuccessful_outcomes = {
-                "changes_requested",
-                "submitted_for_review",
-                "github_pr_superseded",
-                "github_pr_closed",
-            }
             if all(
                 p["status"] in ("done", "archived")
-                and p["outcome"] not in unsuccessful_outcomes
+                and p["outcome"] not in _UNSUCCESSFUL_PARENT_OUTCOMES
                 for p in parents
             ):
                 if cur_status == "blocked":
@@ -4257,8 +4261,14 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
+            "LEFT JOIN task_runs r ON r.id = COALESCE(p.current_run_id, "
+            "(SELECT latest.id FROM task_runs latest WHERE latest.task_id = p.id "
+            "ORDER BY latest.id DESC LIMIT 1)) "
+            "WHERE l.child_id = ? "
+            "AND (p.status NOT IN ('done', 'archived') "
+            "OR r.outcome IN (" + ",".join("?" * len(_UNSUCCESSFUL_PARENT_OUTCOMES)) + ")) "
+            "LIMIT 1",
+            (task_id, *_UNSUCCESSFUL_PARENT_OUTCOMES),
         ).fetchone()
         if undone:
             conn.execute(
@@ -4609,6 +4619,17 @@ def request_review_changes(
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
+        remediation_key = f"review-remediation:{task_id}:{current_run_id}"
+        remediation_id = create_task(
+            conn, title=f"Address review feedback: {row['title']}",
+            body=f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}",
+            assignee=implementer, created_by=row["assignee"] or "reviewer",
+            tenant=row["tenant"], priority=row["priority"],
+            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
+            branch_name=row["branch_name"], project_id=row["project_id"],
+            skills=json.loads(row["skills"]) if row["skills"] else None,
+            idempotency_key=remediation_key,
+        )
         review_metadata = dict(metadata or {})
         review_metadata.update({
             "approved": False,
@@ -4617,24 +4638,25 @@ def request_review_changes(
             "original_implementer": implementer,
             "review_identity": handoff.get("review_identity"),
             "changes_requested": True,
+            "remediation_task_id": remediation_id,
         })
         cur = conn.execute(
-            "UPDATE tasks SET status='ready', assignee=?, result=?, completed_at=NULL, "
-            "consecutive_failures=0, last_failure_error=NULL, claim_lock=NULL, "
+            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
             "claim_expires=NULL, worker_pid=NULL WHERE id=? "
             "AND status='running' AND current_run_id IS NOT NULL",
-            (implementer, summary.strip(), task_id),
+            (summary.strip(), int(time.time()), task_id),
         )
         if cur.rowcount != 1:
-            return None
+            raise RuntimeError("review task changed while creating remediation")
         run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status="ready",
+            conn, task_id, outcome="changes_requested", status="done",
             summary=summary.strip(), metadata=review_metadata,
         )
         if run_id is None:
             raise RuntimeError("review run disappeared while requesting changes")
         _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
-    return task_id
+    recompute_ready(conn)
+    return remediation_id
 
 
 def heartbeat_claim(
@@ -5105,8 +5127,8 @@ def _review_completion_error(
         return "native review completion requires checks_passed=true for the exact head"
     if metadata.get("mergeable") is False:
         return "native review completion rejected: pull request is not mergeable"
-    if metadata.get("exact_head_checks") is False:
-        return "native review completion rejected: exact-head checks failed"
+    if metadata.get("exact_head_checks") is not True:
+        return "native review completion requires exact_head_checks=true for the immutable head"
     return None
 
 
