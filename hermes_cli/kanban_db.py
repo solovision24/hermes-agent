@@ -4848,10 +4848,15 @@ def request_review_changes(
                 or existing["tenant"] != row["tenant"]
                 or existing["priority"] != row["priority"]
                 or existing["workspace_kind"] != row["workspace_kind"]
+                or existing["workspace_path"] != row["workspace_path"]
                 or existing["branch_name"] != row["branch_name"]
                 or existing["project_id"] != row["project_id"]
                 or actual_skills != expected_skills
                 or existing_parents != {task_id}
+                or existing["status"] != "todo"
+                or existing["current_run_id"] is not None
+                or existing["completed_at"] is not None
+                or existing["result"] is not None
             ):
                 return None
         remediation_id = create_task(

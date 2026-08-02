@@ -216,6 +216,51 @@ def test_review_changes_exact_key_preemption_cannot_hijack_handoff(board):
         ).fetchone()["n"] == 0
 
 
+def test_review_changes_rejects_preseeded_key_with_workspace_mismatch(board):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        remediation_key = f"review-remediation:{task_id}:{review.current_run_id}"
+        remediation_title = f"Address review feedback: {review.title}"
+        remediation_body = (
+            f"Review task: {task_id}\n\nChanges requested:\nFix the regression"
+        )
+        remediation_id = kb.create_task(
+            conn,
+            title=remediation_title,
+            body=remediation_body,
+            assignee="dev",
+            created_by="reviewer",
+            workspace_path="/tmp/untrusted-review-workspace",
+            parents=(task_id,),
+        )
+        conn.execute(
+            "UPDATE tasks SET idempotency_key=? WHERE id=?",
+            (remediation_key, remediation_id),
+        )
+        conn.commit()
+
+        assert kb.request_review_changes(
+            conn, task_id, summary="Fix the regression",
+            expected_run_id=review.current_run_id,
+        ) is None
+        assert kb.get_task(conn, task_id).status == "running"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id=? AND kind='review_changes_requested'",
+            (task_id,),
+        ).fetchone()["n"] == 0
+        assert kb.get_task(conn, remediation_id).status == "todo"
+        assert kb.claim_task(conn, remediation_id, claimer="worker:dev") is None
+
+
 def test_webhook_first_native_submission_preserves_native_card(board):
     with board as conn:
         webhook_id = kb.ingest_pull_request(
