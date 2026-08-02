@@ -189,7 +189,8 @@ def test_ingest_pr_reopened_done_head_returns_to_review(kanban_home):
         claimed = kb.claim_review_task(conn, initial["id"], claimer="reviewer")
         assert claimed is not None
         assert kb.complete_task(
-            conn, initial["id"], summary="approved", metadata={"approved": True},
+            conn, initial["id"], summary="approved",
+            metadata={"approved": True, "checks_passed": True, "exact_head_checks": True},
             expected_run_id=claimed.current_run_id,
         )
     reopened = json.loads(kc.run_slash(

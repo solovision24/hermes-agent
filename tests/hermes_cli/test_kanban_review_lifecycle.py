@@ -273,12 +273,76 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
             conn,
             task_id,
             summary="Approved after independent review",
-            metadata={"approved": True, "commit": "abc123"},
+            metadata={
+                "approved": True,
+                "checks_passed": True,
+                "exact_head_checks": True,
+                "commit": "abc123",
+            },
             expected_run_id=review.current_run_id,
         )
         run = kb.latest_run(conn, task_id)
         assert run is not None
         assert run.metadata["approved"] is True
+
+
+def test_changes_requested_event_cannot_complete_or_promote_dependency(board):
+    """The incident event shape is never a successful dependency signal."""
+    with board as conn:
+        parent = kb.create_task(conn, title="review", assignee="dev")
+        child = kb.create_task(conn, title="downstream", assignee="dev", parents=[parent])
+        implementation = kb.claim_task(conn, parent, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, parent, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, parent, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.request_review_changes(
+            conn,
+            parent,
+            summary="changes required",
+            metadata={
+                "approved": False,
+                "changes_requested": True,
+                "review_state": "COMMENTED",
+                "checks_passed": False,
+            },
+            expected_run_id=review.current_run_id,
+        ) == parent
+        assert kb.get_task(conn, child).status == "todo"
+
+        rerun = kb.claim_task(conn, parent, claimer="worker:dev")
+        assert rerun is not None
+        with pytest.raises(ValueError, match="submit_for_review"):
+            kb.complete_task(
+                conn, parent, summary="not approved",
+                metadata={"approved": False, "changes_requested": True},
+                expected_run_id=rerun.current_run_id,
+            )
+        assert kb.get_task(conn, parent).status == "running"
+
+
+def test_changes_requested_run_outcome_does_not_satisfy_dependency(board):
+    """A goal-mode/legacy race ending a card with this outcome is not success."""
+    with board as conn:
+        parent = kb.create_task(conn, title="review", assignee="dev")
+        child = kb.create_task(conn, title="downstream", assignee="dev", parents=[parent])
+        claimed = kb.claim_task(conn, parent, claimer="worker:dev")
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET status='done', current_run_id=? WHERE id=?",
+            (claimed.current_run_id, parent),
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='done', outcome='changes_requested', ended_at=1 "
+            "WHERE id=?",
+            (claimed.current_run_id,),
+        )
+        conn.commit()
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
 
         scheduled_id = kb.create_task(conn, title="later", assignee="dev")
         assert kb.schedule_task(conn, scheduled_id, reason="wait for release")

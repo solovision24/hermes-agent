@@ -4175,12 +4175,24 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, r.outcome "
+                "FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
+                "LEFT JOIN task_runs r ON r.id = t.current_run_id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            unsuccessful_outcomes = {
+                "changes_requested",
+                "submitted_for_review",
+                "github_pr_superseded",
+                "github_pr_closed",
+            }
+            if all(
+                p["status"] in ("done", "archived")
+                and p["outcome"] not in unsuccessful_outcomes
+                for p in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5041,6 +5053,63 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _review_completion_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Return a fail-closed error for an attempted native-review acceptance.
+
+    A task can only be completed as a review when its current run was claimed
+    from the native ``review`` lane and the closing evidence proves an
+    affirmative review plus passing checks for the immutable head.  Keeping
+    this gate at the DB boundary prevents goal-mode workers, CLI callers, and
+    webhook races from turning a COMMENTED/changes-requested review into a
+    successful dependency.
+    """
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    run_id = row["current_run_id"] if row else None
+    if not run_id:
+        return None
+    claim = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    try:
+        claim_payload = json.loads(claim["payload"]) if claim and claim["payload"] else {}
+    except (TypeError, json.JSONDecodeError):
+        claim_payload = {}
+    if claim_payload.get("source_status") != "review":
+        prior_changes = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_changes_requested' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if prior_changes:
+            return "changes-requested implementation must submit_for_review before completion"
+        return None
+    if not isinstance(metadata, dict) or metadata.get("approved") is not True:
+        return "native review completion requires approved=true"
+    if metadata.get("changes_requested") is True:
+        return "native review completion rejected: changes_requested=true"
+    review_state = str(
+        metadata.get("review_state") or metadata.get("review_decision") or ""
+    ).strip().lower()
+    if review_state in {"commented", "changes_requested", "request_changes", "dismissed"}:
+        return f"native review completion rejected: review state is {review_state}"
+    if metadata.get("checks_passed") is not True:
+        return "native review completion requires checks_passed=true for the exact head"
+    if metadata.get("mergeable") is False:
+        return "native review completion rejected: pull request is not mergeable"
+    if metadata.get("exact_head_checks") is False:
+        return "native review completion rejected: exact-head checks failed"
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5107,6 +5176,10 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    review_error = _review_completion_error(conn, task_id, metadata)
+    if review_error:
+        raise ValueError(review_error)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
