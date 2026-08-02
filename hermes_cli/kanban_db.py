@@ -4826,39 +4826,16 @@ def request_review_changes(
             f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"
         )
         existing = conn.execute(
-            "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM tasks WHERE idempotency_key = ? LIMIT 1",
             (remediation_key,),
         ).fetchone()
         if existing is not None:
-            existing_parents = {
-                parent["parent_id"]
-                for parent in conn.execute(
-                    "SELECT parent_id FROM task_links WHERE child_id = ?",
-                    (existing["id"],),
-                ).fetchall()
-            }
-            expected_skills = json.loads(row["skills"]) if row["skills"] else None
-            actual_skills = json.loads(existing["skills"]) if existing["skills"] else None
-            if (
-                existing["title"] != remediation_title
-                or existing["body"] != remediation_body
-                or _canonical_assignee(existing["assignee"]) != implementer
-                or existing["created_by"] != (row["assignee"] or "reviewer")
-                or existing["tenant"] != row["tenant"]
-                or existing["priority"] != row["priority"]
-                or existing["workspace_kind"] != row["workspace_kind"]
-                or existing["workspace_path"] != row["workspace_path"]
-                or existing["branch_name"] != row["branch_name"]
-                or existing["project_id"] != row["project_id"]
-                or actual_skills != expected_skills
-                or existing_parents != {task_id}
-                or existing["status"] != "todo"
-                or existing["current_run_id"] is not None
-                or existing["completed_at"] is not None
-                or existing["result"] is not None
-            ):
-                return None
+            # This key is an internal authorization binding, not a normal
+            # idempotency shortcut. Never adopt a pre-existing row: even a
+            # row whose visible fields look correct may carry unchecked
+            # execution fields (for example, model_override) or an
+            # attacker-controlled claim state.
+            return None
         remediation_id = create_task(
             conn, title=remediation_title, body=remediation_body,
             assignee=implementer, created_by=row["assignee"] or "reviewer",
