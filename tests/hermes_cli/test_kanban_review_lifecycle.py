@@ -123,3 +123,25 @@ def test_unknown_reviewer_and_duplicate_head_do_not_mutate(board, monkeypatch):
                                         metadata=REVIEW_METADATA,
                                         expected_run_id=second_run.current_run_id)
         assert kb.get_task(conn, second_id).status == "running"
+
+
+def test_review_handoff_rejects_abbreviated_head_sha_without_mutation(board, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "default")
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        with pytest.raises(ValueError, match="immutable head_sha"):
+            kb.submit_for_review(
+                conn,
+                task_id,
+                reviewer="default",
+                summary="ready",
+                metadata={**REVIEW_METADATA, "head_sha": "a" * 12},
+                expected_run_id=implementation.current_run_id,
+            )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"

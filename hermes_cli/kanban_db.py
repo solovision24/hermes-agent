@@ -4428,7 +4428,7 @@ _GITHUB_PR_URL_RE = re.compile(
     r"^https://(?:www\.)?github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)(?:[/?#].*)?$",
     re.IGNORECASE,
 )
-_GITHUB_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
+_GITHUB_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 
 
 def _canonical_review_metadata(metadata: Optional[dict]) -> tuple[dict, str]:

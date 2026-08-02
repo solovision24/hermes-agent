@@ -68,6 +68,25 @@ For code-changing tasks, implementation is handed to an independent reviewer rat
 
 The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks) and the explicit Review-lane handoff.
 
+### Upstream boundary and upgrade checklist
+
+The native Review lane is intentionally a thin SoLoVision boundary over the upstream Kanban lifecycle:
+
+| Contract | Upstream behavior | Boundary behavior | Upgrade check |
+| --- | --- | --- | --- |
+| Completion | `kanban_complete` ends a run as `done` | unchanged | Run completion and goal-mode tests |
+| Genuine blockers | `kanban_block` routes dependency/input/capability/transient failures | unchanged; never use it as a review queue | Run blocked-task and requeue tests |
+| Review handoff | not an upstream terminal status | `kanban_submit_review` moves the same card to `review` with immutable PR proof | Run lifecycle, duplicate-head, and SHA validation tests |
+| Review outcome | normal completion semantics | approval completes the review; changes requested create one remediation card | Run approval/remediation tests |
+
+Before upgrading the upstream Kanban implementation:
+
+1. Rebase this boundary onto the current upstream default branch, not a stale fork branch.
+2. Confirm one definition, schema, and registry entry exists for each native Review tool.
+3. Run `tests/hermes_cli/test_kanban_review_lifecycle.py` and the Kanban database/tool suites.
+4. Verify the handoff still requires the open PR URL, matching repository/number, exact 40-character head SHA, verification evidence, deployment implications, and original implementer provenance.
+5. Inspect the diff for restored `review-required` guidance or abbreviated SHA acceptance before opening the next PR.
+
 ## Logs and audit trail
 
 The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_id>.log`. Logs are auditable from kanban metadata:
