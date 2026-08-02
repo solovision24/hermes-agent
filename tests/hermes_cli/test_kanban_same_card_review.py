@@ -290,6 +290,36 @@ def test_preseeded_legacy_remediation_key_fails_closed(board):
         ).fetchone()["n"] == before_events
 
 
+def test_archived_historical_remediation_key_does_not_block_same_card_rejection(board):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="orion", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:orion")
+        assert review is not None
+
+        historical_id = kb.create_task(conn, title="historical remediation", assignee="dev")
+        conn.execute(
+            "UPDATE tasks SET status='archived', idempotency_key=? WHERE id=?",
+            (f"review-remediation:{task_id}:{review.current_run_id - 1}", historical_id),
+        )
+        conn.commit()
+
+        assert kb.request_review_changes(
+            conn, task_id, summary="current finding", expected_run_id=review.current_run_id,
+        ) == task_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "dev"
+        assert kb.get_task(conn, historical_id).status == "archived"
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 2
+
+
 def test_second_connection_cannot_replay_a_completed_changes_request(board):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")

@@ -4825,14 +4825,15 @@ def request_review_changes(
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
-        legacy_key_prefix = f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:"
+        remediation_key = (
+            f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:{current_run_id}"
+        )
         preseeded = conn.execute(
-            "SELECT 1 FROM tasks "
-            "WHERE substr(idempotency_key, 1, ?) = ? LIMIT 1",
-            (len(legacy_key_prefix), legacy_key_prefix),
+            "SELECT 1 FROM tasks WHERE idempotency_key = ? LIMIT 1",
+            (remediation_key,),
         ).fetchone()
         if preseeded is not None:
-            # Legacy remediation keys are an authorization binding. A
+            # The current remediation key is an authorization binding. A
             # pre-existing row means the request cannot be reconciled safely;
             # never adopt it and never mutate the canonical review card.
             return None
