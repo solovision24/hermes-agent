@@ -4424,6 +4424,44 @@ def claim_review_task(
         return get_task(conn, task_id)
 
 
+_GITHUB_PR_URL_RE = re.compile(
+    r"^https://(?:www\.)?github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)(?:[/?#].*)?$",
+    re.IGNORECASE,
+)
+_GITHUB_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
+
+
+def _canonical_review_metadata(metadata: Optional[dict]) -> tuple[dict, str]:
+    """Validate and canonicalize immutable PR identity and proof."""
+    if not isinstance(metadata, dict):
+        raise ValueError("review metadata must include pr_url, repo, number, head_sha, and verification_evidence")
+    raw_url = metadata.get("pr_url")
+    match = _GITHUB_PR_URL_RE.fullmatch(raw_url.strip()) if isinstance(raw_url, str) else None
+    if not match:
+        raise ValueError("pr_url must be an HTTPS GitHub pull-request URL")
+    repo = f"{match.group(1)}/{match.group(2)}".casefold()
+    if not isinstance(metadata.get("repo"), str) or metadata["repo"].strip().casefold() != repo:
+        raise ValueError("review metadata repo must match pr_url")
+    number = int(match.group(3))
+    try:
+        if int(metadata.get("number")) != number:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("review metadata number must match pr_url") from None
+    head_sha = metadata.get("head_sha")
+    if not isinstance(head_sha, str) or not _GITHUB_HEAD_SHA_RE.fullmatch(head_sha.strip()):
+        raise ValueError("review metadata requires a valid immutable head_sha")
+    evidence = metadata.get("verification_evidence") or metadata.get("verification")
+    if evidence in (None, {}, [], ""):
+        raise ValueError("review metadata requires verification_evidence")
+    canonical = dict(metadata)
+    canonical.update({"pr_url": f"https://github.com/{repo}/pull/{number}", "repo": repo,
+                      "number": number, "head_sha": head_sha.strip().casefold(),
+                      "verification_evidence": evidence})
+    canonical.pop("verification", None)
+    return canonical, f"github-pr:{repo}:{number}:{canonical['head_sha']}"
+
+
 def submit_for_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4445,11 +4483,26 @@ def submit_for_review(
         raise ValueError("reviewer is required")
     if not summary or not summary.strip():
         raise ValueError("review summary is required")
+    review_metadata, review_identity = _canonical_review_metadata(metadata)
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception as exc:
+        raise ValueError(f"reviewer profile {reviewer!r} cannot be resolved") from exc
+    if not profile_exists(reviewer):
+        raise ValueError(f"reviewer profile {reviewer!r} does not exist")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,)
+            "SELECT assignee, status, current_run_id FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if row is None or row["status"] != "running":
+            return False
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return False
+        duplicate = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ? AND id != ? "
+            "AND status IN ('review', 'running') LIMIT 1", (review_identity, task_id)
+        ).fetchone()
+        if duplicate:
             return False
         original_assignee = str(row["assignee"] or "")
         where = "id = ? AND status = 'running'"
@@ -4458,14 +4511,15 @@ def submit_for_review(
             where += " AND current_run_id = ?"
             params += (int(expected_run_id),)
         cur = conn.execute(
-            "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
+            "UPDATE tasks SET status='review', assignee=?, idempotency_key=?, claim_lock=NULL, "
             "claim_expires=NULL, worker_pid=NULL WHERE " + where,
-            (reviewer, *params),
+            (reviewer, review_identity, *params),
         )
         if cur.rowcount != 1:
             return False
-        handoff = dict(metadata or {})
-        handoff.update({"reviewer": reviewer, "original_assignee": original_assignee})
+        handoff = dict(review_metadata)
+        handoff.update({"reviewer": reviewer, "original_assignee": original_assignee,
+                        "review_identity": review_identity})
         run_id = _end_run(
             conn, task_id, outcome="submitted_for_review", status="review",
             summary=summary.strip(), metadata=handoff,

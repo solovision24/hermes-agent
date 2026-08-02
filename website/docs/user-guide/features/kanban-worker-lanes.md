@@ -58,12 +58,12 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 ## Outputs and the Review lane
 
-For code-changing tasks, implementation is handed to an independent reviewer rather than masquerading as a human blocker:
+For code-changing tasks, implementation is handed to an independent reviewer rather than masquerading as a human blocker. Native submission is the SoLo compatibility boundary: `kanban_submit_review` validates the reviewer profile before mutation, requires canonical `pr_url`, `repo`, `number`, `head_sha`, and `verification_evidence`, and stores the kernel-owned implementer provenance.
 
-- Call `kanban_submit_review(reviewer=..., summary=..., metadata=...)` with the PR/commit, changed files, tests, and other evidence.
 - The task moves from `running` to `review`, preserving the implementation run and assigning the reviewer. The dispatcher claims review cards separately, so the implementer is not respawned.
+- Active submissions with the same repository, PR number, and head SHA are rejected without creating a second review card. A new head is a new immutable review identity.
 - A reviewer approves with `kanban_complete(summary=..., metadata={"approved": true, ...})`.
-- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the review card completes with findings and one idempotent remediation task is created for the original implementer.
+- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the review card completes with findings and one remediation task is created for the original implementer.
 - Use `kanban_block(reason=...)` only for genuine human input, credentials, capability, dependency, or transient failures. Scheduled tasks remain time-gated and distinct from blocked work.
 
 The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks) and the explicit Review-lane handoff.

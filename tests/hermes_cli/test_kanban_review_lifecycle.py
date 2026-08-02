@@ -7,6 +7,15 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+REVIEW_METADATA = {
+    "pr_url": "https://github.com/acme/repo/pull/1",
+    "repo": "acme/repo",
+    "number": 1,
+    "head_sha": "a" * 40,
+    "verification_evidence": {"tests_passed": 3},
+}
+
+
 @pytest.fixture
 def board(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -23,21 +32,17 @@ def test_implementation_handoff_is_claimable_by_reviewer(board):
         implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
         assert implementation is not None
         assert kb.submit_for_review(
-            conn,
-            task_id,
-            reviewer="reviewer",
-            summary="PR opened; focused tests pass",
-            metadata={"pr_url": "https://github.com/acme/repo/pull/1", "tests_run": 3},
-            expected_run_id=implementation.current_run_id,
+            conn, task_id, reviewer="default", summary="PR opened; focused tests pass",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
         )
         task = kb.get_task(conn, task_id)
         assert task.status == "review"
-        assert task.assignee == "reviewer"
+        assert task.assignee == "default"
         assert task.claim_lock is None
-        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        review = kb.claim_review_task(conn, task_id, claimer="worker:default")
         assert review is not None
         assert review.status == "running"
-        assert review.assignee == "reviewer"
+        assert review.assignee == "default"
 
 
 def test_review_approval_completes_and_changes_create_one_remediation(board):
@@ -46,9 +51,10 @@ def test_review_approval_completes_and_changes_create_one_remediation(board):
         implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
         assert implementation is not None
         assert kb.submit_for_review(
-            conn, task_id, reviewer="reviewer", summary="ready", expected_run_id=implementation.current_run_id
+            conn, task_id, reviewer="default", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
         )
-        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        review = kb.claim_review_task(conn, task_id, claimer="worker:default")
         assert review is not None
         remediation_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test", expected_run_id=review.current_run_id
@@ -59,8 +65,6 @@ def test_review_approval_completes_and_changes_create_one_remediation(board):
         assert remediation.assignee == "dev"
         assert remediation.status == "ready"
         assert kb.get_task(conn, task_id).status == "done"
-        # The closed review card is terminal; replaying the same reviewer run
-        # cannot create a second remediation.
         assert kb.request_review_changes(conn, task_id, summary="Fix the regression test") is None
         rows = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key LIKE ?",
@@ -75,21 +79,16 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
         implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
         assert implementation is not None
         assert kb.submit_for_review(
-            conn,
-            task_id,
-            reviewer="reviewer",
-            summary="Evidence attached",
-            metadata={"commit": "abc123", "changed_files": ["src/example.py"]},
+            conn, task_id, reviewer="default", summary="Evidence attached",
+            metadata={**REVIEW_METADATA, "head_sha": "b" * 40,
+                      "commit": "abc123", "changed_files": ["src/example.py"]},
             expected_run_id=implementation.current_run_id,
         )
-        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        review = kb.claim_review_task(conn, task_id, claimer="worker:default")
         assert review is not None
         assert kb.complete_task(
-            conn,
-            task_id,
-            summary="Approved after independent review",
-            metadata={"approved": True, "commit": "abc123"},
-            expected_run_id=review.current_run_id,
+            conn, task_id, summary="Approved after independent review",
+            metadata={"approved": True, "commit": "abc123"}, expected_run_id=review.current_run_id,
         )
         run = kb.latest_run(conn, task_id)
         assert run is not None
@@ -99,3 +98,28 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
         assert kb.schedule_task(conn, scheduled_id, reason="wait for release")
         assert kb.claim_task(conn, scheduled_id) is None
         assert kb.get_task(conn, scheduled_id).status == "scheduled"
+
+
+def test_unknown_reviewer_and_duplicate_head_do_not_mutate(board, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "default")
+    with board as conn:
+        first_id = kb.create_task(conn, title="first", assignee="dev")
+        first_run = kb.claim_task(conn, first_id)
+        assert first_run is not None
+        with pytest.raises(ValueError, match="does not exist"):
+            kb.submit_for_review(conn, first_id, reviewer="missing", summary="ready",
+                                 metadata=REVIEW_METADATA, expected_run_id=first_run.current_run_id)
+        assert kb.get_task(conn, first_id).status == "running"
+        assert kb.submit_for_review(conn, first_id, reviewer="default", summary="ready",
+                                    metadata=REVIEW_METADATA,
+                                    expected_run_id=first_run.current_run_id)
+
+        second_id = kb.create_task(conn, title="duplicate", assignee="dev")
+        second_run = kb.claim_task(conn, second_id)
+        assert second_run is not None
+        assert not kb.submit_for_review(conn, second_id, reviewer="default", summary="duplicate",
+                                        metadata=REVIEW_METADATA,
+                                        expected_run_id=second_run.current_run_id)
+        assert kb.get_task(conn, second_id).status == "running"
