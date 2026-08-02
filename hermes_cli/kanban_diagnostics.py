@@ -219,6 +219,35 @@ def _generic_recovery_actions(task: Any, *, running: bool) -> list[DiagnosticAct
 # kanban_db.Event / kanban_db.Run (or plain dicts matching the same
 # shape — for test convenience).
 
+def _rule_invalid_assignee(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Report legacy rows whose assignee no longer resolves."""
+    if _task_field(task, "status") in {"done", "archived"}:
+        return []
+    assignee = _task_field(task, "assignee")
+    if not assignee:
+        return []
+    from hermes_cli.kanban_assignees import InvalidAssigneeError, resolve_assignee
+    try:
+        resolve_assignee(assignee, allow_unassigned=False)
+    except InvalidAssigneeError as exc:
+        return [Diagnostic(
+            kind="invalid_assignee",
+            severity="error",
+            title="Invalid Kanban assignee",
+            detail=str(exc),
+            actions=[DiagnosticAction(
+                kind="reassign",
+                label="Assign a valid profile or external lane",
+                payload={"current_assignee": str(assignee)},
+                suggested=True,
+            )],
+            first_seen_at=int(_task_field(task, "created_at", 0) or 0),
+            last_seen_at=int(_task_field(task, "created_at", 0) or 0),
+            data={"assignee": str(assignee), "code": "invalid_assignee"},
+        )]
+    return []
+
+
 RuleFn = Callable[[Any, list[Any], list[Any], int, dict], list[Diagnostic]]
 
 
@@ -1003,6 +1032,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
+    _rule_invalid_assignee,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -1017,6 +1047,7 @@ _RULES: list[RuleFn] = [
 # Known kinds (for the UI's filter / legend / i18n keys). Update when
 # rules are added.
 DIAGNOSTIC_KINDS = (
+    "invalid_assignee",
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",

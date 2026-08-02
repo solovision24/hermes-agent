@@ -866,6 +866,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
                 )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
             except RuntimeError as e:
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
@@ -1758,12 +1760,15 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         if not ok:
             raise HTTPException(
                 status_code=409,

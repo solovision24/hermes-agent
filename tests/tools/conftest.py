@@ -13,6 +13,26 @@ from unittest.mock import patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _register_synthetic_assignee_lanes(monkeypatch):
+    """Make historical Kanban test labels explicit resolver targets."""
+    from hermes_cli import profiles
+
+    synthetic = {
+        "a", "alice", "alpha", "beta", "broken", "coder", "default",
+        "demo", "dev", "elias", "factory", "ops", "orch", "orchestrator",
+        "peer", "reviewer", "setup", "some-profile", "someother", "teknium",
+        "test-worker", "w", "worker", "worker-a", "worker-d",
+        "worker1", "writer", "x",
+    }
+    real_exists = profiles.profile_exists
+    monkeypatch.setattr(
+        profiles,
+        "profile_exists",
+        lambda name: str(name).strip().casefold() in synthetic or real_exists(name),
+    )
+
+
 def register_all_web_providers():
     """Register all bundled web-search providers into the global registry.
 

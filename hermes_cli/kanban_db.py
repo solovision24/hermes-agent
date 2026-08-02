@@ -2892,12 +2892,10 @@ def _claimer_id() -> str:
 # ---------------------------------------------------------------------------
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
-    if assignee is None:
-        return None
-    from hermes_cli.profiles import normalize_profile_name
+    """Resolve an assignee before persisting it in a Kanban row."""
+    from hermes_cli.kanban_assignees import resolve_assignee
 
-    return normalize_profile_name(assignee)
+    return resolve_assignee(assignee).canonical
 
 
 def create_task(
@@ -4713,6 +4711,7 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    profile = _canonical_assignee(profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6840,6 +6839,10 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_invalid_assignee: list[str] = field(default_factory=list)
+    """Ready/review task ids with legacy unresolved assignees."""
+    invalid_assignee_diagnostics: dict[str, str] = field(default_factory=dict)
+    """Actionable diagnostics keyed by legacy task id."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -8498,17 +8501,14 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
+        from hermes_cli.kanban_assignees import AssigneeResolver, InvalidAssigneeError
         try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+            resolved = AssigneeResolver().resolve(row_assignee, allow_unassigned=False)
+        except InvalidAssigneeError as exc:
+            result.skipped_invalid_assignee.append(row["id"])
+            result.invalid_assignee_diagnostics[row["id"]] = str(exc)
+            continue
+        if not resolved.spawnable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -8638,11 +8638,14 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        from hermes_cli.kanban_assignees import AssigneeResolver, InvalidAssigneeError
         try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+            resolved = AssigneeResolver().resolve(row["assignee"], allow_unassigned=False)
+        except InvalidAssigneeError as exc:
+            result.skipped_invalid_assignee.append(row["id"])
+            result.invalid_assignee_diagnostics[row["id"]] = str(exc)
+            continue
+        if not resolved.spawnable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
