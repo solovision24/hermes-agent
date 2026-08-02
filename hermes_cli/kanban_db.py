@@ -4556,7 +4556,38 @@ def request_review_changes(
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None or row["status"] != "running":
             return None
-        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        current_run_id = row["current_run_id"]
+        if not current_run_id:
+            return None
+        if expected_run_id is not None and current_run_id != int(expected_run_id):
+            return None
+        run = conn.execute(
+            "SELECT profile, status, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (current_run_id, task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["status"] != "running"
+            or run["ended_at"] is not None
+            or _canonical_assignee(run["profile"]) != _canonical_assignee(row["assignee"])
+        ):
+            return None
+        claim = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, current_run_id),
+        ).fetchone()
+        try:
+            claim_payload = json.loads(claim["payload"]) if claim and claim["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            claim_payload = {}
+        if (
+            claim_payload.get("source_status") != "review"
+            or _canonical_assignee(claim_payload.get("assignee"))
+            != _canonical_assignee(row["assignee"])
+        ):
             return None
         event = conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? AND kind='review_submitted' "

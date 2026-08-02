@@ -655,6 +655,30 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_worker_review_changes_rejects_foreign_task_id(worker_env):
+    """A worker cannot request review changes on a sibling task."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(
+            conn, title="review sibling", assignee="reviewer", initial_status="review",
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_review_changes({"task_id": other, "summary": "HIJACK"})
+    d = json.loads(out)
+    assert d.get("ok") is not True
+    assert "refusing to mutate" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "review"
+    finally:
+        conn.close()
+
+
 def test_worker_can_comment_on_foreign_task(worker_env):
     """Cross-task commenting must remain unrestricted (#19713 policy).
 

@@ -121,6 +121,61 @@ def test_changes_requested_reuses_same_card_for_implementer_and_re_review(board,
         assert kb.get_task(conn, task_id).status == "review"
 
 
+def test_dev_implementation_rerun_cannot_use_historical_review_submission(board):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, task_id, summary="Fix the regression test",
+            expected_run_id=review.current_run_id,
+        ) == task_id
+
+        rerun = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert rerun is not None
+        assert kb.request_review_changes(
+            conn, task_id, summary="I found another issue",
+            expected_run_id=rerun.current_run_id,
+        ) is None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.assignee == "dev"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id=? AND kind='review_changes_requested'",
+            (task_id,),
+        ).fetchone()["n"] == 1
+
+
+def test_review_changes_rejects_delegated_child_context(board):
+    from agent.delegation_context import delegated_child_context
+
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+
+        with delegated_child_context(), pytest.raises(PermissionError, match="delegate_task child"):
+            kb.request_review_changes(
+                conn, task_id, summary="child must not mutate the board",
+                expected_run_id=review.current_run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+
+
 def test_review_handoff_rejects_self_reviewer_without_mutation(board):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")

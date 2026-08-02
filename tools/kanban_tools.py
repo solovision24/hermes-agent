@@ -831,10 +831,16 @@ def _handle_submit_review(args: dict, **kw) -> str:
 
 def _handle_review_changes(args: dict, **kw) -> str:
     """Return the same card to the implementer for requested changes."""
+    delegated_err = _reject_delegated_child_mutation("kanban_review_changes")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     summary = str(args.get("summary") or "").strip()
     if not tid or not summary:
         return tool_error("task_id and summary are required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
