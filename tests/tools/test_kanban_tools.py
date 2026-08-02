@@ -446,7 +446,7 @@ def test_create_review_status_enters_review_and_is_claimable(worker_env):
         conn.close()
 
 
-def test_review_changes_tool_reports_ready_remediation_status(worker_env, monkeypatch):
+def test_review_changes_tool_requeues_same_card(worker_env, monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli import profiles
     from tools import kanban_tools as kt
@@ -479,10 +479,14 @@ def test_review_changes_tool_reports_ready_remediation_status(worker_env, monkey
     result = json.loads(kt._handle_review_changes({"summary": "fix it"}))
     assert result["ok"] is True
     assert result["task_id"] == worker_env
-    assert result["status"] == "done"
-    assert result["parent_status"] == "done"
-    assert result["remediation_task_id"]
-    assert result["remediation_status"] == "ready"
+    assert result["status"] == "ready"
+    assert result["assignee"] == "test-worker"
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
+        assert conn.execute("SELECT COUNT(*) AS n FROM task_links").fetchone()["n"] == 0
+    finally:
+        conn.close()
 
 
 def test_review_tool_schema_and_runtime_handoff(worker_env, monkeypatch):

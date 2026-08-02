@@ -65,7 +65,7 @@ For code-changing tasks, implementation is handed to an independent reviewer rat
 - Native handoff and GitHub webhook ingestion reconcile by `repo/number/head_sha` in either arrival order. A webhook-first card and a native-first card become one active card; implementation runs and events are retained, and webhook replays do not steal an active reviewer claim.
 - For the CLI, use `hermes kanban submit-review <task> <summary words...>` for the default `orion` reviewer. To select another reviewer, use the unambiguous `--reviewer <profile>` flag; the first summary word is never interpreted as a reviewer.
 - A reviewer approves with `kanban_complete(summary=..., metadata={"approved": true, ...})`.
-- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the review card completes with findings and one idempotent remediation task is created for the original implementer.
+- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the active review run closes with durable findings, and the same canonical card returns to `ready` for its original implementer. No remediation child task is created, so resubmission preserves the task identity and full audit history.
 - Use `kanban_block(reason=...)` only for genuine human input, credentials, capability, dependency, or transient failures. Scheduled tasks remain time-gated and distinct from blocked work.
 
 The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks) and the explicit Review-lane handoff.

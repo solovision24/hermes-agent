@@ -54,7 +54,7 @@ def test_implementation_handoff_is_claimable_by_reviewer(board):
         assert review.assignee == "reviewer"
 
 
-def test_review_changes_creates_one_idempotent_remediation_child(board):
+def test_review_changes_requeues_the_same_card(board):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")
         implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
@@ -65,18 +65,19 @@ def test_review_changes_creates_one_idempotent_remediation_child(board):
         )
         review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
         assert review is not None
-        remediation_id = kb.request_review_changes(
+        requeued_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test", expected_run_id=review.current_run_id
         )
-        assert remediation_id != task_id
+        assert requeued_id == task_id
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.assignee == "reviewer"
-        assert task.status == "done"
+        assert task.assignee == "dev"
+        assert task.status == "ready"
+        assert task.current_run_id is None
         rows = conn.execute(
             "SELECT COUNT(*) AS n FROM tasks",
         ).fetchone()
-        assert rows["n"] == 2
+        assert rows["n"] == 1
         run = conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs "
             "WHERE task_id=? ORDER BY id DESC LIMIT 1",
@@ -87,7 +88,7 @@ def test_review_changes_creates_one_idempotent_remediation_child(board):
         assert run["ended_at"] is not None
 
 
-def test_review_changes_remediation_is_ready_after_parent_done(board, capsys):
+def test_review_changes_cli_reports_same_card_ready(board, capsys):
     from hermes_cli import kanban as cli
 
     with board as conn:
@@ -105,17 +106,12 @@ def test_review_changes_remediation_is_ready_after_parent_done(board, capsys):
             task_id=task_id, summary=["Fix", "the", "regression"], metadata=None
         )
         assert cli._cmd_review_changes(args) == 0
-        assert "remediation status: ready" in capsys.readouterr().out
-        remediation = conn.execute(
-            "SELECT child_id FROM task_links WHERE parent_id=?", (task_id,)
-        ).fetchone()
-        assert remediation is not None
-        child = kb.get_task(conn, remediation["child_id"])
-        assert child is not None
-        assert child.status == "ready"
+        assert "task requeued for implementer" in capsys.readouterr().out
+        assert conn.execute("SELECT COUNT(*) AS n FROM task_links").fetchone()["n"] == 0
+        assert kb.get_task(conn, task_id).status == "ready"
 
 
-def test_remediation_child_can_be_reviewed_again(board, monkeypatch):
+def test_same_card_can_be_reviewed_again(board, monkeypatch):
     from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
@@ -130,26 +126,26 @@ def test_remediation_child_can_be_reviewed_again(board, monkeypatch):
         review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
         assert review is not None
 
-        remediation_id = kb.request_review_changes(
+        requeued_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test",
             metadata={"approved": False}, expected_run_id=review.current_run_id,
         )
-        assert remediation_id != task_id
+        assert requeued_id == task_id
 
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.status == "done"
-        assert task.assignee == "reviewer"
-        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 2
+        assert task.status == "ready"
+        assert task.assignee == "dev"
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
 
-        fix = kb.claim_task(conn, remediation_id, claimer="worker:dev")
+        fix = kb.claim_task(conn, task_id, claimer="worker:dev")
         assert fix is not None
         assert kb.submit_for_review(
-            conn, remediation_id, reviewer="reviewer", summary="fixed",
+            conn, task_id, reviewer="orion", summary="fixed",
             metadata={**REVIEW_METADATA, "head_sha": "b" * 40},
             expected_run_id=fix.current_run_id,
         )
-        assert kb.get_task(conn, remediation_id).status == "review"
+        assert kb.get_task(conn, task_id).status == "review"
 
 
 def test_forged_review_remediation_prefix_cannot_bypass_parent_gate(board):
@@ -395,19 +391,19 @@ def test_dev_implementation_rerun_cannot_use_historical_review_submission(board)
         )
         review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
         assert review is not None
-        remediation_id = kb.request_review_changes(
+        requeued_id = kb.request_review_changes(
             conn, task_id, summary="Fix the regression test",
             expected_run_id=review.current_run_id,
         )
-        assert remediation_id != task_id
+        assert requeued_id == task_id
 
         assert kb.request_review_changes(
             conn, task_id, summary="I found another issue",
         ) is None
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert task.status == "done"
-        assert task.assignee == "reviewer"
+        assert task.status == "ready"
+        assert task.assignee == "dev"
         assert conn.execute(
             "SELECT COUNT(*) AS n FROM task_events "
             "WHERE task_id=? AND kind='review_changes_requested'",
@@ -640,7 +636,7 @@ def test_changes_requested_event_cannot_complete_or_promote_dependency(board):
         )
         review = kb.claim_review_task(conn, parent, claimer="worker:reviewer")
         assert review is not None
-        remediation_id = kb.request_review_changes(
+        requeued_id = kb.request_review_changes(
             conn,
             parent,
             summary="changes required",
@@ -652,10 +648,10 @@ def test_changes_requested_event_cannot_complete_or_promote_dependency(board):
             },
             expected_run_id=review.current_run_id,
         )
-        assert remediation_id != parent
+        assert requeued_id == parent
         assert kb.get_task(conn, child).status == "todo"
 
-        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, parent).status == "ready"
 
 
 def test_changes_requested_run_outcome_does_not_satisfy_dependency(board):

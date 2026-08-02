@@ -630,7 +630,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_submit_review.add_argument("--metadata", default=None, help="JSON evidence object")
 
     p_review_changes = sub.add_parser(
-        "review-changes", help="Complete a review and create implementer remediation"
+        "review-changes", help="Record review findings and requeue the same card"
     )
     p_review_changes.add_argument("task_id")
     p_review_changes.add_argument("summary", nargs="+", help="Requested changes")
@@ -2249,21 +2249,16 @@ def _cmd_review_changes(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         run_id = task.current_run_id if task else None
-        remediation = kb.request_review_changes(
+        requeued = kb.request_review_changes(
             conn, args.task_id, summary=" ".join(args.summary), metadata=metadata,
             expected_run_id=run_id,
         )
-    if not remediation:
+    if not requeued:
         print(f"cannot request changes for {args.task_id}", file=sys.stderr)
         return 1
-    remediation_status = "unknown"
-    with kb.connect_closing() as conn:
-        remediation_task = kb.get_task(conn, remediation)
-        if remediation_task is not None:
-            remediation_status = remediation_task.status
     print(
-        "Review changes recorded; original task is done; "
-        f"remediation task: {remediation}; remediation status: {remediation_status}"
+        "Review changes recorded; task requeued for implementer: "
+        f"{requeued}; status: ready"
     )
     return 0
 

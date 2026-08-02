@@ -3086,9 +3086,9 @@ def create_task(
     for attempt in range(2):
         task_id = _new_task_id()
         try:
-            # A review changes-requested handoff may create a remediation
-            # while already holding the lifecycle transaction. SQLite has no
-            # nested BEGIN support, so reuse that transaction when present.
+            # A review lifecycle handoff may run while already holding the
+            # lifecycle transaction. SQLite has no nested BEGIN support, so
+            # reuse that transaction when present.
             with (contextlib.nullcontext() if conn.in_transaction else write_txn(conn)):
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
@@ -4771,7 +4771,12 @@ def request_review_changes(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Close the review card and create one idempotent remediation child."""
+    """Record review findings and requeue the canonical card for its implementer.
+
+    Review remediation is a same-card transition.  The current reviewer run
+    is closed with durable findings, while the task identity and all prior
+    history remain intact for the next immutable-head submission.
+    """
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
     with write_txn(conn):
@@ -4820,33 +4825,17 @@ def request_review_changes(
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             return None
-        remediation_key = f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:{current_run_id}"
-        remediation_title = f"Address review feedback: {row['title']}"
-        remediation_body = (
-            f"Review task: {task_id}\n\nChanges requested:\n{summary.strip()}"
-        )
-        existing = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? LIMIT 1",
-            (remediation_key,),
+        legacy_key_prefix = f"{_INTERNAL_REVIEW_REMEDIATION_PREFIX}{task_id}:"
+        preseeded = conn.execute(
+            "SELECT 1 FROM tasks "
+            "WHERE substr(idempotency_key, 1, ?) = ? LIMIT 1",
+            (len(legacy_key_prefix), legacy_key_prefix),
         ).fetchone()
-        if existing is not None:
-            # This key is an internal authorization binding, not a normal
-            # idempotency shortcut. Never adopt a pre-existing row: even a
-            # row whose visible fields look correct may carry unchecked
-            # execution fields (for example, model_override) or an
-            # attacker-controlled claim state.
+        if preseeded is not None:
+            # Legacy remediation keys are an authorization binding. A
+            # pre-existing row means the request cannot be reconciled safely;
+            # never adopt it and never mutate the canonical review card.
             return None
-        remediation_id = create_task(
-            conn, title=remediation_title, body=remediation_body,
-            assignee=implementer, created_by=row["assignee"] or "reviewer",
-            tenant=row["tenant"], priority=row["priority"],
-            workspace_kind=row["workspace_kind"], workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"], project_id=row["project_id"],
-            skills=json.loads(row["skills"]) if row["skills"] else None,
-            parents=(task_id,),
-            idempotency_key=remediation_key,
-            _allow_internal_idempotency=True,
-        )
         review_metadata = dict(metadata or {})
         review_metadata.update({
             "approved": False,
@@ -4855,17 +4844,16 @@ def request_review_changes(
             "original_implementer": implementer,
             "review_identity": handoff.get("review_identity"),
             "changes_requested": True,
-            "remediation_task_id": remediation_id,
-            "remediation_key": remediation_key,
         })
         cur = conn.execute(
-            "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL WHERE id=? "
+            "UPDATE tasks SET status='ready', assignee=?, result=?, completed_at=NULL, "
+            "consecutive_failures=0, last_failure_error=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=? "
             "AND status='running' AND current_run_id IS NOT NULL",
-            (summary.strip(), int(time.time()), task_id),
+            (implementer, summary.strip(), task_id),
         )
         if cur.rowcount != 1:
-            raise RuntimeError("review task changed while creating remediation")
+            raise RuntimeError("review task changed while requeueing same card")
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status="done",
             summary=summary.strip(), metadata=review_metadata,
@@ -4873,19 +4861,7 @@ def request_review_changes(
         if run_id is None:
             raise RuntimeError("review run disappeared while requesting changes")
         _append_event(conn, task_id, "review_changes_requested", review_metadata, run_id=run_id)
-        # The remediation child is the one intentional exception to the
-        # unsuccessful-parent dependency guard: its parent is done precisely
-        # because review requested a new implementation cycle. Promote this
-        # child atomically so both public review-changes surfaces can report
-        # the ready handoff without making unrelated dependents ready.
-        promoted = conn.execute(
-            "UPDATE tasks SET status='ready' WHERE id=? AND status='todo'",
-            (remediation_id,),
-        )
-        if promoted.rowcount == 1:
-            _append_event(conn, remediation_id, "promoted", None)
-    recompute_ready(conn)
-    return remediation_id
+    return task_id
 
 
 def heartbeat_claim(
