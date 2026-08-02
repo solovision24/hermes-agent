@@ -277,6 +277,7 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
                 "approved": True,
                 "checks_passed": True,
                 "exact_head_checks": True,
+                "reviewed_head_sha": "a" * 40,
                 "commit": "abc123",
             },
             expected_run_id=review.current_run_id,
@@ -307,6 +308,62 @@ def test_review_approval_requires_exact_head_checks(board, exact_head_checks):
                 metadata=metadata, expected_run_id=review.current_run_id,
             )
         assert kb.get_task(conn, task_id).status == "running"
+
+
+@pytest.mark.parametrize("reviewed_head_sha", [None, "b" * 40])
+def test_review_approval_binds_to_submitted_head(board, reviewed_head_sha):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        metadata = {
+            "approved": True,
+            "checks_passed": True,
+            "exact_head_checks": True,
+        }
+        if reviewed_head_sha is not None:
+            metadata["reviewed_head_sha"] = reviewed_head_sha
+        with pytest.raises(ValueError, match="reviewed_head_sha"):
+            kb.complete_task(
+                conn, task_id, summary="unbound review", metadata=metadata,
+                expected_run_id=review.current_run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+@pytest.mark.parametrize("terminal_state", ["stale_run", "archived_task"])
+def test_review_changes_rejects_stale_or_archived_races(board, terminal_state):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready",
+            metadata=REVIEW_METADATA, expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        if terminal_state == "stale_run":
+            conn.execute(
+                "UPDATE task_runs SET status='done', ended_at=1 WHERE id=?",
+                (review.current_run_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET status='archived', completed_at=1 WHERE id=?",
+                (task_id,),
+            )
+        conn.commit()
+        assert kb.request_review_changes(
+            conn, task_id, summary="late changes", expected_run_id=review.current_run_id,
+        ) is None
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
 
 
 def test_changes_requested_event_cannot_complete_or_promote_dependency(board):

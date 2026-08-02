@@ -4571,7 +4571,7 @@ def request_review_changes(
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> Optional[str]:
-    """Return the same card to its implementer for a changes-requested re-review."""
+    """Close the review card and create one idempotent remediation child."""
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
     with write_txn(conn):
@@ -5090,7 +5090,7 @@ def _review_completion_error(
     successful dependency.
     """
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        "SELECT current_run_id, idempotency_key FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     run_id = row["current_run_id"] if row else None
     if not run_id:
@@ -5129,6 +5129,34 @@ def _review_completion_error(
         return "native review completion rejected: pull request is not mergeable"
     if metadata.get("exact_head_checks") is not True:
         return "native review completion requires exact_head_checks=true for the immutable head"
+    review_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_submitted' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        review_payload = (
+            json.loads(review_event["payload"])
+            if review_event and review_event["payload"]
+            else {}
+        )
+        submitted_metadata = review_payload.get("metadata") or {}
+    except (TypeError, json.JSONDecodeError):
+        submitted_metadata = {}
+    submitted_head_sha = submitted_metadata.get("head_sha")
+    if not isinstance(submitted_head_sha, str):
+        key_head = str(row["idempotency_key"] or "").rsplit(":", 1)[-1]
+        if _GITHUB_HEAD_SHA_RE.fullmatch(key_head):
+            submitted_head_sha = key_head
+    reviewed_head_sha = metadata.get("reviewed_head_sha")
+    if not isinstance(reviewed_head_sha, str) or not reviewed_head_sha.strip():
+        return "native review completion requires reviewed_head_sha for the immutable head"
+    if (
+        not isinstance(submitted_head_sha, str)
+        or reviewed_head_sha.strip().casefold() != submitted_head_sha.casefold()
+    ):
+        return "native review completion rejected: reviewed_head_sha does not match the submitted immutable head"
     return None
 
 

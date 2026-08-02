@@ -830,7 +830,7 @@ def _handle_submit_review(args: dict, **kw) -> str:
 
 
 def _handle_review_changes(args: dict, **kw) -> str:
-    """Return the same card to the implementer for requested changes."""
+    """Close the review card and create an implementer remediation child."""
     delegated_err = _reject_delegated_child_mutation("kanban_review_changes")
     if delegated_err:
         return delegated_err
@@ -848,7 +848,7 @@ def _handle_review_changes(args: dict, **kw) -> str:
                 conn, tid, summary=summary, metadata=args.get("metadata"),
                 expected_run_id=_worker_run_id(tid),
             )
-            return _ok(task_id=tid, status="ready", re_review_task_id=remediation) \
+            return _ok(task_id=tid, status="done", parent_status="done", remediation_task_id=remediation) \
                 if remediation else tool_error(
                     f"could not request changes for {tid} (not the active review run)"
                 )

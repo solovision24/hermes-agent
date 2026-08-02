@@ -2255,7 +2255,7 @@ def _cmd_review_changes(args: argparse.Namespace) -> int:
     if not remediation:
         print(f"cannot request changes for {args.task_id}", file=sys.stderr)
         return 1
-    print(f"Review changes recorded on the same card; re-review task: {remediation}")
+    print(f"Review changes recorded; original task is done; remediation task: {remediation}")
     return 0
 
 
