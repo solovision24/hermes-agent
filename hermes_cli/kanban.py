@@ -621,8 +621,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "submit-review", help="Submit a running implementation to the Review lane"
     )
     p_submit_review.add_argument("task_id")
-    p_submit_review.add_argument("reviewer")
-    p_submit_review.add_argument("summary", nargs="+", help="Review handoff summary")
+    p_submit_review.add_argument(
+        "reviewer_or_summary", nargs="?",
+        help="Reviewer profile (legacy form) or first summary word",
+    )
+    p_submit_review.add_argument("summary", nargs="*", help="Review handoff summary")
+    p_submit_review.add_argument(
+        "--reviewer", default=None, help="Reviewer profile (default: orion)"
+    )
     p_submit_review.add_argument("--metadata", default=None, help="JSON evidence object")
 
     p_review_changes = sub.add_parser(
@@ -2206,12 +2212,25 @@ def _cmd_submit_review(args: argparse.Namespace) -> int:
         metadata = json.loads(args.metadata)
         if not isinstance(metadata, dict):
             raise ValueError("--metadata must be a JSON object")
+    first = args.reviewer_or_summary
+    if args.reviewer is not None:
+        reviewer = args.reviewer
+        summary_words = ([first] if first else []) + list(args.summary)
+    elif args.summary:
+        # Preserve the original positional form: <task> <reviewer> <summary...>.
+        reviewer = first
+        summary_words = list(args.summary)
+    else:
+        reviewer = "orion"
+        summary_words = [first] if first else []
+    if not reviewer or not summary_words:
+        raise ValueError("reviewer and summary are required")
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         run_id = task.current_run_id if task else None
         if not kb.submit_for_review(
-            conn, args.task_id, reviewer=args.reviewer,
-            summary=" ".join(args.summary), metadata=metadata,
+            conn, args.task_id, reviewer=reviewer,
+            summary=" ".join(summary_words), metadata=metadata,
             expected_run_id=run_id,
         ):
             print(f"cannot submit {args.task_id} for review", file=sys.stderr)
@@ -2236,7 +2255,7 @@ def _cmd_review_changes(args: argparse.Namespace) -> int:
     if not remediation:
         print(f"cannot request changes for {args.task_id}", file=sys.stderr)
         return 1
-    print(f"Review changes recorded; remediation task: {remediation}")
+    print(f"Review changes recorded on the same card; re-review task: {remediation}")
     return 0
 
 

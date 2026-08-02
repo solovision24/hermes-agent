@@ -799,16 +799,26 @@ def _handle_block(args: dict, **kw) -> str:
 def _handle_submit_review(args: dict, **kw) -> str:
     """Route a completed implementation to the canonical review lane."""
     tid = _default_task_id(args.get("task_id"))
-    reviewer = str(args.get("reviewer") or "").strip()
+    reviewer = str(args.get("reviewer") or "orion").strip()
     summary = str(args.get("summary") or "").strip()
     if not tid or not reviewer or not summary:
         return tool_error("task_id, reviewer, and summary are required")
+    metadata = args.get("metadata")
+    if not isinstance(metadata, dict):
+        return tool_error(
+            "metadata is required and must include pr_url, repo, number, "
+            "head_sha, and verification_evidence"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
             ok = kb.submit_for_review(
                 conn, tid, reviewer=reviewer, summary=summary,
-                metadata=args.get("metadata"), expected_run_id=_worker_run_id(tid),
+                metadata=_stamp_worker_session_metadata(tid, metadata),
+                expected_run_id=_worker_run_id(tid),
             )
             return _ok(task_id=tid, status="review") if ok else tool_error(
                 f"could not submit {tid} for review (not the active implementation run)"
@@ -820,7 +830,7 @@ def _handle_submit_review(args: dict, **kw) -> str:
 
 
 def _handle_review_changes(args: dict, **kw) -> str:
-    """Close a review and create an implementer remediation card."""
+    """Return the same card to the implementer for requested changes."""
     tid = _default_task_id(args.get("task_id"))
     summary = str(args.get("summary") or "").strip()
     if not tid or not summary:
@@ -832,7 +842,7 @@ def _handle_review_changes(args: dict, **kw) -> str:
                 conn, tid, summary=summary, metadata=args.get("metadata"),
                 expected_run_id=_worker_run_id(tid),
             )
-            return _ok(task_id=tid, status="done", remediation_task_id=remediation) \
+            return _ok(task_id=tid, status="ready", re_review_task_id=remediation) \
                 if remediation else tool_error(
                     f"could not request changes for {tid} (not the active review run)"
                 )
@@ -1720,28 +1730,37 @@ KANBAN_BLOCK_SCHEMA = {
 KANBAN_SUBMIT_REVIEW_SCHEMA = {
     "name": "kanban_submit_review",
     "description": (
-        "Submit the active implementation run to the Review lane. Preserve "
-        "evidence in metadata and name the independent reviewer. Use this "
-        "instead of kanban_block for normal code-review handoff."
+        "Submit the active implementation run to the Review lane. The kernel "
+        "requires immutable GitHub PR identity and verification evidence; "
+        "reviewer defaults to the orion profile."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
-            "reviewer": {"type": "string", "description": "Reviewer profile."},
+            "reviewer": {
+                "type": "string", "default": "orion",
+                "description": "Existing independent reviewer profile (default: orion).",
+            },
             "summary": {"type": "string", "description": "Review handoff summary."},
-            "metadata": {"type": "object", "description": "Evidence: PR URL, commit, tests, changed files."},
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Required evidence: pr_url, repo, number, exact 40-character "
+                    "head_sha, and verification_evidence."
+                ),
+            },
             "board": _board_schema_prop(),
         },
-        "required": ["reviewer", "summary"],
+        "required": ["summary", "metadata"],
     },
 }
 
 KANBAN_REVIEW_CHANGES_SCHEMA = {
     "name": "kanban_review_changes",
     "description": (
-        "Record review findings, complete the active Review card, and create "
-        "one idempotent remediation task assigned to the original implementer."
+        "Record review findings and return the same Review card to the original "
+        "implementer for a re-review."
     ),
     "parameters": {
         "type": "object",

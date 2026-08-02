@@ -36,14 +36,14 @@ Top-level command for managing profiles. Running `hermes profile` without a subc
 hermes profile list
 ```
 
-Lists all profiles. The currently active profile is marked with `*`.
+Lists all profiles. The currently active profile is marked with `◆`.
 
 **Example:**
 
 ```bash
 $ hermes profile list
   default
-* work
+◆ work
   dev
   personal
 ```

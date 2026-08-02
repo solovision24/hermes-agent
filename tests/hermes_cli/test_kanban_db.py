@@ -422,6 +422,29 @@ def test_dispatch_requeues_review_worker_into_review_lane(kanban_home, monkeypat
         assert json.loads(claim["payload"])["source_status"] == "review"
 
 
+def test_stale_and_manual_reviewer_recovery_stay_in_review(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        stale_id = kb.create_task(
+            conn, title="stale review", assignee="reviewer", initial_status="review",
+        )
+        assert kb.claim_review_task(conn, stale_id, claimer="worker:reviewer") is not None
+        conn.execute(
+            "UPDATE tasks SET claim_expires = 1 WHERE id = ?", (stale_id,)
+        )
+        conn.commit()
+        assert kb.release_stale_claims(conn) == 1
+        assert kb.get_task(conn, stale_id).status == "review"
+
+        manual_id = kb.create_task(
+            conn, title="manual review", assignee="reviewer", initial_status="review",
+        )
+        assert kb.claim_review_task(conn, manual_id, claimer="worker:reviewer") is not None
+        assert kb.reclaim_task(conn, manual_id, reason="operator recovery") is True
+        assert kb.get_task(conn, manual_id).status == "review"
+
+
 def test_respawn_guard_allows_requeued_review_worker_after_pr(kanban_home, monkeypatch):
     """A crashed reviewer requeued to ready retains reviewer execution intent."""
     import hermes_cli.kanban_db as _kb
