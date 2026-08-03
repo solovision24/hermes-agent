@@ -22,6 +22,20 @@ from agent.transports.codex_app_server_session import CodexAppServerSession, Tur
 
 
 @pytest.fixture
+def bypass_coding_intake_gate(monkeypatch):
+    """Keep these runtime-shape tests focused on the app-server adapter."""
+    monkeypatch.setattr(
+        "tools.coding_kanban_gate.coding_tool_gate_refusal",
+        lambda *args, **kwargs: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _bypass_coding_intake_gate(bypass_coding_intake_gate):
+    return bypass_coding_intake_gate
+
+
+@pytest.fixture
 def fake_session(monkeypatch):
     """Replace CodexAppServerSession with a stub that returns a fixed
     TurnResult, so we can drive AIAgent without spawning real codex."""
