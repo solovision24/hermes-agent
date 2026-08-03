@@ -111,6 +111,12 @@ def _reply_anchor_for_event(event) -> str | None:
     topic lanes prefer replying to the triggering user message so the answer
     stays attached to the active lane; synthetic/resumed sends fall back to
     ``direct_messages_topic_id`` metadata when no message id is available.
+
+    Buzz: replying with ``--reply-to`` creates a Nostr thread. Flat DMs and
+    channel messages that did not originate inside a thread must reply without
+    the anchor so the agent response lands inline. A threaded reply (one that
+    already has a thread_id from an ``e``-tag reply marker) preserves the
+    anchor so the response stays inside the thread.
     """
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", None))
@@ -126,6 +132,10 @@ def _reply_anchor_for_event(event) -> str | None:
         # event's message_id as reply_to would make
         # SlackAdapter._resolve_thread_ts() treat it as a thread anchor and
         # reply in a (nonexistent) thread anyway.
+        return None
+    if platform == "buzz":
+        if thread_id:
+            return getattr(event, "message_id", None)
         return None
     if platform == "telegram" and thread_id and getattr(source, "chat_type", None) == "dm":
         # Reply to the triggering user message. Replying to Telegram's earlier

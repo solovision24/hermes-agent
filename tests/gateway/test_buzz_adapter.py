@@ -421,6 +421,74 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+# ── Reply tag / thread_id parsing ─────────────────────────────────────────
+
+
+class TestBuzzThreadIdParsing:
+
+    @pytest.fixture
+    def adapter(self):
+        a = _make_adapter()
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        a._channel_names[CHANNEL] = "general"
+        return a
+
+    @pytest.mark.asyncio
+    async def test_reply_tag_sets_thread_id_on_source(self, adapter):
+        """An event with an ``e``-tag with 4th element \"reply\" sets thread_id."""
+        reply_to_id = "root-event-123"
+        event = _tagged_event(
+            "e42", CHANNEL,
+            content="@Chip replying in thread",
+            reply_to=reply_to_id,
+            created_at=200,
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [event])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+        assert len(adapter._dispatched) == 1
+        kwargs = adapter._dispatched[0]
+        assert kwargs["message_id"] == "e42"
+        assert kwargs["thread_id"] == reply_to_id
+
+    @pytest.mark.asyncio
+    async def test_flat_message_has_no_thread_id(self, adapter):
+        """A plain event with no reply tags has thread_id=None."""
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [
+            _event("e99", content="@Chip hey there", created_at=200),
+        ])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+        assert len(adapter._dispatched) == 1
+        kwargs = adapter._dispatched[0]
+        assert kwargs["thread_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_dm_without_reply_tag_has_no_thread_id(self, adapter):
+        """A DM (p-tagged, no reply tag) has thread_id=None."""
+        adapter._channel_state[CHANNEL]["chat_type"] = "dm"
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [
+            _tagged_event("e100", CHANNEL, content="dm message", p=SELF_PUBKEY, created_at=200),
+        ])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+        assert len(adapter._dispatched) == 1
+        kwargs = adapter._dispatched[0]
+        assert kwargs["thread_id"] is None
+
 
 # ── Thread reply mention (p-tag) — t_128ba197 ────────────────────────────
 

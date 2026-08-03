@@ -638,7 +638,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
-        mention_pubkey = ""
+        mention_pubkey = "" 
         if reply_target:
             args += ["--reply-to", str(reply_target)]
             # Thread replies stay in the thread (e-tag anchor above) but must
@@ -1110,6 +1110,18 @@ class BuzzAdapter(BasePlatformAdapter):
         # strip applies to both chat types.
         dispatch_text = self._strip_mention(content)
 
+        # Parse thread ancestry from Nostr tags.  A chat message that is itself
+        # a reply carries an ``["e", <root-event-id>, "", "reply"]`` tag.
+        # When present, it is the Buzz equivalent of source.thread_id — the
+        # agent's reply should stay inside that thread rather than landing flat
+        # at the channel root.
+        thread_id = None
+        tags = event.get("tags") or []
+        for tag in tags:
+            if isinstance(tag, list) and len(tag) >= 4 and tag[0] == "e" and tag[3] == "reply":
+                thread_id = str(tag[1]) if tag[1] else None
+                break
+
         await self._dispatch_message(
             text=dispatch_text,
             chat_id=channel_id,
@@ -1117,6 +1129,7 @@ class BuzzAdapter(BasePlatformAdapter):
             user_id=pubkey,
             user_name=await self._resolve_user_name(pubkey),
             message_id=event_id,
+            thread_id=thread_id,
             created_at=created_at,
         )
 
@@ -1303,7 +1316,8 @@ class BuzzAdapter(BasePlatformAdapter):
         user_id: str,
         user_name: str,
         message_id: str,
-        created_at: int,
+        thread_id: Optional[str] = None,
+        created_at: int = 0,
     ) -> None:
         """Build a MessageEvent and hand it to the base class handler."""
         if not self._message_handler:
@@ -1315,6 +1329,7 @@ class BuzzAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=user_id,
             user_name=user_name,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
