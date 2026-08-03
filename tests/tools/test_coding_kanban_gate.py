@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from tools.coding_kanban_gate import intake_coding_task, is_coding_intent
+from tools.coding_kanban_gate import coding_tool_gate_refusal, intake_coding_task, is_coding_intent
 from tools.registry import ToolRegistry
 
 
@@ -167,15 +167,52 @@ def test_gh_read_only_classifier_fails_closed_for_mutations(monkeypatch):
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"dev", "orion"})
     read_only = [
-        "gh pr view 1", "gh issue list", "gh run view 1", "gh api /repos/example",
+        "gh pr view 1", "gh --repo solovision24/hermes-agent pr view 1", "gh issue list",
+        "gh run view 1", "gh api /repos/example",
     ]
     mutating = [
         "gh issue reopen 1", "gh run cancel 1", "gh api /repos/example -f state=closed",
         "gh api /repos/example -F state=closed", "gh api /repos/example --input payload.json",
         "gh variable set NAME --body value", "gh secret set NAME", "gh release upload v1 file.zip",
+        "gh api /repos/example -XPOST", "gh api /repos/example -fstate=closed",
     ]
     assert all(not is_coding_intent("terminal", {"command": command}) for command in read_only)
     assert all(is_coding_intent("terminal", {"command": command}) for command in mutating)
+
+
+def test_shell_and_python_mutation_probes_fail_closed():
+    assert is_coding_intent("terminal", {"command": "sed -n 'w /tmp/copied.py' source.py"})
+    assert is_coding_intent("terminal", {"command": "git diff --output=/tmp/patch.diff"})
+    assert is_coding_intent("terminal", {"command": "cat pyproject.toml\nmake format"})
+    assert is_coding_intent("execute_code", {"code": "from pathlib import Path; Path('x.py').touch()"})
+    assert is_coding_intent("execute_code", {"code": "DataFrame().to_csv('x.py')"})
+
+
+def test_active_generic_worker_task_with_legacy_null_metadata_is_allowed(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_db
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_legacy")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setattr(kanban_db, "connect_closing", lambda: _Connection())
+    monkeypatch.setattr(
+        kanban_db,
+        "get_task",
+        lambda _conn, _task_id: SimpleNamespace(
+            metadata=None, current_run_id=7, assignee="dev", status="running",
+        ),
+    )
+
+    assert coding_tool_gate_refusal(
+        "patch", function_args={}, user_message="Implement this change",
+    ) is None
 
 
 def test_implicit_routing_never_uses_active_non_engineering_profile(monkeypatch, tmp_path):

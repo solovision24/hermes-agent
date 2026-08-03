@@ -46,7 +46,8 @@ _RESEARCH_RE = re.compile(r"\b(?:explain|research|inspect|review|analy[sz]e|look
 _WRITE_MARKERS = re.compile(
     r"(?:>>?|<<|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|"
     r"\bperl\s+[^\n]*-i\b|\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|"
-    r"\bchmod\b|\bchown\b|\binstall\b|\btruncate\b)", re.I,
+    r"\bchmod\b|\bchown\b|\binstall\b|\btruncate\b|"
+    r"\bsed\s+[^\n]*['\"]w(?:\s|['\"])|\bgit\s+[^\n]*--output(?:=|\s))", re.I,
 )
 
 
@@ -348,7 +349,7 @@ create_or_reuse_coding_task = intake_coding_task
 
 
 def _command_parts(command: str) -> list[str]:
-    return [part.strip() for part in re.split(r"\s*(?:&&|\|\||[|;])\s*", command) if part.strip()]
+    return [part.strip() for part in re.split(r"\s*(?:&&|\|\||[|;]|\n)\s*", command) if part.strip()]
 
 
 def _gh_is_read_only(words: list[str]) -> bool:
@@ -356,13 +357,24 @@ def _gh_is_read_only(words: list[str]) -> bool:
     if len(words) < 2:
         return False
     args = words[1:]
+    # gh accepts repository/host/cwd options before the command.
+    while args and args[0].startswith("-"):
+        option = args.pop(0)
+        if option in {"--repo", "--hostname", "--cwd"}:
+            if not args:
+                return False
+            args.pop(0)
     if args[0] == "api":
         # gh api defaults to GET. Any explicit method, form field, or input
         # changes the request and must remain behind the coding gate.
         mutation_flags = {"-X", "--method", "-f", "--raw-field", "-F", "--field", "--input"}
         return not any(
             item in mutation_flags
-            or any(item.startswith(flag + "=") for flag in mutation_flags)
+            or any(
+                item.startswith(flag + "=")
+                or (flag in {"-X", "-f", "-F"} and item.startswith(flag) and len(item) > len(flag))
+                for flag in mutation_flags
+            )
             for item in args[1:]
         )
     roots = {
@@ -430,7 +442,12 @@ def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: 
         command = _text(args.get("command"))
         return not command or not all(_simple_command_is_read_only(part) for part in _command_parts(command))
     if tool_name == "execute_code":
-        return bool(re.search(r"(?:open\s*\([^)]*['\"](?:w|a|x)|\.write(?:_text|_bytes)?\s*\(|\b(?:unlink|remove|rename|replace|mkdir|rmdir|subprocess|os\.system|shutil\.)\b)", _text(args.get("code")), re.I))
+        return bool(re.search(
+            r"(?:open\s*\([^)]*['\"](?:w|a|x)|\.write(?:_text|_bytes)?\s*\(|"
+            r"\.(?:touch|to_csv|to_excel|to_json|to_pickle|to_sql)\s*\(|"
+            r"\b(?:unlink|remove|rename|replace|mkdir|rmdir|subprocess|os\.system|shutil\.)\b)",
+            _text(args.get("code")), re.I,
+        ))
     if tool_name == "delegate_task":
         text = "\n".join(filter(None, [_text(args.get("goal")), _text(args.get("context"))]))
         return bool(_CODING_INTENT_RE.search(text) and not (_RESEARCH_RE.search(text) and not re.search(r"\b(?:implement|edit|write|fix|change|patch)\b", text, re.I)))
@@ -450,10 +467,15 @@ def coding_tool_gate_refusal(tool_name: str, *, function_args: Optional[dict] = 
             from hermes_cli import kanban_db
             with kanban_db.connect_closing() as conn:
                 task = kanban_db.get_task(conn, worker_id)
-            metadata = task.metadata if task else {}
+            metadata = task.metadata if task and isinstance(task.metadata, dict) else {}
             run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
             active_run = task and run_id and task.current_run_id is not None and str(task.current_run_id) == run_id
-            if not task or not task.assignee or task.status not in ACTIVE_TASK_STATUSES or metadata.get("canonical") is not True or metadata.get("lane") != CODING_LANE or metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS or not active_run:
+            canonical_metadata_invalid = bool(metadata) and (
+                metadata.get("canonical") is not True
+                or metadata.get("lane") != CODING_LANE
+                or metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS
+            )
+            if not task or not task.assignee or task.status not in ACTIVE_TASK_STATUSES or canonical_metadata_invalid or not active_run:
                 reason = "task is not an active qualified coding worker"
                 return json.dumps({"ok": False, "error_type": "kanban_task_required", "tool": tool_name, "task_id": worker_id, "error": reason})
             return None
