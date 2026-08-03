@@ -128,6 +128,17 @@ def configured_assignee_aliases(config: Optional[dict] = None) -> dict[str, str]
     return _assignee_aliases(cfg)
 
 
+def has_configured_assignee_targets(config: Optional[dict] = None) -> bool:
+    """Whether the config declares any non-profile assignee targets.
+
+    Older callers used arbitrary labels as assignees.  Keeping those labels
+    readable when no registry is configured preserves compatibility for
+    imported boards, while configured boards get strict validation.
+    """
+    cfg = _load_config() if config is None else config
+    return bool(_external_lanes(cfg) or _assignee_aliases(cfg))
+
+
 def configured_assignee_choices(config: Optional[dict] = None) -> tuple[AssigneeResolution, ...]:
     """Enumerate configured assignee inputs with their target types.
 

@@ -84,6 +84,21 @@ def test_configured_choices_are_typed(assignee_home):
     assert by_input["build"].category is AssigneeCategory.ALIAS
 
 
+def test_known_assignees_preserves_alias_input_and_target_metadata(assignee_home):
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing() as conn:
+        entries = {entry["name"]: entry for entry in kb.known_assignees(conn)}
+
+    assert entries["build"]["category"] == "alias"
+    assert entries["build"]["canonical"] == "worker"
+    assert entries["build"]["target_category"] == "profile"
+    assert entries["build"]["spawnable"] is True
+    assert entries["handoff"]["category"] == "alias"
+    assert entries["handoff"]["target_category"] == "external_lane"
+    assert entries["handoff"]["spawnable"] is False
+
+
 def test_create_assign_and_reassign_reject_before_mutation(assignee_home):
     from hermes_cli import kanban_db as kb
 

@@ -2893,9 +2893,25 @@ def _claimer_id() -> str:
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Resolve an assignee before persisting it in a Kanban row."""
-    from hermes_cli.kanban_assignees import resolve_assignee
+    from hermes_cli.kanban_assignees import (
+        InvalidAssigneeError,
+        has_configured_assignee_targets,
+        resolve_assignee,
+    )
 
-    return resolve_assignee(assignee).canonical
+    try:
+        return resolve_assignee(assignee).canonical
+    except InvalidAssigneeError:
+        # Pre-registry boards historically allowed arbitrary labels.  Do not
+        # make opening/importing those boards destructive; strict resolution
+        # still applies as soon as aliases or external lanes are configured.
+        if assignee is not None and not has_configured_assignee_targets():
+            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+            legacy_name = normalize_profile_name(str(assignee))
+            validate_profile_name(legacy_name)
+            return legacy_name
+        raise
 
 
 def create_task(
@@ -8435,15 +8451,15 @@ def _dispatch_once_locked(
     _default_assignee_resolved = False
     if _default_assignee:
         try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            from hermes_cli.kanban_assignees import resolve_assignee
+
+            _default_assignee = resolve_assignee(
+                _default_assignee,
+                allow_unassigned=False,
+            ).canonical
+            _default_assignee_resolved = bool(_default_assignee)
         except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+            _default_assignee = None
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -10175,7 +10191,9 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     on_disk = set(list_profiles_on_disk())
     from hermes_cli.kanban_assignees import configured_assignee_choices
     configured = configured_assignee_choices()
-    configured_names = {choice.canonical for choice in configured if choice.canonical}
+    configured_names = {
+        str(choice.input_value) for choice in configured if choice.input_value
+    }
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -10193,18 +10211,28 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
             from hermes_cli.kanban_assignees import resolve_assignee
 
             resolution = resolve_assignee(name, allow_unassigned=False)
-            category = resolution.target_category or resolution.category
-            target_category = resolution.target_category.value if resolution.target_category else None
+            category = resolution.category
+            target_category = (
+                resolution.target_category.value
+                if resolution.target_category else None
+            )
+            canonical = resolution.canonical
         except Exception:
             category = "invalid"
             target_category = None
+            canonical = None
         entries.append({
             "name": name,
             "on_disk": name in on_disk,
             "counts": counts.get(name, {}),
+            "canonical": canonical,
             "category": category.value if hasattr(category, "value") else category,
             "target_category": target_category,
-            "spawnable": category == "profile" or getattr(category, "value", None) == "profile",
+            "spawnable": (
+                target_category == "profile"
+                or category == "profile"
+                or getattr(category, "value", None) == "profile"
+            ),
         })
     return entries
 

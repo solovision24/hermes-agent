@@ -249,8 +249,15 @@ def _resolve_default_assignee(cfg: dict) -> str:
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
+            from hermes_cli.kanban_assignees import resolve_assignee
+
+            resolved = resolve_assignee(
+                explicit,
+                allow_unassigned=False,
+                config={"kanban": kanban_cfg},
+            )
+            if resolved.canonical:
+                return resolved.canonical
         except Exception:
             pass
     try:
@@ -281,6 +288,26 @@ def _build_roster() -> tuple[list[dict], set[str]]:
             "has_description": bool(desc),
         })
         valid.add(p.name)
+    # The model may select configured aliases, but the persisted task must
+    # still use the resolver's canonical target.  Include aliases and lanes
+    # in the prompt without duplicating profile discovery logic here.
+    try:
+        from hermes_cli.kanban_assignees import configured_assignee_choices
+
+        for choice in configured_assignee_choices():
+            name = str(choice.input_value)
+            if name in valid:
+                continue
+            roster.append({
+                "name": name,
+                "description": (
+                    f"{choice.category.value}; routes to {choice.canonical!r}"
+                ),
+                "has_description": True,
+            })
+            valid.add(name)
+    except Exception as exc:
+        logger.warning("decompose: failed to list configured assignees: %s", exc)
     return roster, valid
 
 
@@ -308,9 +335,14 @@ def _normalize_assignee_choice(
     if not isinstance(assignee, str) or not assignee.strip():
         return default_assignee
     chosen = assignee.strip()
-    if chosen not in valid_names:
+    if chosen.casefold() not in {name.casefold() for name in valid_names}:
         return default_assignee
-    return chosen
+    try:
+        from hermes_cli.kanban_assignees import resolve_assignee
+
+        return resolve_assignee(chosen, allow_unassigned=False).canonical or default_assignee
+    except Exception:
+        return default_assignee
 
 
 def decompose_task(

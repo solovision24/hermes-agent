@@ -93,3 +93,18 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
 
 
+def test_default_assignee_alias_is_resolved_before_dispatch(isolated_kanban_home):
+    """Configured aliases work in the direct dispatcher path, not only gateway setup."""
+    kb, home = isolated_kanban_home
+    with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("kanban:\n  assignee_aliases:\n    build: default\n")
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="alias-default", assignee=None)
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False,
+            default_assignee="build",
+        )
+    assert res.auto_assigned_default == [task_id]
+    assert res.spawned[0][1] == "default"
+
+
