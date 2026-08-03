@@ -2737,6 +2737,23 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Agent-loop tools bypass model_tools.handle_function_call, so keep the
+    # gate here for delegation. Registry-backed tools are gated by the shared
+    # model/registry boundaries after ACP edit approval has run.
+    if function_name == "delegate_task":
+        from tools.coding_kanban_gate import coding_tool_gate_refusal
+
+        refusal = coding_tool_gate_refusal(
+            function_name,
+            function_args=function_args,
+            session_id=getattr(agent, "session_id", None),
+            task_id=effective_task_id,
+            turn_id=getattr(agent, "_current_turn_id", None),
+            user_message=getattr(agent, "_current_user_message", None),
+        )
+        if refusal is not None:
+            return refusal
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware

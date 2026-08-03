@@ -466,6 +466,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "metadata": task.metadata,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -512,6 +513,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "metadata": t.metadata,
                 }
 
             def _run_dict(r):
@@ -1265,6 +1267,9 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error("metadata must be an object")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1315,6 +1320,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                metadata=metadata,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)

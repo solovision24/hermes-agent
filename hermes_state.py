@@ -4122,6 +4122,65 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def set_session_kanban_linkage(
+        self,
+        session_id: str,
+        task_id: str,
+        *,
+        origin_session_id: Optional[str] = None,
+        origin_message_id: Optional[str] = None,
+    ) -> None:
+        """Persist the Kanban card linked to a user-facing session.
+
+        These columns are session-scoped display state, separate from the
+        transcript and gateway routing metadata.  The update is idempotent so
+        repeated intake/retry calls cannot lose the original origin.
+        """
+        if not session_id or not task_id:
+            return
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE sessions
+                   SET kanban_task_id = ?,
+                       kanban_origin_session_id = COALESCE(?, kanban_origin_session_id),
+                       kanban_origin_message_id = COALESCE(?, kanban_origin_message_id)
+                 WHERE id = ?""",
+                (task_id, origin_session_id, origin_message_id, session_id),
+            )
+            if cursor.rowcount == 0:
+                conn.execute(
+                    "INSERT OR IGNORE INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                    (session_id, "chat", time.time()),
+                )
+                conn.execute(
+                    """UPDATE sessions
+                       SET kanban_task_id = ?,
+                           kanban_origin_session_id = ?,
+                           kanban_origin_message_id = ?
+                     WHERE id = ?""",
+                    (task_id, origin_session_id, origin_message_id, session_id),
+                )
+
+        self._execute_write(_do)
+
+    def get_session_kanban_linkage(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return the persisted Kanban linkage for a session, if present."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT kanban_task_id, kanban_origin_session_id,
+                          kanban_origin_message_id
+                     FROM sessions WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+        if not row or not row["kanban_task_id"]:
+            return None
+        return {
+            "kanban_task_id": row["kanban_task_id"],
+            "origin_session_id": row["kanban_origin_session_id"],
+            "origin_message_id": row["kanban_origin_message_id"],
+        }
+
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):

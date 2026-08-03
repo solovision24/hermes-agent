@@ -399,6 +399,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--metadata", default=None,
+                          help="JSON object retained as task request metadata")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1495,6 +1497,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    metadata = None
+    raw_metadata = getattr(args, "metadata", None)
+    if raw_metadata:
+        try:
+            metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must be a JSON object", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1519,6 +1532,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            metadata=metadata,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

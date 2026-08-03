@@ -745,6 +745,23 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        # Keep the intake at the shared boundary so gateway, CLI/TUI, API,
+        # and ordinary model tool calls cannot bypass it. ACP edit approval
+        # calls do not carry chat context and therefore remain on their own
+        # approval path.
+        if kwargs.get("session_id") or kwargs.get("user_message") or kwargs.get("user_task"):
+            from tools.coding_kanban_gate import coding_tool_gate_refusal
+
+            refusal = coding_tool_gate_refusal(
+                name,
+                function_args=args,
+                session_id=kwargs.get("session_id"),
+                task_id=kwargs.get("task_id"),
+                turn_id=kwargs.get("turn_id"),
+                user_message=kwargs.get("user_message") or kwargs.get("user_task"),
+            )
+            if refusal is not None:
+                return refusal
         try:
             if entry.is_async:
                 from model_tools import _run_async

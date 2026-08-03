@@ -1303,6 +1303,22 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return tool_error("Edit approval denied: approval guard failed")
 
+        # Coding work must be handed to a canonical Kanban task before the
+        # registry handler can mutate the workspace. Keep this after ACP edit
+        # approval so the existing human-approval ordering remains intact.
+        from tools.coding_kanban_gate import coding_tool_gate_refusal
+
+        refusal = coding_tool_gate_refusal(
+            function_name,
+            function_args=function_args,
+            session_id=session_id,
+            task_id=task_id,
+            turn_id=turn_id,
+            user_message=user_task,
+        )
+        if refusal is not None:
+            return refusal
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:

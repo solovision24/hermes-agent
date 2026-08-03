@@ -115,6 +115,32 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_coding_intake_route_preserves_fields_and_is_idempotent(client):
+    payload = {
+        "repository": "/tmp/example-repo",
+        "workspace": "/tmp/example-repo",
+        "scope": "Implement the chat intake route",
+        "acceptance_criteria": ["Route returns a canonical task"],
+        "provider": "openai",
+        "model": "gpt-5-codex",
+        "provider_metadata": {"account": "team"},
+        "origin_session_id": "mission-control-session",
+        "origin_message_id": "message-1",
+    }
+    first = client.post("/api/plugins/kanban/coding-intake", json=payload)
+    second = client.post("/api/plugins/kanban/coding-intake", json=payload)
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["task_id"] == first.json()["task_id"]
+    assert second.json()["reused"] is True
+
+    task = client.get(
+        f"/api/plugins/kanban/tasks/{first.json()['task_id']}"
+    ).json()["task"]
+    assert task["metadata"]["scope"] == payload["scope"]
+    assert task["metadata"]["provider_metadata"] == payload["provider_metadata"]
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

@@ -618,6 +618,49 @@ class CreateTaskBody(BaseModel):
     project_id: Optional[str] = None
 
 
+class CodingIntakeBody(BaseModel):
+    """Canonical request shared by chat, Mission Control, ACP, and CLI/TUI."""
+
+    repository: Optional[str] = None
+    workspace: Optional[str] = None
+    scope: str
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    coding_agent: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    provider_metadata: Optional[dict[str, Any]] = None
+    origin_session_id: Optional[str] = None
+    origin_message_id: Optional[str] = None
+    assignee: Optional[str] = None
+    specialist: Optional[str] = None
+    board: Optional[str] = None
+
+
+@router.post("/coding-intake")
+def create_or_reuse_coding_intake(payload: CodingIntakeBody):
+    """Create or locate one canonical chat-originated coding task."""
+    from tools.coding_kanban_gate import intake_coding_task
+
+    result = intake_coding_task(
+        repository=payload.repository,
+        workspace=payload.workspace,
+        scope=payload.scope,
+        acceptance_criteria=payload.acceptance_criteria,
+        coding_agent=payload.coding_agent,
+        provider=payload.provider,
+        model=payload.model,
+        provider_metadata=payload.provider_metadata,
+        origin_session_id=payload.origin_session_id,
+        origin_message_id=payload.origin_message_id,
+        assignee=payload.assignee,
+        specialist=payload.specialist,
+        board=payload.board,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
+
+
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)

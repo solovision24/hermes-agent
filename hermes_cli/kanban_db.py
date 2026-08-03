@@ -993,6 +993,8 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Structured intake/provider/origin metadata. Legacy rows leave this NULL.
+    metadata: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1006,6 +1008,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        metadata_value: Optional[dict] = None
+        if "metadata" in keys and row["metadata"]:
+            try:
+                parsed = json.loads(row["metadata"])
+                if isinstance(parsed, dict):
+                    metadata_value = parsed
+            except Exception:
+                metadata_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1087,6 +1097,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            metadata=metadata_value,
         )
 
 
@@ -1262,6 +1273,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Structured intake/provider/origin metadata for reusable cards.
+    metadata             TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2464,6 +2477,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # generic human blocker — same behaviour they had before the column.
         _add_column_if_missing(conn, "tasks", "block_kind", "block_kind TEXT")
 
+    if "metadata" not in cols:
+        _add_column_if_missing(conn, "tasks", "metadata", "metadata TEXT")
+
     if "block_recurrences" not in cols:
         # Unblock-loop counter. Existing rows start at 0, so the loop breaker
         # only begins counting from the first re-block after this migration.
@@ -2906,6 +2922,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2949,6 +2966,8 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3217,8 +3236,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3244,6 +3263,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(metadata, ensure_ascii=False) if metadata else None,
                     ),
                 )
                 for pid in parents:
@@ -3268,6 +3288,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "metadata": metadata,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -9017,6 +9038,8 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    if isinstance(task.metadata, dict) and task.metadata.get("coding_agent"):
+        env["HERMES_CODING_AGENT"] = str(task.metadata["coding_agent"])
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
