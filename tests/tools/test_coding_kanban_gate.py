@@ -7,7 +7,7 @@ import json
 import pytest
 
 from tools.registry import ToolRegistry
-from tools.coding_kanban_gate import coding_tool_gate_refusal
+from tools.coding_kanban_gate import coding_tool_gate_refusal, is_coding_intent
 
 
 def _registry(calls: list[str], *names: str) -> ToolRegistry:
@@ -312,3 +312,37 @@ def test_codex_app_server_enters_the_same_intake_gate(monkeypatch, tmp_path):
     assert result["task_id"].startswith("t_")
     assert result["status"] == "ready"
     assert result["coding_agent"] == "codex"
+
+
+@pytest.mark.parametrize("command", [
+    "date", "ps -ef", "curl -I https://example.com", "sqlite3 state.db '.tables'",
+    "gh pr view 19", "git remote -v", "git remote show origin",
+])
+def test_read_only_operational_probes_are_not_coding_intent(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect runtime state") is False
+
+
+def test_mutating_shell_probes_are_coding_intent():
+    assert is_coding_intent("terminal", {"command": "find . -delete"}, "Inspect the tree") is True
+    assert is_coding_intent("terminal", {"command": "git remote add origin https://example.com"}, "Inspect remotes") is True
+
+
+def test_report_write_and_read_only_codex_turn_do_not_create_intake_task(tmp_path):
+    assert is_coding_intent(
+        "write_file", {"path": str(tmp_path / "report.md"), "content": "Findings"},
+        "Write the audit report",
+    ) is False
+    assert is_coding_intent("codex_app_server", {}, "Inspect the repository and report findings") is False
+
+
+def test_active_non_dev_worker_can_still_inspect(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "not-a-real-task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-1")
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal", {"command": "date"}, session_id="worker", user_message="Inspect time",
+    ))
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
