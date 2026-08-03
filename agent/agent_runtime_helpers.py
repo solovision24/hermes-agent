@@ -2737,13 +2737,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
-    if function_name == "delegate_task":
-        from tools.registry import coding_tool_gate_refusal
+    if function_name in {"delegate_task", "terminal", "execute_code", "write_file", "patch", "project_create", "project_switch"}:
+        from tools.coding_kanban_gate import coding_tool_gate_refusal
 
         refusal = coding_tool_gate_refusal(
             function_name,
-            args=function_args,
+            function_args=function_args,
             session_id=getattr(agent, "session_id", None),
+            task_id=effective_task_id,
+            turn_id=getattr(agent, "_current_turn_id", None),
+            user_message=getattr(agent, "_current_user_message", None),
+        )
+        if refusal is not None:
+            return refusal
         )
         if refusal is not None:
             return refusal
