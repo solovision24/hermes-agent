@@ -279,6 +279,35 @@ def test_worker_can_change_code_only_from_own_canonical_dev_task(monkeypatch, tm
     assert calls == ["patch"]
 
 
+@pytest.mark.parametrize("assignee", ["forge", "quill", "chip"])
+def test_active_canonical_specialist_worker_can_change_code(
+    monkeypatch, tmp_path, assignee,
+):
+    """Specialist implementation workers remain inside the canonical DEV lane."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title=f"{assignee} task", assignee=assignee, session_id="origin",
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+        conn.execute("UPDATE tasks SET current_run_id = 42 WHERE id = ?", (task_id,))
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    assert _payload(registry.dispatch(
+        "patch", {}, session_id="worker-session", user_message="Implement",
+    )) == {"ok": True}
+    assert calls == ["patch"]
+
+
 def test_fake_task_environment_without_active_run_cannot_unlock_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     from hermes_cli import kanban_db

@@ -2,7 +2,9 @@
 
 The gate deliberately lives below the model-facing dispatchers.  A model can
 inspect and reason in chat, but a code-changing operation is handed to the
-canonical DEV lane before its handler is allowed to run.
+canonical DEV lane before its handler is allowed to run.  The DEV lane may
+dispatch the implementation to a specialist profile, so worker validation
+must use canonical task metadata rather than hard-coding the supervisor.
 """
 
 from __future__ import annotations
@@ -301,8 +303,8 @@ def _canonical_worker_task(task_id: str):
     if task is None:
         return None, "task does not exist"
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
-    if task.assignee != CANONICAL_ASSIGNEE:
-        return task, "task is not assigned to DEV"
+    if not _text(task.assignee):
+        return task, "task has no implementation assignee"
     if task.status not in ACTIVE_TASK_STATUSES:
         return task, f"task status is {task.status!r}"
     if metadata.get("canonical") is not True or metadata.get("lane") != "DEV":
