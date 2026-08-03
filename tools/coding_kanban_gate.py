@@ -36,13 +36,14 @@ _READ_ONLY_COMMANDS = frozenset({
     "git", "grep", "head", "jq", "ls", "pwd", "readlink", "rg", "sed",
     "sort", "stat", "tail", "test", "tree", "uniq", "wc", "which",
     "whoami", "python", "python3", "node", "ruby", "go", "cargo", "npm",
+    "date", "ps", "curl", "sqlite3", "gh",
 })
 _GIT_READ_ONLY = frozenset({
     "branch", "diff", "log", "ls-files", "remote", "rev-parse", "show",
     "status", "tag",
 })
 _WRITE_MARKERS = re.compile(
-    r"(?:^|[^<])(?:>>?|<<|\btee\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
+    r"(?:^|[^<])(?:>>?|<<|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
     r"\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|"
     r"\binstall\b|\btruncate\b|\btruncate\b)",
     re.IGNORECASE,
@@ -99,6 +100,13 @@ def _simple_command_is_read_only(command: str) -> bool:
             return False
         if subcommand not in _GIT_READ_ONLY:
             return False
+        if subcommand == "remote":
+            # `git remote` is read-only only for inspection.  `add`, `remove`,
+            # and `set-*` mutate repository configuration before any worker
+            # could be authorized.
+            remote_args = [word for word in words[2:] if not word.startswith("-")]
+            if remote_args and words[2] not in {"show", "get-url"}:
+                return False
         if subcommand == "branch":
             # `git branch --show-current`, `-a`, and `--list` inspect; a
             # positional branch name creates a branch.
@@ -114,7 +122,45 @@ def _simple_command_is_read_only(command: str) -> bool:
             return False
         if re.search(r"\b(?:open|write_text|write_bytes|unlink|remove|rename|mkdir|rmdir|system|popen|run|call|check_call|check_output)\b", command, re.I):
             return False
+    if base == "gh":
+        # Keep status/view/list probes available, but never permit a mutating
+        # GitHub subcommand to slip through the read-only classification.
+        try:
+            gh_subcommand = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if gh_subcommand not in {"auth", "pr", "run", "repo", "issue"}:
+            return False
+        if any(word in {"create", "close", "merge", "edit", "delete", "checkout", "comment", "rerun"} for word in words[1:]):
+            return False
     return True
+
+
+def _write_file_is_coding(args: dict, user_message: Any) -> bool:
+    """Permit ordinary report/artifact authoring outside the repository.
+
+    ``write_file`` is also the file tool used for reports and research notes.
+    Those must not be forced through the coding lane merely because the tool
+    can write.  Repository files, or a request explicitly describing code
+    work, remain coding operations.
+    """
+    path = _text(args.get("path") or args.get("file_path"))
+    message = _text(user_message)
+    report_request = bool(re.search(r"\b(?:report|audit|research|findings|notes?)\b", message, re.I))
+    if _CODING_INTENT_RE.search(message) and not report_request:
+        return True
+    if not path:
+        return True
+    try:
+        candidate = Path(path).expanduser().resolve()
+        repo = Path(_repository(_workspace(args), args)).resolve()
+        if candidate == repo or repo in candidate.parents:
+            return True
+        if report_request:
+            return False
+    except OSError:
+        return True
+    return False
 
 
 def _execute_code_is_read_only(code: str) -> bool:
@@ -137,8 +183,13 @@ def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: 
     """Return whether this call could start implementation work."""
     args = args if isinstance(args, dict) else {}
     if tool_name == "codex_app_server":
-        return True
-    if tool_name in {"write_file", "patch"}:
+        return bool(_CODING_INTENT_RE.search(_text(user_message)) and not (
+            _RESEARCH_RE.search(_text(user_message))
+            and not re.search(r"\b(?:implement|edit|write|fix|change|patch)\b", _text(user_message), re.I)
+        ))
+    if tool_name == "write_file":
+        return _write_file_is_coding(args, user_message)
+    if tool_name == "patch":
         return True
     if tool_name == "terminal":
         command = _text(args.get("command"))
@@ -261,9 +312,6 @@ def _canonical_worker_task(task_id: str):
     run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
     if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
         return task, "worker is not the active dispatcher run for this task"
-    origin = metadata.get("origin")
-    if not isinstance(origin, dict) or not _text(origin.get("session_id")):
-        return task, "task lacks origin linkage"
     return task, None
 
 
@@ -286,6 +334,8 @@ def coding_tool_gate_refusal(
             task, reason = _canonical_worker_task(worker_id)
         except Exception:
             return _worker_refusal(tool_name, worker_id, "Kanban is unavailable")
+        if not is_coding_intent(tool_name, args, user_message):
+            return None
         if reason:
             return _worker_refusal(tool_name, worker_id, reason)
         worker_agent = _text(os.environ.get("HERMES_CODING_AGENT"))
