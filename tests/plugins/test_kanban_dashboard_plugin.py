@@ -116,6 +116,9 @@ def test_create_task_appears_on_board(client):
 
 
 def test_coding_intake_route_preserves_fields_and_is_idempotent(client):
+    # Coding intake must resolve a real engineering profile even when the
+    # test's isolated HOME has no user-created profiles.
+    (Path.home() / ".hermes" / "profiles" / "dev").mkdir(parents=True)
     payload = {
         "repository": "/tmp/example-repo",
         "workspace": "/tmp/example-repo",

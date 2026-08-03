@@ -25,6 +25,7 @@ CODING_TOOLS = frozenset({
 SUPPORTED_CODING_AGENTS = frozenset({"codex", "cursor"})
 ACTIVE_TASK_STATUSES = frozenset({"todo", "ready", "running", "review"})
 CODING_LANE = "DEV"
+_ENGINEERING_ASSIGNEES = ("dev", "forge", "quill", "chip")
 
 _READ_ONLY_COMMANDS = frozenset({
     "awk", "cat", "cut", "date", "diff", "dirname", "du", "file", "find",
@@ -128,17 +129,22 @@ def _resolve_assignee(args: dict) -> str:
         cfg = load_config() or {}
         kanban = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         configured = kanban.get("coding_assignee") or kanban.get("default_assignee")
-        if configured:
-            return _profile_name(configured)
+        configured_name = _profile_name(configured) if configured else ""
+        if configured_name in _ENGINEERING_ASSIGNEES:
+            return configured_name
     except Exception:
         pass
-    # Default to the active profile rather than hard-coding a DEV identity;
-    # explicit specialist routing is validated against the live profile roster.
+    # Never route implementation work to the active chat profile: that may be
+    # Orion/default or another non-engineering profile. Pick the first
+    # qualified engineering profile that exists in the live roster.
     try:
-        from hermes_cli.profiles import get_active_profile_name
-        return _profile_name(get_active_profile_name() or "default")
+        from hermes_cli.profiles import profile_exists
+        for candidate in _ENGINEERING_ASSIGNEES:
+            if profile_exists(candidate):
+                return candidate
     except Exception:
-        return "default"
+        pass
+    return _ENGINEERING_ASSIGNEES[0]
 
 
 def _requested_agent(args: dict, user_message: Any = None) -> tuple[str, Optional[str]]:
@@ -237,7 +243,10 @@ def intake_coding_task(
     if agent_error:
         return {"ok": False, "status": "subscription_required" if agent_value == "claude" else "unsupported", "error_type": "subscription_required" if agent_value == "claude" else "unsupported_coding_agent", "coding_agent": agent_value, "error": agent_error}
     try:
-        assignee_value = _profile_name(assignee or specialist) or _resolve_assignee(args)
+        requested_assignee = _profile_name(assignee or specialist)
+        if requested_assignee and requested_assignee not in _ENGINEERING_ASSIGNEES:
+            return {"ok": False, "status": "invalid_assignee", "error_type": "invalid_assignee", "error": f"Coding assignee must be an engineering profile: {requested_assignee!r}"}
+        assignee_value = requested_assignee or _resolve_assignee(args)
         from hermes_cli.profiles import profile_exists
         if not profile_exists(assignee_value):
             return {"ok": False, "status": "invalid_assignee", "error_type": "invalid_assignee", "error": f"Unknown coding assignee profile {assignee_value!r}"}
@@ -342,6 +351,39 @@ def _command_parts(command: str) -> list[str]:
     return [part.strip() for part in re.split(r"\s*(?:&&|\|\||[|;])\s*", command) if part.strip()]
 
 
+def _gh_is_read_only(words: list[str]) -> bool:
+    """Allow only known read-only gh operations; fail closed otherwise."""
+    if len(words) < 2:
+        return False
+    args = words[1:]
+    if args[0] == "api":
+        # gh api defaults to GET. Any explicit method, form field, or input
+        # changes the request and must remain behind the coding gate.
+        mutation_flags = {"-X", "--method", "-f", "--raw-field", "-F", "--field", "--input"}
+        return not any(
+            item in mutation_flags
+            or any(item.startswith(flag + "=") for flag in mutation_flags)
+            for item in args[1:]
+        )
+    roots = {
+        "auth": {"status"},
+        "gist": {"list", "view"},
+        "issue": {"list", "status", "view"},
+        "label": {"list", "view"},
+        "pr": {"list", "status", "view"},
+        "project": {"list", "view"},
+        "release": {"list", "view"},
+        "repo": {"list", "status", "view"},
+        "run": {"list", "view"},
+        "variable": {"list"},
+        "secret": {"list"},
+        "workflow": {"list", "view"},
+    }
+    root = args[0]
+    subcommand = next((item for item in args[1:] if not item.startswith("-")), None)
+    return subcommand in roots.get(root, set())
+
+
 def _simple_command_is_read_only(command: str) -> bool:
     if not command or _WRITE_MARKERS.search(command) or re.search(r"[`$()]", command):
         return False
@@ -368,14 +410,7 @@ def _simple_command_is_read_only(command: str) -> bool:
             return False
 
     if base == "gh":
-        if any(word in {"create", "close", "merge", "edit", "delete", "checkout", "comment", "rerun", "review"} for word in words[1:]):
-            return False
-        if "api" in words[1:] and any(
-            word.casefold() in {"post", "put", "patch", "delete"}
-            or word.casefold().startswith(("-x=", "--method="))
-            for word in words[1:]
-        ):
-            return False
+        return _gh_is_read_only(words)
     return True
 
 
