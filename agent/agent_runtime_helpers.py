@@ -2750,9 +2750,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
         if refusal is not None:
             return refusal
-        )
-        if refusal is not None:
-            return refusal
 
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:

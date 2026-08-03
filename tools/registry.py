@@ -793,7 +793,6 @@ class ToolRegistry:
             turn_id=kwargs.get("turn_id"),
             user_message=kwargs.get("user_message") or kwargs.get("user_task"),
         )
-        )
         if refusal is not None:
             return refusal
         try:

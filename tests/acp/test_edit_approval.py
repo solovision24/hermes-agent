@@ -48,7 +48,7 @@ def test_acp_permission_tool_call_uses_edit_kind_and_diff_content():
 
 
 def test_requester_exception_denies_and_does_not_mutate(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "acp-edit-exception")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     target = tmp_path / "sample.txt"
     target.write_text("before\n", encoding="utf-8")
 
@@ -71,7 +71,7 @@ def test_requester_exception_denies_and_does_not_mutate(tmp_path, monkeypatch):
 
 
 def test_patch_replace_rejection_does_not_mutate(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "acp-patch-reject")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     target = tmp_path / "sample.txt"
     target.write_text("alpha\nbeta\n", encoding="utf-8")
 

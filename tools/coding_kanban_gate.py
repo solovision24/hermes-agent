@@ -25,6 +25,7 @@ CODING_TOOLS = frozenset({
     "delegate_task",
     "project_create",
     "project_switch",
+    "codex_app_server",
 })
 CANONICAL_ASSIGNEE = "dev"
 SUPPORTED_CODING_AGENTS = frozenset({"codex", "cursor"})
@@ -135,6 +136,8 @@ def _execute_code_is_read_only(code: str) -> bool:
 def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: Any = None) -> bool:
     """Return whether this call could start implementation work."""
     args = args if isinstance(args, dict) else {}
+    if tool_name == "codex_app_server":
+        return True
     if tool_name in {"write_file", "patch"}:
         return True
     if tool_name == "terminal":
@@ -255,6 +258,9 @@ def _canonical_worker_task(task_id: str):
         return task, "task lacks canonical DEV metadata"
     if metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS:
         return task, "task has no supported coding-agent metadata"
+    run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
+    if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
+        return task, "worker is not the active dispatcher run for this task"
     origin = metadata.get("origin")
     if not isinstance(origin, dict) or not _text(origin.get("session_id")):
         return task, "task lacks origin linkage"

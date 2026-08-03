@@ -7,6 +7,7 @@ import json
 import pytest
 
 from tools.registry import ToolRegistry
+from tools.coding_kanban_gate import coding_tool_gate_refusal
 
 
 def _registry(calls: list[str], *names: str) -> ToolRegistry:
@@ -266,6 +267,9 @@ def test_worker_can_change_code_only_from_own_canonical_dev_task(monkeypatch, tm
     calls: list[str] = []
     registry = _registry(calls, "patch")
     monkeypatch.setenv("HERMES_KANBAN_TASK", own_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    with kanban_db.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET current_run_id = 42 WHERE id = ?", (own_id,))
     assert _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement")) == {"ok": True}
     assert calls == ["patch"]
 
@@ -273,3 +277,38 @@ def test_worker_can_change_code_only_from_own_canonical_dev_task(monkeypatch, tm
     denied = _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement"))
     assert denied["error_type"] == "kanban_task_required"
     assert calls == ["patch"]
+
+
+def test_fake_task_environment_without_active_run_cannot_unlock_worker(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="fake", assignee="dev", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999")
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    result = _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement"))
+    assert result["error_type"] == "kanban_task_required"
+    assert calls == []
+
+
+def test_codex_app_server_enters_the_same_intake_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = _payload(coding_tool_gate_refusal(
+        "codex_app_server",
+        session_id="chat-codex",
+        task_id="message-1",
+        user_message="Implement the requested feature",
+    ))
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert result["coding_agent"] == "codex"

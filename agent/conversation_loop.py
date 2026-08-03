@@ -1391,6 +1391,25 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        from tools.coding_kanban_gate import coding_tool_gate_refusal
+
+        refusal = coding_tool_gate_refusal(
+            "codex_app_server",
+            function_args={},
+            session_id=getattr(agent, "session_id", None),
+            task_id=effective_task_id,
+            turn_id=getattr(agent, "_current_turn_id", None),
+            user_message=user_message,
+        )
+        if refusal is not None:
+            return {
+                "final_response": refusal,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "error": "coding_kanban_gate",
+            }
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
