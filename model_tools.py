@@ -1138,6 +1138,12 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    from tools.registry import coding_tool_gate_refusal
+    refusal = coding_tool_gate_refusal(
+        function_name, args=function_args, session_id=session_id,
+    )
+    if refusal is not None:
+        return refusal
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────

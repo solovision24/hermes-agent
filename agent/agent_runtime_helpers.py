@@ -2742,6 +2742,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
         refusal = coding_tool_gate_refusal(
             function_name,
+            args=function_args,
             session_id=getattr(agent, "session_id", None),
         )
         if refusal is not None:
