@@ -83,7 +83,7 @@ def test_tiny_edit_reuses_card_without_unlocking_originating_chat(monkeypatch, t
 @pytest.mark.parametrize(
     ("name", "args", "message"),
     [
-        ("terminal", {"command": "pwd && git status --short && rg 'needle' ."}, "Inspect the repo"),
+        ("terminal", {"command": "pwd && git status --short && git diff && rg 'needle' ."}, "Inspect the repo"),
         ("execute_code", {"code": "print(sum(range(10)))"}, "Calculate a value"),
         ("delegate_task", {"goal": "Research the relevant parser documentation"}, "Research only"),
     ],
@@ -100,6 +100,70 @@ def test_read_only_inspection_calculation_and_research_remain_available(
 
     assert result == {"ok": True}
     assert calls == [name]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("terminal", {"command": "find . -name '*.py' -delete"}),
+        ("terminal", {"command": "git branch -D stale"}),
+        ("terminal", {"command": "git branch -d stale"}),
+        ("terminal", {"command": "git branch -m old new"}),
+        ("terminal", {"command": "git branch -M old new"}),
+        ("terminal", {"command": "git branch -c old copy"}),
+        ("terminal", {"command": "git branch -C old copy"}),
+        ("terminal", {"command": "git branch --ambiguous"}),
+        ("terminal", {"command": "git tag -a release -m release"}),
+        ("terminal", {"command": "git tag -d release"}),
+        ("terminal", {"command": "git tag --force release"}),
+        ("terminal", {"command": "git tag --create-reflog release"}),
+        ("terminal", {"command": "git tag --ambiguous"}),
+        ("terminal", {"command": "git remote add origin https://example.invalid/repo.git"}),
+        ("terminal", {"command": "git remote set-url origin https://example.invalid/repo.git"}),
+        ("terminal", {"command": "git remote update origin"}),
+        ("terminal", {"command": "git remote ambiguous"}),
+        ("terminal", {"command": "git diff --output=changes.patch"}),
+        ("terminal", {"command": "git diff --output changes.patch"}),
+        ("terminal", {"command": "git diff --ambiguous"}),
+        ("terminal", {"command": "node -e \"require('fs').writeFileSync('x', 'x')\""}),
+        ("terminal", {"command": "node -e \"require('fs').appendFile('x', 'x', () => {})\""}),
+        ("terminal", {"command": "node -e \"require('fs').unlinkSync('x')\""}),
+        ("terminal", {"command": "node -e \"require('fs').renameSync('x', 'y')\""}),
+        ("terminal", {"command": "node -e \"require('fs').mkdirSync('x')\""}),
+        ("terminal", {"command": "node -e \"require('child_process').execSync('touch x')\""}),
+        ("terminal", {"command": "ruby -e \"File.write('x', 'x')\""}),
+        ("terminal", {"command": "python -c \"from pathlib import Path; Path('x').write_text('x')\""}),
+        ("execute_code", {"code": "from pathlib import Path; Path('x').write_text('x')"}),
+        ("execute_code", {"code": "import os; os.rename('x', 'y')"}),
+        ("execute_code", {"code": "import subprocess; subprocess.run(['touch', 'x'])"}),
+    ],
+)
+def test_mutating_terminal_and_execute_code_bypasses_handoff_once(
+    monkeypatch, tmp_path, name, args,
+):
+    """Every known bypass is refused before its handler, idempotently."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+    kwargs = dict(
+        session_id="chat-bypass", task_id="bypass-message",
+        user_message="Please implement the requested change",
+    )
+
+    first = _payload(registry.dispatch(name, args, **kwargs))
+    second = _payload(registry.dispatch(name, args, **kwargs))
+
+    assert first["error_type"] == "kanban_task_required"
+    assert second["error_type"] == "kanban_task_required"
+    assert second["task_id"] == first["task_id"]
+    assert second["reused"] is True
+    assert calls == []
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert len(kanban_db.list_tasks(conn, session_id="chat-bypass")) == 1
 
 
 def test_discussion_to_implementation_creates_card_at_transition(monkeypatch, tmp_path):

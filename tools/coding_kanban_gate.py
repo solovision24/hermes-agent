@@ -40,10 +40,67 @@ _GIT_READ_ONLY = frozenset({
     "branch", "diff", "log", "ls-files", "remote", "rev-parse", "show",
     "status", "tag",
 })
+_GIT_GLOBAL_OPTIONS_WITH_VALUES = frozenset({
+    "-C", "-c", "--config-env", "--exec-path", "--git-dir",
+    "--namespace", "--super-prefix", "--work-tree",
+})
+_GIT_GLOBAL_OPTIONS = frozenset({
+    "--bare", "--no-pager", "--paginate", "--no-replace-objects",
+    "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+    "--icase-pathspecs", "--no-optional-locks",
+})
+_GIT_BRANCH_READ_ONLY_OPTIONS = frozenset({
+    "-a", "--all", "-l", "--list", "-r", "--remotes", "-v", "--verbose",
+    "-vv", "--contains", "--no-contains", "--merged", "--no-merged",
+    "--points-at", "--format", "--sort", "--column", "--no-column",
+    "--color", "--no-color", "--abbrev", "--omit-empty", "--show-current",
+})
+_GIT_TAG_READ_ONLY_OPTIONS = frozenset({
+    "-l", "--list", "-n", "--contains", "--no-contains", "--merged",
+    "--no-merged", "--points-at", "--column", "--no-column", "--sort",
+    "--format", "--color", "--no-color", "--omit-empty", "-v", "--verify",
+})
+_GIT_TAG_MUTATING_OPTIONS = frozenset({
+    "-a", "--annotate", "-s", "--sign", "-u", "--local-user", "-f",
+    "--force", "-d", "--delete", "--create-reflog", "--edit",
+})
+_GIT_REMOTE_READ_ONLY_SUBCOMMANDS = frozenset({"show", "get-url"})
+_GIT_REMOTE_MUTATING_SUBCOMMANDS = frozenset({
+    "add", "rename", "remove", "rm", "set-head", "set-branches", "set-url",
+    "update", "prune",
+})
+_GIT_DIFF_READ_ONLY_OPTIONS = frozenset({
+    "--cached", "--staged", "--merge-base", "--no-index", "--no-ext-diff",
+    "--text", "--ignore-space-at-eol", "--ignore-space-change",
+    "--ignore-all-space", "-w", "-b", "--ignore-blank-lines", "--patience",
+    "--histogram", "--minimal", "--raw", "--patch", "-p", "--no-patch",
+    "-u", "--unified", "--stat", "--numstat", "--shortstat", "--dirstat",
+    "--summary", "--name-only", "--name-status", "--submodule", "--no-renames",
+    "--find-renames", "-M", "--find-copies", "-C", "--full-index", "--binary",
+    "--no-full-index", "--textconv", "--check", "--quiet", "--exit-code",
+    "--relative", "--no-relative", "--color", "--no-color", "--abbrev",
+})
 _WRITE_MARKERS = re.compile(
     r"(?:^|[^<])(?:>>?|<<|\btee\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
     r"\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|"
     r"\binstall\b|\btruncate\b|\btruncate\b)",
+    re.IGNORECASE,
+)
+_INLINE_MUTATION_APIS = re.compile(
+    r"(?:\b(?:writeFile|writeFileSync|appendFile|appendFileSync|unlink|unlinkSync|"
+    r"rm|rmSync|rename|renameSync|mkdir|mkdirSync|rmdir|rmdirSync|copyFile|"
+    r"copyFileSync|cp|cpSync|writeSync|ftruncate|ftruncateSync|chmod|chmodSync|"
+    r"chown|chownSync|symlink|symlinkSync|link|linkSync|truncate|truncateSync|"
+    r"mkdtemp|mkdtempSync|createWriteStream)\s*\(|"
+    r"\b(?:child_process\s*\.\s*)?(?:exec|execSync|execFile|execFileSync|"
+    r"spawn|spawnSync|fork|Popen)\s*\(|"
+    r"\b(?:File|FileUtils)\s*\.\s*(?:write|binwrite|delete|unlink|rename|"
+    r"chmod|chown|truncate|symlink|link|open|mkpath|mkdir|mkdir_p|rmdir|cp|mv|"
+    r"rm|touch|remove_entry|remove_file)\s*\(|"
+    r"\b(?:system|popen|IO\.popen|Process\.spawn|Process\.exec)\s*\(|"
+    r"\.(?:write_text|write_bytes|touch|unlink|rename|replace|mkdir|rmdir|"
+    r"chmod|lchmod|chown|lchown|symlink_to|hardlink_to)\s*\(|"
+    r"\bprocess\.env(?:\.|\[)|\b(?:os\.)?open\s*\([^)]*\b(?:O_WRONLY|O_RDWR|O_CREAT|O_APPEND)\b)",
     re.IGNORECASE,
 )
 _CODING_AGENT_RE = re.compile(r"\b(codex|cursor|claude)(?:\s+(?:code|cli|agent))?\b", re.I)
@@ -70,6 +127,116 @@ def _command_parts(command: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
+def _git_subcommand(words: list[str]) -> tuple[Optional[str], int]:
+    """Return the Git subcommand and its index, rejecting ambiguous globals."""
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            return None, index
+        if not word.startswith("-"):
+            return word, index
+        option = word.split("=", 1)[0]
+        if option in _GIT_GLOBAL_OPTIONS_WITH_VALUES:
+            if "=" not in word:
+                index += 1
+                if index >= len(words):
+                    return None, index
+        elif option not in _GIT_GLOBAL_OPTIONS:
+            return None, index
+        index += 1
+    return None, index
+
+
+def _git_options_are_read_only(
+    args: list[str], allowed: frozenset[str], *, value_options: frozenset[str] = frozenset(),
+) -> bool:
+    """Accept only known inspection options for the operation-specific Git paths."""
+    index = 0
+    while index < len(args):
+        word = args[index]
+        if word == "--":
+            return True
+        if not word.startswith("-"):
+            index += 1
+            continue
+        option = word.split("=", 1)[0]
+        if option not in allowed and option not in value_options:
+            return False
+        if option in value_options and "=" not in word:
+            index += 1
+            if index >= len(args):
+                return False
+        index += 1
+    return True
+
+
+def _git_is_read_only(words: list[str]) -> bool:
+    subcommand, subcommand_index = _git_subcommand(words)
+    if subcommand not in _GIT_READ_ONLY:
+        return False
+    args = words[subcommand_index + 1:]
+
+    if subcommand == "branch":
+        # Branch names make the default form create a branch; all branch
+        # mutation flags are rejected even when a later positional is absent.
+        if any(
+            word.split("=", 1)[0] in {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy"}
+            or (word.startswith(("-d", "-D", "-m", "-M", "-c", "-C")) and word != "--")
+            for word in args
+        ):
+            return False
+        if any(not word.startswith("-") for word in args):
+            return False
+        return _git_options_are_read_only(
+            args, _GIT_BRANCH_READ_ONLY_OPTIONS,
+            value_options=frozenset({"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "--column", "--color", "--abbrev"}),
+        )
+
+    if subcommand == "tag":
+        if any(
+            word.split("=", 1)[0] in _GIT_TAG_MUTATING_OPTIONS
+            or word.startswith(("-a", "-s", "-u", "-f", "-d")) and word not in {"--"}
+            for word in args
+        ):
+            return False
+        # `git tag` lists tags.  Verification is also read-only; any other
+        # positional tag name is ambiguous because it can create a tag.
+        verify = any(word in {"-v", "--verify"} for word in args)
+        if any(not word.startswith("-") for word in args) and not verify and not any(
+            word in {"-l", "--list"} for word in args
+        ):
+            return False
+        return _git_options_are_read_only(
+            args, _GIT_TAG_READ_ONLY_OPTIONS,
+            value_options=frozenset({"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--column", "--sort", "--format", "--color"}),
+        )
+
+    if subcommand == "remote":
+        if not args:
+            return True
+        operation = next((word for word in args if not word.startswith("-")), None)
+        if operation is None:
+            return _git_options_are_read_only(args, frozenset({"-v", "--verbose"}))
+        if operation in _GIT_REMOTE_MUTATING_SUBCOMMANDS or operation not in _GIT_REMOTE_READ_ONLY_SUBCOMMANDS:
+            return False
+        return _git_options_are_read_only(args, frozenset({"-v", "--verbose"}))
+
+    if subcommand == "diff":
+        if any(word == "--output" or word.startswith("--output=") or word == "-o" or word.startswith("-o") for word in args):
+            return False
+        return _git_options_are_read_only(
+            args, _GIT_DIFF_READ_ONLY_OPTIONS,
+            value_options=frozenset({"--unified", "-U", "--diff-algorithm", "--anchored", "--word-diff", "--word-diff-regex", "--ignore-matching-lines", "-I", "--src-prefix", "--dst-prefix", "--line-prefix", "--inter-hunk-context", "--output-indicator-new", "--output-indicator-old", "--output-indicator-context", "--dirstat-by-file", "--submodule"}),
+        )
+
+    return True
+
+
+def _contains_inline_mutation(code: str) -> bool:
+    return bool(_INLINE_MUTATION_APIS.search(code))
+
+
 def _simple_command_is_read_only(command: str) -> bool:
     command = command.strip()
     if not command or _WRITE_MARKERS.search(command):
@@ -91,27 +258,20 @@ def _simple_command_is_read_only(command: str) -> bool:
     base = Path(words[0]).name.lower()
     if base not in _READ_ONLY_COMMANDS:
         return False
+    if base == "find" and any(word in {"-delete", "-exec", "-execdir", "-ok", "-okdir"} for word in words[1:]):
+        return False
     if base == "git":
-        try:
-            subcommand = next(word for word in words[1:] if not word.startswith("-"))
-        except StopIteration:
-            return False
-        if subcommand not in _GIT_READ_ONLY:
-            return False
-        if subcommand == "branch":
-            # `git branch --show-current`, `-a`, and `--list` inspect; a
-            # positional branch name creates a branch.
-            if any(not word.startswith("-") for word in words[2:]):
-                return False
-        if subcommand == "tag" and any(not word.startswith("-") for word in words[2:]):
-            return False
+        return _git_is_read_only(words)
     if base in {"python", "python3", "node", "ruby", "go", "cargo", "npm"}:
         # Package/build commands mutate caches or the workspace.  Inline
         # calculations and version/help probes remain available.
         lowered = command.lower()
         if base in {"npm", "cargo", "go"} and not re.search(r"\b(?:--version|version|help)\b", lowered):
             return False
-        if re.search(r"\b(?:open|write_text|write_bytes|unlink|remove|rename|mkdir|rmdir|system|popen|run|call|check_call|check_output)\b", command, re.I):
+        if _contains_inline_mutation(command) or re.search(
+            r"\b(?:open|remove|replace|run|call|check_call|check_output|system|popen|exec|spawn)\s*\(",
+            command, re.I,
+        ):
             return False
     return True
 
@@ -121,15 +281,15 @@ def _execute_code_is_read_only(code: str) -> bool:
     if not code:
         return True
     if re.search(
-        r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
-        r"\.write(?:_text|_bytes)?\s*\(|\b(?:unlink|remove|rename|replace|mkdir|rmdir)\s*\(|"
-        r"\b(?:subprocess|os\.system|os\.popen|shutil\.(?:copy|move|rmtree))\b|"
+        r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|r\+|w\+|a\+|x\+|wb|ab|wb\+|ab\+)|mode\s*=\s*['\"](?:w|a|x|r\+|w\+|a\+|x\+|wb|ab|wb\+|ab\+))|"
+        r"\.write(?:_text|_bytes)?\s*\(|\b(?:unlink|remove|rename|replace|mkdir|makedirs|rmdir|chmod|chown|symlink|link|truncate)\s*\(|"
+        r"\b(?:subprocess|os\.system|os\.popen|shutil\.(?:copy|copy2|copyfile|copytree|move|rmtree))\b|"
         r"\b(?:write_file|patch|terminal)\s*\()",
         code,
         re.I,
     ):
         return False
-    return True
+    return not _contains_inline_mutation(code)
 
 
 def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: Any = None) -> bool:
