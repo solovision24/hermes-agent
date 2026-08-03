@@ -21,7 +21,7 @@ import pytest
 
 def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
-    zero kanban_* tools in their schema."""
+    only the intake tool is exposed; lifecycle tools stay hidden."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -35,8 +35,8 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
-    assert kanban == set(), (
-        f"kanban tools leaked into normal chat schema: {kanban}"
+    assert kanban == {"kanban_create"}, (
+        f"unexpected kanban tools in normal chat schema: {kanban}"
     )
 
 

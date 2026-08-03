@@ -32,7 +32,7 @@ def test_code_changing_tool_is_refused_before_handler_without_active_task(
     assert called is False
 
 
-def test_code_changing_tool_is_allowed_for_active_task(monkeypatch, tmp_path):
+def test_chat_task_association_does_not_bypass_worker_gate(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 
@@ -66,8 +66,8 @@ def test_code_changing_tool_is_allowed_for_active_task(monkeypatch, tmp_path):
 
     result = json.loads(registry.dispatch("patch", {}, session_id="chat-2"))
 
-    assert result == {"ok": True}
-    assert called is True
+    assert result["error_type"] == "kanban_task_required"
+    assert called is False
 
 
 def test_code_changing_tool_is_allowed_for_kanban_worker(monkeypatch):
@@ -87,7 +87,9 @@ def test_code_changing_tool_is_allowed_for_kanban_worker(monkeypatch):
         handler=handler,
     )
 
-    result = json.loads(registry.dispatch("terminal", {}, session_id=""))
+    result = json.loads(registry.dispatch(
+        "terminal", {"command": "git status --short"}, session_id="",
+    ))
 
     assert result == {"ok": True}
     assert called is True
@@ -109,6 +111,20 @@ def test_read_only_tool_remains_allowed_without_active_task(monkeypatch):
     assert result == {"content": "unchanged"}
 
 
+def test_read_only_terminal_remains_allowed_without_active_task(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    registry = ToolRegistry()
+    registry.register(
+        name="terminal",
+        toolset="terminal",
+        schema={"name": "terminal"},
+        handler=lambda args, **kwargs: json.dumps({"ok": True}),
+    )
+    assert json.loads(registry.dispatch(
+        "terminal", {"command": "git diff --check"}, session_id="chat-3",
+    )) == {"ok": True}
+
+
 def test_delegation_is_refused_before_agent_level_dispatch(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -116,7 +132,11 @@ def test_delegation_is_refused_before_agent_level_dispatch(monkeypatch, tmp_path
     from model_tools import handle_function_call
 
     result = json.loads(
-        handle_function_call("delegate_task", {}, session_id="chat-4")
+        handle_function_call(
+            "delegate_task",
+            {"goal": "implement the requested feature"},
+            session_id="chat-4",
+        )
     )
 
     assert result["error_type"] == "kanban_task_required"
@@ -135,7 +155,9 @@ def test_agent_runtime_delegation_cannot_bypass_gate(monkeypatch, tmp_path):
         def _dispatch_delegate_task(self, args):
             raise AssertionError("delegation handler must not execute")
 
-    result = json.loads(invoke_tool(Agent(), "delegate_task", {}, "task-5"))
+    result = json.loads(invoke_tool(
+        Agent(), "delegate_task", {"goal": "fix the bug"}, "task-5",
+    ))
 
     assert result["error_type"] == "kanban_task_required"
     assert result["tool"] == "delegate_task"
