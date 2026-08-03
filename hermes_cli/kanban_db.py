@@ -10173,6 +10173,9 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
       the whole board.
     """
     on_disk = set(list_profiles_on_disk())
+    from hermes_cli.kanban_assignees import configured_assignee_choices
+    configured = configured_assignee_choices()
+    configured_names = {choice.canonical for choice in configured if choice.canonical}
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -10183,15 +10186,27 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    names = sorted(on_disk | set(counts.keys()))
-    return [
-        {
+    names = sorted(on_disk | configured_names | set(counts.keys()))
+    entries = []
+    for name in names:
+        try:
+            from hermes_cli.kanban_assignees import resolve_assignee
+
+            resolution = resolve_assignee(name, allow_unassigned=False)
+            category = resolution.target_category or resolution.category
+            target_category = resolution.target_category.value if resolution.target_category else None
+        except Exception:
+            category = "invalid"
+            target_category = None
+        entries.append({
             "name": name,
             "on_disk": name in on_disk,
             "counts": counts.get(name, {}),
-        }
-        for name in names
-    ]
+            "category": category.value if hasattr(category, "value") else category,
+            "target_category": target_category,
+            "spawnable": category == "profile" or getattr(category, "value", None) == "profile",
+        })
+    return entries
 
 
 # ---------------------------------------------------------------------------

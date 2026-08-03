@@ -63,6 +63,27 @@ def test_resolver_classifies_and_preserves_canonical_targets(assignee_home):
     )
 
 
+def test_path_traversal_is_not_a_profile(assignee_home):
+    from hermes_cli.kanban_assignees import InvalidAssigneeError, resolve_assignee
+
+    for value in ("..", ".", "../worker", "profiles/worker"):
+        with pytest.raises(InvalidAssigneeError):
+            resolve_assignee(value, allow_unassigned=False)
+
+
+def test_configured_choices_are_typed(assignee_home):
+    from hermes_cli.kanban_assignees import (
+        AssigneeCategory,
+        configured_assignee_choices,
+    )
+
+    choices = configured_assignee_choices()
+    by_input = {str(choice.input_value): choice for choice in choices}
+    assert by_input["worker"].target_category is AssigneeCategory.PROFILE
+    assert by_input["terminal"].target_category is AssigneeCategory.EXTERNAL_LANE
+    assert by_input["build"].category is AssigneeCategory.ALIAS
+
+
 def test_create_assign_and_reassign_reject_before_mutation(assignee_home):
     from hermes_cli import kanban_db as kb
 

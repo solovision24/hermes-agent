@@ -9,6 +9,7 @@ _SYNTHETIC_ASSIGNEES = (
     "a", "alice", "alpha", "beta", "broken", "coder", "default",
     "demo", "dev", "elias", "factory", "ops", "orch", "orchestrator",
     "peer", "reviewer", "setup", "some-profile", "someother", "teknium",
+    "broken-model",
     "test-worker", "w", "worker", "worker-a", "worker-d",
     "worker1", "writer", "x",
 )

@@ -21,7 +21,7 @@ def _register_synthetic_assignee_lanes(monkeypatch):
     synthetic = {
         "a", "alice", "alpha", "beta", "broken", "coder", "default",
         "demo", "dev", "elias", "factory", "ops", "orch", "orchestrator",
-        "peer", "reviewer", "setup", "some-profile", "someother", "teknium",
+        "peer", "qa", "reviewer", "setup", "some-profile", "someother", "teknium",
         "test-worker", "w", "worker", "worker-a", "worker-d",
         "worker1", "writer", "x",
     }

@@ -1103,11 +1103,27 @@ class GatewayKanbanWatchersMixin:
         # backward-compatible with existing installs.
         default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
         if default_assignee:
-            logger.info(
-                "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
-                "will route to this profile)",
-                default_assignee,
+            from hermes_cli.kanban_assignees import (
+                InvalidAssigneeError,
+                resolve_assignee,
             )
+            try:
+                default_assignee = resolve_assignee(
+                    default_assignee,
+                    allow_unassigned=False,
+                    config={"kanban": kanban_cfg},
+                ).canonical
+                logger.info(
+                    "kanban dispatcher: default_assignee=%r (unassigned ready "
+                    "tasks will route to this target)",
+                    default_assignee,
+                )
+            except InvalidAssigneeError as exc:
+                logger.warning(
+                    "kanban dispatcher: ignoring invalid kanban.default_assignee: %s",
+                    exc,
+                )
+                default_assignee = None
 
         # Read kanban.max_in_progress_per_profile — per-profile concurrency
         # cap (#21582). When set, no single profile gets more than N

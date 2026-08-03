@@ -122,6 +122,42 @@ def configured_external_lanes(config: Optional[dict] = None) -> tuple[str, ...]:
     return tuple(sorted(set(_external_lanes(cfg).values()), key=str.casefold))
 
 
+def configured_assignee_aliases(config: Optional[dict] = None) -> dict[str, str]:
+    """Return configured aliases mapped to their canonical targets."""
+    cfg = _load_config() if config is None else config
+    return _assignee_aliases(cfg)
+
+
+def configured_assignee_choices(config: Optional[dict] = None) -> tuple[AssigneeResolution, ...]:
+    """Enumerate configured assignee inputs with their target types.
+
+    This is intentionally typed rather than a bare list of strings so CLI and
+    dashboard consumers can distinguish spawnable profiles from control-plane
+    lanes and display-only aliases without reimplementing resolution rules.
+    """
+    cfg = _load_config() if config is None else config
+    choices: list[AssigneeResolution] = []
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        profile_names = [info.name for info in list_profiles()]
+    except Exception:
+        profile_names = ["default"]
+    for name in profile_names:
+        try:
+            choices.append(resolve_assignee(name, allow_unassigned=False, config=cfg))
+        except InvalidAssigneeError:
+            continue
+    for name in configured_external_lanes(cfg):
+        choices.append(resolve_assignee(name, allow_unassigned=False, config=cfg))
+    for alias, target in sorted(configured_assignee_aliases(cfg).items()):
+        try:
+            choices.append(resolve_assignee(alias, allow_unassigned=False, config=cfg))
+        except InvalidAssigneeError:
+            continue
+    return tuple(choices)
+
+
 def _assignee_aliases(config: dict) -> dict[str, str]:
     section = config.get("kanban")
     if not isinstance(section, dict):
@@ -142,9 +178,18 @@ def _profile_name(value: Any) -> Optional[str]:
     if value is None:
         return None
     try:
-        from hermes_cli.profiles import normalize_profile_name, profile_exists
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
 
         name = normalize_profile_name(str(value))
+        # normalize_profile_name intentionally only canonicalizes CLI input;
+        # it does not validate path components.  Validate before calling
+        # profile_exists/get_profile_dir so values such as ``..`` cannot be
+        # treated as a profile rooted outside the profiles directory.
+        validate_profile_name(name)
         return name if profile_exists(name) else None
     except (TypeError, ValueError, OSError):
         return None
