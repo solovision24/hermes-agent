@@ -1138,9 +1138,14 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
-    from tools.registry import coding_tool_gate_refusal
+    from tools.coding_kanban_gate import coding_tool_gate_refusal
     refusal = coding_tool_gate_refusal(
-        function_name, args=function_args, session_id=session_id,
+        function_name,
+        function_args=function_args,
+        session_id=session_id,
+        task_id=task_id,
+        turn_id=turn_id,
+        user_message=user_task,
     )
     if refusal is not None:
         return refusal
