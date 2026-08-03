@@ -430,6 +430,10 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
+    # Tool dispatch uses this turn-local snapshot to build a coding handoff
+    # when implementation intent first crosses the tool boundary.
+    agent._current_user_message = user_message
+
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None

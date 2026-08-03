@@ -783,8 +783,16 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        from tools.coding_kanban_gate import coding_tool_gate_refusal
+
         refusal = coding_tool_gate_refusal(
-            name, args=args, session_id=kwargs.get("session_id"),
+            name,
+            function_args=args,
+            session_id=kwargs.get("session_id"),
+            task_id=kwargs.get("task_id"),
+            turn_id=kwargs.get("turn_id"),
+            user_message=kwargs.get("user_message") or kwargs.get("user_task"),
+        )
         )
         if refusal is not None:
             return refusal
