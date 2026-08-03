@@ -2930,7 +2930,6 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     _allow_internal_idempotency: bool = False,
     metadata: Optional[dict] = None,
-    
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 

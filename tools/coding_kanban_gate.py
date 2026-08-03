@@ -28,6 +28,7 @@ CODING_TOOLS = frozenset({
     "codex_app_server",
 })
 CANONICAL_ASSIGNEE = "dev"
+IMPLEMENTATION_ASSIGNEES = frozenset({"dev", "forge", "quill", "chip"})
 SUPPORTED_CODING_AGENTS = frozenset({"codex", "cursor"})
 ACTIVE_TASK_STATUSES = frozenset({"todo", "ready", "running", "review"})
 
@@ -51,7 +52,7 @@ _WRITE_MARKERS = re.compile(
 _CODING_AGENT_RE = re.compile(r"\b(codex|cursor|claude)(?:\s+(?:code|cli|agent))?\b", re.I)
 _CODING_INTENT_RE = re.compile(
     r"\b(?:implement|modify|edit|write|add|remove|delete|fix|refactor|patch|"
-    r"change|create|build|develop|code|commit|branch|worktree|checkout|launch)\b",
+    r"change|create|build|develop|code|commit|branch|worktree|checkout|launch|ship)\b",
     re.I,
 )
 _RESEARCH_RE = re.compile(r"\b(?:explain|research|inspect|査|review|analy[sz]e|look\s+up)\b", re.I)
@@ -59,6 +60,12 @@ _RESEARCH_RE = re.compile(r"\b(?:explain|research|inspect|査|review|analy[sz]e|
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _has_coding_intent(value: Any) -> bool:
+    text = _text(value)
+    normalized = re.sub(r"[^A-Za-z0-9]+", " ", text)
+    return bool(_CODING_INTENT_RE.search(text) or _CODING_INTENT_RE.search(normalized))
 
 
 def _first_line(value: str, fallback: str) -> str:
@@ -147,7 +154,7 @@ def _write_file_is_coding(args: dict, user_message: Any) -> bool:
     path = _text(args.get("path") or args.get("file_path"))
     message = _text(user_message)
     report_request = bool(re.search(r"\b(?:report|audit|research|findings|notes?)\b", message, re.I))
-    if _CODING_INTENT_RE.search(message) and not report_request:
+    if (_has_coding_intent(message) or Path(path).suffix.lower() in {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".sh"}) and not report_request:
         return True
     if not path:
         return True
@@ -167,6 +174,28 @@ def _execute_code_is_read_only(code: str) -> bool:
     code = _text(code)
     if not code:
         return True
+    try:
+        import ast
+        tree = ast.parse(code)
+        aliases = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for item in node.names:
+                    if item.name in {"write_file", "patch", "terminal"}:
+                        aliases.add(item.asname or item.name)
+            elif isinstance(node, ast.Import):
+                for item in node.names:
+                    if item.name.rsplit(".", 1)[-1] in {"write_file", "patch", "terminal"}:
+                        aliases.add(item.asname or item.name.rsplit(".", 1)[-1])
+        if aliases and any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in aliases
+            for node in ast.walk(tree)
+        ):
+            return False
+    except (SyntaxError, ValueError):
+        return False
     if re.search(
         r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
         r"\.write(?:_text|_bytes)?\s*\(|\b(?:unlink|remove|rename|replace|mkdir|rmdir)\s*\(|"
@@ -183,9 +212,9 @@ def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: 
     """Return whether this call could start implementation work."""
     args = args if isinstance(args, dict) else {}
     if tool_name == "codex_app_server":
-        return bool(_CODING_INTENT_RE.search(_text(user_message)) and not (
+        return bool(_has_coding_intent(user_message) and not (
             _RESEARCH_RE.search(_text(user_message))
-            and not re.search(r"\b(?:implement|edit|write|fix|change|patch)\b", _text(user_message), re.I)
+            and not _has_coding_intent(_text(user_message))
         ))
     if tool_name == "write_file":
         return _write_file_is_coding(args, user_message)
@@ -197,15 +226,22 @@ def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: 
     if tool_name == "execute_code":
         return not _execute_code_is_read_only(_text(args.get("code")))
     if tool_name == "delegate_task":
-        goals = [_text(args.get("goal")), _text(args.get("context"))]
-        for item in args.get("tasks") or []:
-            if isinstance(item, dict):
-                goals.extend((_text(item.get("goal")), _text(item.get("context"))))
+        goals: list[str] = []
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+            elif value:
+                goals.append(_text(value))
+        collect(args)
         text = "\n".join(item for item in goals if item)
         # A review/research request is read-only unless it also asks for a
         # change.  This keeps documentation/research delegation available.
-        return bool(_CODING_INTENT_RE.search(text) and not (
-            _RESEARCH_RE.search(text) and not re.search(r"\b(?:implement|edit|write|fix|change|patch)\b", text, re.I)
+        return bool(_has_coding_intent(text) and not (
+            _RESEARCH_RE.search(text) and not _has_coding_intent(text)
         ))
     if tool_name in {"project_create", "project_switch"}:
         return bool(re.search(r"\b(?:branch|worktree|repository|repo|codebase|implementation)\b", _text(user_message), re.I))
@@ -301,18 +337,88 @@ def _canonical_worker_task(task_id: str):
     if task is None:
         return None, "task does not exist"
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
-    if task.assignee != CANONICAL_ASSIGNEE:
-        return task, "task is not assigned to DEV"
+    if task.assignee not in IMPLEMENTATION_ASSIGNEES:
+        return task, "task is not assigned to a validated implementation profile"
     if task.status not in ACTIVE_TASK_STATUSES:
         return task, f"task status is {task.status!r}"
-    if metadata.get("canonical") is not True or metadata.get("lane") != "DEV":
-        return task, "task lacks canonical DEV metadata"
+    expected_lane = "DEV" if task.assignee == "dev" else task.assignee.upper()
+    if metadata.get("canonical") is not True or metadata.get("lane") not in {expected_lane, "ENGINEERING"}:
+        return task, "task lacks canonical implementation metadata"
     if metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS:
         return task, "task has no supported coding-agent metadata"
     run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
     if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
         return task, "worker is not the active dispatcher run for this task"
     return task, None
+
+
+def _canonical_worker_task_for_session(task_id: str, session_id: str):
+    task, reason = _canonical_worker_task(task_id)
+    if reason:
+        # Session-associated chat calls do not have a dispatcher run, so the
+        # worker-only run check is not applicable. Revalidate the task's
+        # canonical ownership and active status without weakening those checks.
+        try:
+            from hermes_cli import kanban_db
+            conn = kanban_db.connect()
+            try:
+                task = kanban_db.get_task(conn, task_id)
+            finally:
+                conn.close()
+        except Exception:
+            return None, "Kanban is unavailable"
+        if task is None:
+            return None, "task does not exist"
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if (
+            task.assignee not in IMPLEMENTATION_ASSIGNEES
+            or task.status not in ACTIVE_TASK_STATUSES
+            or metadata.get("canonical") is not True
+            or metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS
+            or metadata.get("origin", {}).get("session_id") != session_id
+        ):
+            return task, "session is not associated with a canonical active implementation task"
+        return task, None
+    return task, None
+
+
+def _session_task_id(session_id: str) -> Optional[str]:
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            row = db.get_session(session_id)
+        finally:
+            db.close()
+        config = row.get("model_config") if row else None
+        if isinstance(config, str):
+            config = json.loads(config)
+        return _text(config.get("kanban_task_id")) or None if isinstance(config, dict) else None
+    except Exception:
+        return None
+
+
+def _persist_session_task_id(session_id: str, task_id: str) -> None:
+    if not session_id or not task_id:
+        return
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            row = db.get_session(session_id) or {}
+            config = row.get("model_config")
+            if isinstance(config, str):
+                config = json.loads(config)
+            if not isinstance(config, dict):
+                config = {}
+            config["kanban_task_id"] = task_id
+            db.update_session_meta(session_id, json.dumps(config, ensure_ascii=False))
+        finally:
+            db.close()
+    except Exception:
+        return
 
 
 def coding_tool_gate_refusal(
@@ -346,6 +452,14 @@ def coding_tool_gate_refusal(
     normalized_session = _text(session_id)
     if not normalized_session or not is_coding_intent(tool_name, args, user_message):
         return None
+
+    associated_id = _session_task_id(normalized_session)
+    if associated_id:
+        associated_task, association_error = _canonical_worker_task_for_session(
+            associated_id, normalized_session
+        )
+        if associated_task is not None and association_error is None:
+            return None
 
     agent, agent_error = _requested_coding_agent(args, user_message)
     if agent_error:
@@ -428,12 +542,13 @@ def coding_tool_gate_refusal(
             tool_name=tool_name,
             error_type="kanban_unavailable",
         )
-    if task is None or task.assignee != CANONICAL_ASSIGNEE or not isinstance(task.metadata, dict):
+    if task is None or task.assignee not in IMPLEMENTATION_ASSIGNEES or not isinstance(task.metadata, dict):
         return _refusal(
             error="Kanban did not return a canonical DEV task; coding work is blocked.",
             tool_name=tool_name,
             error_type="kanban_task_invalid",
         )
+    _persist_session_task_id(normalized_session, task.id)
     return _refusal(
         error="Coding work was handed off to the DEV Kanban worker. The originating chat remains read-only for this change.",
         tool_name=tool_name,

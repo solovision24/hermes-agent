@@ -18,8 +18,7 @@ import ast
 import importlib
 import json
 import logging
-import os
-import re
+
 import sys
 import threading
 import time
@@ -28,41 +27,6 @@ from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
-
-_KANBAN_GATED_TOOLS = frozenset({
-    "write_file", "patch", "terminal", "execute_code", "delegate_task",
-})
-
-
-def _looks_like_workspace_mutation(tool_name: str, args: Optional[dict]) -> bool:
-    args = args or {}
-    if tool_name in {"write_file", "patch"}:
-        return True
-    if tool_name == "delegate_task":
-        text = " ".join(str(args.get(k, "")) for k in ("goal", "context"))
-        return bool(re.search(r"\b(?:implement|code|coding|fix|build|edit|modify|refactor|write|add|remove|change|patch|test)\b", text, re.I))
-    if tool_name == "execute_code":
-        code = str(args.get("code", ""))
-        return bool(re.search(r"(?:open\s*\([^)]*['\"](?:w|a|x)|write_text\s*\(|write_bytes\s*\(|unlink\s*\(|\b(?:patch|write_file|mkdir|makedirs|remove|rename)\s*\(|subprocess\.(?:run|Popen|call).*\b(?:git\s+(?:add|commit|push)|rm\b|mv\b|cp\b))", code, re.I | re.S))
-    if tool_name == "terminal":
-        command = str(args.get("command", ""))
-        return bool(re.search(r"(?:^|[;&|]\s*|\()\s*(?:sudo\s+)?(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|install|tee|truncate|git\s+(?:add|commit|push|reset|restore|checkout|switch|merge|rebase|cherry-pick)|npm\s+(?:install|ci|uninstall)|(?:pip|uv)\s+install|cargo\s+(?:add|remove)|docker\s+(?:build|run|exec|cp)|make\s+install)\b|(?:>>?|<<)\s*|\b(?:python|python3|node)\s+(?:-c|- <<)", command, re.I))
-    return False
-
-
-def coding_tool_gate_refusal(tool_name: str, *, args: Optional[dict] = None, session_id: Optional[str] = None) -> Optional[str]:
-    """Refuse implementation work from chat unless this is a dispatcher worker."""
-    del session_id
-    if tool_name not in _KANBAN_GATED_TOOLS or not _looks_like_workspace_mutation(tool_name, args):
-        return None
-    if os.environ.get("HERMES_KANBAN_TASK", "").strip():
-        return None
-    return json.dumps({
-        "error": "This chat cannot perform code-changing work directly. Create or use a Kanban task first; the dispatcher will run implementation in the DEV worker. Read-only inspection remains available.",
-        "error_type": "kanban_task_required",
-        "tool": tool_name,
-        "next_action": "call kanban_create with assignee='dev' and the implementation scope",
-    }, ensure_ascii=False)
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:

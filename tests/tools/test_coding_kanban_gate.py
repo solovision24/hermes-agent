@@ -346,3 +346,65 @@ def test_active_non_dev_worker_can_still_inspect(monkeypatch, tmp_path):
     ))
     assert result == {"ok": True}
     assert calls == ["terminal"]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("delegate_task", {"task_name": "ship_feature"}),
+        ("execute_code", {"code": "from hermes_tools import write_file as wf\nwf('/tmp/x.py', 'x')"}),
+        ("write_file", {"path": "/tmp/x.py", "content": "print(1)"}),
+    ],
+)
+def test_mutation_aliases_fail_closed_before_task_association(monkeypatch, tmp_path, name, args):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert is_coding_intent(name, args, "Inspect this request") is True
+
+
+def test_specialist_owned_active_worker_can_change_code(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Forge task", assignee="forge", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "FORGE", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+        conn.execute("UPDATE tasks SET current_run_id = 7 WHERE id = ?", (task_id,))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    assert _payload(registry.dispatch("patch", {}, session_id="worker", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
+
+
+def test_canonical_session_association_unlocks_scoped_coding(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db
+    from hermes_state import SessionDB
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Session task", assignee="dev", session_id="chat-associated",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "chat-associated", "message_id": "m"},
+                "repository": str(tmp_path), "workspace": str(tmp_path),
+            },
+        )
+    db = SessionDB()
+    try:
+        db.create_session("chat-associated", "cli", model_config={"kanban_task_id": task_id})
+    finally:
+        db.close()
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    assert _payload(registry.dispatch("patch", {}, session_id="chat-associated", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
