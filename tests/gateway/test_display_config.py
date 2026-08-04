@@ -169,6 +169,26 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "slack", "busy_ack_detail") is False
 
 
+    def test_buzz_quiet_status_defaults(self):
+        """Buzz should not receive progress-iteration heartbeat/busy-ack telemetry.
+
+        Buzz (buzz.sololink.cloud) is a permanent-message web chat, same
+        low-noise class as photon/bluebubbles. The periodic "⏳ Working — N min
+        — iteration X/Y" heartbeat and the busy-ack iteration detail must stay
+        out of the chat; other platforms keep their existing defaults.
+        """
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "buzz", "long_running_notifications") is False
+        assert resolve_display_setting({}, "buzz", "busy_ack_detail") is False
+        # Non-Buzz platforms unchanged: telegram keeps heartbeats, discord keeps
+        # both heartbeats and busy-ack detail.
+        assert resolve_display_setting({}, "telegram", "long_running_notifications") is True
+        assert resolve_display_setting({}, "telegram", "busy_ack_detail") is False
+        assert resolve_display_setting({}, "discord", "long_running_notifications") is True
+        assert resolve_display_setting({}, "discord", "busy_ack_detail") is True
+
+
 # ---------------------------------------------------------------------------
 # Config migration: tool_progress_overrides → display.platforms
 # ---------------------------------------------------------------------------

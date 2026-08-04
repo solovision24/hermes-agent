@@ -403,6 +403,47 @@ class TestBusySessionAck:
         assert "10 min" in content  # elapsed
 
 
+    @pytest.mark.asyncio
+    async def test_buzz_default_excludes_status_detail(self, monkeypatch):
+        """Buzz busy-ack must NOT include iteration/tool detail by default.
+
+        Regression for the Buzz UX card: with no explicit config, the built-in
+        ``_PLATFORM_DEFAULTS`` entry for ``buzz`` sets ``busy_ack_detail`` to
+        False, so the direct ``adapter._send_with_retry`` send path must not
+        render "iteration X/Y" / current-tool / elapsed-min telemetry.
+        """
+        import gateway.run as _gr
+
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="buzz")
+
+        event = _make_event(text="yo", platform_val="buzz")
+        sk = build_session_key(event.source)
+
+        agent = MagicMock()
+        agent.get_activity_summary.return_value = {
+            "api_call_count": 21,
+            "max_iterations": 60,
+            "current_tool": "terminal",
+            "last_activity_ts": time.time(),
+            "last_activity_desc": "terminal",
+            "seconds_since_activity": 0.5,
+        }
+        runner._running_agents[sk] = agent
+        runner._running_agents_ts[sk] = time.time() - 600  # 10 min
+        runner.adapters[event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        call_kwargs = adapter._send_with_retry.call_args
+        content = call_kwargs.kwargs.get("content", "")
+        assert "21/60" not in content  # no iteration detail
+        assert "terminal" not in content  # no current tool
+        assert "10 min" not in content  # no elapsed detail
+
+
 class TestBusySessionOnboardingHint:
     """First-touch hint appended to the busy-ack the first time it fires."""
 

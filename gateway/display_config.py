@@ -167,6 +167,16 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # global ("all") defaults and compacted/narrated on nearly every turn.
     "photon":          _TIER_LOW,
     "bluebubbles":     _TIER_LOW,
+    # Buzz (Nostr-based human+agent community chat, buzz.sololink.cloud) is a
+    # permanent-message web chat without message-edit support — same class as
+    # photon/bluebubbles. Keep periodic "⏳ Working — N min — iteration X/Y"
+    # heartbeats and busy-ack iteration detail out of the chat. Interim
+    # assistant messages and tool progress are already pinned off for Buzz in
+    # prod config; this entry closes the remaining progress-iteration noise.
+    "buzz":            {
+        "long_running_notifications": False,
+        "busy_ack_detail": False,
+    },
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,
     "wecom_callback":  _TIER_LOW,
