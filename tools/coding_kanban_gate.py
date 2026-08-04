@@ -347,7 +347,44 @@ def _worker_refusal(tool_name: str, task_id: str, reason: str) -> str:
     )
 
 
-def _canonical_worker_task(task_id: str):
+def _task_is_review_lane(task) -> bool:
+    """Return whether this task was claimed into the SDLC review lane.
+
+    Review-lane cards are claimed by reviewer profiles (e.g. ``orion``) via
+    ``claim_review_task`` after the implementer submitted the card for review.
+    The lane is detected from the claim history (a ``claimed`` event whose
+    payload records ``source_status: "review"``) or from explicit review
+    identity on the card (``review_identity`` metadata or a ``review_submitted``
+    event).  A later plain ``claimed`` event (a changes-requested requeue back
+    to the implementation lane) ends the review lane.
+    """
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    if _text(metadata.get("review_identity")):
+        return True
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect()
+        try:
+            events = kanban_db.list_events(conn, task.id)
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    # Newest-first: the most recent claim decides the lane.  A claim from
+    # status=review marks a reviewer-owned run; a plain ready->running claim
+    # after a review (changes requested) returns the card to the
+    # implementation lane.
+    for event in reversed(events):
+        if event.kind == "claimed":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            return payload.get("source_status") == "review"
+        if event.kind == "review_submitted":
+            return True
+    return False
+
+
+def _canonical_worker_task(task_id: str, *, tool_name: Optional[str] = None):
     from hermes_cli import kanban_db
 
     conn = kanban_db.connect()
@@ -358,6 +395,21 @@ def _canonical_worker_task(task_id: str):
     if task is None:
         return None, "task does not exist"
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
+    if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
+        return task, "worker is not the active dispatcher run for this task"
+    if tool_name is not None and _task_is_review_lane(task):
+        # Review-lane workers are reviewers (e.g. ``orion``), not
+        # implementation profiles.  They need the terminal mutations the SDLC
+        # review requires (``gh pr merge``/``close``/``review``, ``git push``/
+        # ``fetch``, deploy scripts, service checks) but must not write
+        # implementation code.  The session path (``tool_name`` is None) never
+        # inherits review-lane privileges.
+        if tool_name in {"write_file", "patch", "execute_code"}:
+            return task, "review-lane workers cannot write implementation code"
+        if tool_name in {"delegate_task", "codex_app_server", "project_create", "project_switch"}:
+            return task, "review-lane workers cannot start coding work"
+        return task, None
     if task.assignee not in IMPLEMENTATION_ASSIGNEES:
         return task, "task is not assigned to a validated implementation profile"
     if task.status not in ACTIVE_TASK_STATUSES:
@@ -367,9 +419,6 @@ def _canonical_worker_task(task_id: str):
         return task, "task lacks canonical implementation metadata"
     if metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS:
         return task, "task has no supported coding-agent metadata"
-    run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
-    if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
-        return task, "worker is not the active dispatcher run for this task"
     return task, None
 
 
@@ -529,7 +578,7 @@ def coding_tool_gate_refusal(
     worker_id = _text(os.environ.get("HERMES_KANBAN_TASK"))
     if worker_id:
         try:
-            task, reason = _canonical_worker_task(worker_id)
+            task, reason = _canonical_worker_task(worker_id, tool_name=tool_name)
         except Exception:
             return _worker_refusal(tool_name, worker_id, "Kanban is unavailable")
         if not is_coding_intent(tool_name, args, user_message):

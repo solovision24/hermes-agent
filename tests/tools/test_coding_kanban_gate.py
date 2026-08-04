@@ -468,3 +468,138 @@ def test_associated_session_cannot_unlock_unrelated_targets(monkeypatch, tmp_pat
     assert result["error_type"] == "kanban_task_scope_mismatch"
     assert result["task_id"] == task_id
     assert calls == []
+
+
+def _claim_review_lane_task(monkeypatch, tmp_path, *, assignee="orion", metadata=None) -> str:
+    """Create a task, move it into the review column, and claim it the way the
+    dispatcher does for a review worker (``claim_review_task``). Returns the
+    task id with ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` set to the
+    claimed review run."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Review task", assignee=assignee, session_id="origin",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+            metadata=metadata,
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        claimed = kanban_db.claim_review_task(conn, task_id, ttl_seconds=30, claimer=assignee)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    return task_id
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr merge 123 --repo acme/repo",
+        "gh pr close 123 --repo acme/repo",
+        "gh pr review 123 --repo acme/repo --approve",
+        "git push origin main",
+        "git fetch origin",
+        "npm run deploy:mc",
+        "systemctl restart mission-control.service",
+        "systemctl is-active mission-control.service",
+    ],
+)
+def test_review_lane_worker_can_run_sdlc_terminal_mutations(monkeypatch, tmp_path, command):
+    _claim_review_lane_task(monkeypatch, tmp_path)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal", {"command": command}, session_id="review-worker", user_message="Execute the SDLC review step",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_review_lane_worker_can_run_terminal_via_review_identity_metadata(monkeypatch, tmp_path):
+    _claim_review_lane_task(
+        monkeypatch, tmp_path,
+        metadata={"review_identity": "github-pr:acme/repo:123:deadbeef"},
+    )
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal", {"command": "gh pr merge 123 --repo acme/repo"}, session_id="review-worker",
+        user_message="Merge the reviewed PR",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("patch", {"path": "/repo/file.py"}),
+        ("write_file", {"path": "/repo/file.py", "content": "print(1)"}),
+        ("execute_code", {"code": "from hermes_tools import write_file\nwrite_file('/repo/file.py', 'x')"}),
+    ],
+)
+def test_review_lane_worker_cannot_write_implementation_code(monkeypatch, tmp_path, name, args):
+    _claim_review_lane_task(monkeypatch, tmp_path)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+
+    result = _payload(registry.dispatch(
+        name, args, session_id="review-worker", user_message="Implement the change",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert "review-lane workers cannot write implementation code" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git status --short", "git diff --stat", "gh pr view 123 --repo acme/repo", "git log --oneline -5"],
+)
+def test_review_lane_worker_read_only_inspection_passes(monkeypatch, tmp_path, command):
+    _claim_review_lane_task(monkeypatch, tmp_path)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal", {"command": command}, session_id="review-worker", user_message="Inspect the repository",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_review_lane_session_does_not_gain_review_privileges(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db
+    from hermes_state import SessionDB
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Review task", assignee="orion", session_id="chat-review",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        claimed = kanban_db.claim_review_task(conn, task_id, ttl_seconds=30, claimer="orion")
+        assert claimed is not None
+    db = SessionDB()
+    try:
+        db.create_session("chat-review", "cli", model_config={"kanban_task_id": task_id})
+    finally:
+        db.close()
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    result = _payload(registry.dispatch(
+        "patch", {}, session_id="chat-review", user_message="Implement",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert calls == []
