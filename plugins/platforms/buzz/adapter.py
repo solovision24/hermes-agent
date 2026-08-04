@@ -333,6 +333,30 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     return text or f"buzz CLI failed with exit code {returncode}"
 
 
+def _is_mention_membership_error(stderr: str) -> bool:
+    """True when the CLI rejected a send because a ``--mention`` target is not
+    a channel member.
+
+    ``buzz messages send --mention <pubkey>`` fails with exit 1 and a JSON
+    ``user_error`` on stderr when the target is not a member of the channel.
+    The adapter retries such a send without the mention flag (keeping the
+    reply anchor) so a non-member edge case never regresses thread replies.
+    """
+    text = (stderr or "").strip()
+    if not text:
+        return False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if str(data.get("error") or "") != "user_error":
+        return False
+    message = str(data.get("message") or "").lower()
+    return "member" in message or "mention" in message
+
+
 def _parse_json_list(stdout: str) -> List[dict]:
     """Parse CLI stdout expected to be a JSON array of objects."""
     try:
@@ -435,6 +459,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # classification (see _may_reclassify_as_dm).
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
+        # event_id -> author pubkey, bounded like the per-channel seen set.
+        # Lets send()/send_image() p-tag (mention) the reply target's author
+        # so Buzz's mention feed notifies the human on thread replies.
+        self._event_authors: "OrderedDict[str, str]" = OrderedDict()
         self._poll_count = 0
 
     @property
@@ -610,9 +638,27 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
+        mention_pubkey = ""
         if reply_target:
             args += ["--reply-to", str(reply_target)]
+            # Thread replies stay in the thread (e-tag anchor above) but must
+            # also p-tag the reply target's author so Buzz's mention feed /
+            # push notifies the human — otherwise the reply is only visible
+            # via the app's "View thread" badge (t_128ba197).
+            mention_pubkey = self._mention_for_reply(str(reply_target))
+            if mention_pubkey:
+                args += ["--mention", mention_pubkey]
         code, out, err = await self._run_cli(args, input_text=content)
+        if code != 0 and mention_pubkey and _is_mention_membership_error(err):
+            # The mention target is not a channel member: drop only the
+            # mention, KEEP the reply anchor so the thread reply still lands.
+            logger.info(
+                "Buzz: mention for reply %s rejected (%s); retrying without mention",
+                str(reply_target)[:12],
+                _cli_error_message(err, code),
+            )
+            args = [arg for arg in args if arg not in ("--mention", mention_pubkey)]
+            code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
                 success=False,
@@ -681,9 +727,21 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
+            mention_pubkey = ""
             if reply_to:
                 args += ["--reply-to", str(reply_to)]
+                mention_pubkey = self._mention_for_reply(str(reply_to))
+                if mention_pubkey:
+                    args += ["--mention", mention_pubkey]
             code, out, err = await self._run_cli(args, input_text=caption or "")
+            if code != 0 and mention_pubkey and _is_mention_membership_error(err):
+                logger.info(
+                    "Buzz: image mention for reply %s rejected (%s); retrying without mention",
+                    str(reply_to)[:12],
+                    _cli_error_message(err, code),
+                )
+                args = [arg for arg in args if arg not in ("--mention", mention_pubkey)]
+                code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
             try:
@@ -1021,6 +1079,10 @@ class BuzzAdapter(BasePlatformAdapter):
         if not pubkey or not isinstance(content, str) or not content.strip():
             return
 
+        # Remember the author so a later threaded reply can p-tag them
+        # (--mention), making the reply discoverable via Buzz's mention feed.
+        self._remember_author(event_id, pubkey)
+
         # Suppress self-echo: never dispatch our own messages back to the agent.
         if pubkey == self._self_pubkey:
             return
@@ -1209,6 +1271,29 @@ class BuzzAdapter(BasePlatformAdapter):
         if state is not None:
             state["seen"][event_id] = None
             self._trim_seen(state)
+
+    def _remember_author(self, event_id: str, pubkey: str) -> None:
+        """Record event_id -> author pubkey for reply mention lookups.
+
+        Bounded like the per-channel seen set: once the map exceeds
+        ``_SEEN_CAP`` entries the oldest events are dropped.
+        """
+        if not event_id or not pubkey:
+            return
+        self._event_authors[event_id] = pubkey
+        while len(self._event_authors) > _SEEN_CAP:
+            self._event_authors.popitem(last=False)
+
+    def _mention_for_reply(self, reply_target: str) -> str:
+        """Author pubkey to p-tag when replying in a thread, or "".
+
+        Returns the reply target's author when known and not our own
+        identity — never mention ourselves. Unknown authors get no mention
+        (safe default; the thread anchor is unchanged)."""
+        author = self._event_authors.get(str(reply_target))
+        if not author or (self._self_pubkey and author.lower() == self._self_pubkey.lower()):
+            return ""
+        return author
 
     async def _dispatch_message(
         self,
