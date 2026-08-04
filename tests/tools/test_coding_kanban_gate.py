@@ -339,6 +339,11 @@ def test_read_only_operational_probes_are_not_coding_intent(command):
     "git log --oneline -5 2>&1 | head",
     "git status --short 2>&1",
     "curl -s https://mc.solobot.cloud/build-info.json > /tmp/bi.json",
+    "hermes kanban list &> /tmp/x",
+    "echo hi > /tmp/out.txt",
+    "echo 'a > b'",
+    "cat <<EOF\nhello\nEOF",
+    "python3 - <<'PY'\nimport json\nprint(json.load(open('/tmp/x.json')))\nPY",
     "python3 -c \"import json; d=json.load(open('/tmp/audit.json')); print(len(d))\"",
     "python3 -c \"import sqlite3; c=sqlite3.connect('/home/solo/.hermes/kanban.db'); print(c.execute('select count(*) from tasks').fetchone())\"",
 ])
@@ -359,6 +364,13 @@ def test_scratch_redirect_export_loop_and_read_probes_are_read_only(command):
     "echo hi | tee /tmp/out.txt",
     # loop/conditional body with a mutating command stays gated
     "if [ -f x ]; then rm x; fi",
+    "echo hi > repo/out.txt",
+    "echo hi >> repo/out.txt",
+    "hermes kanban list &> repo/x",
+    "cat <<EOF > repo/out.txt\nhello\nEOF",
+    "rm \"important file.txt\"",
+    "mv \"a b.txt\" \"c d.txt\"",
+    "python3 - <<'PY'\nopen('/tmp/x','w').write('y')\nPY",
 ])
 def test_mutating_hermes_verbs_and_interpreter_writes_fail_closed(command):
     assert is_coding_intent("terminal", {"command": command}, "Manage the board") is True

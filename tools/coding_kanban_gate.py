@@ -51,7 +51,7 @@ _GIT_READ_ONLY = frozenset({
     "blame",
 })
 _WRITE_MARKERS = re.compile(
-    r"(?:^|[^<])(?:>>?|<<|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
+    r"(?:^|[^<])(?:>>?|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
     r"\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|"
     r"\binstall\b|\btruncate\b|\btruncate\b)",
     re.IGNORECASE,
@@ -63,6 +63,12 @@ _SCRATCH_REDIRECT_RE = re.compile(
     r"(?:[0-9]?>>?|&>)\s*(?:/tmp|/var/tmp|/dev/null)\S*|"
     r"[0-9]?>>?\s*&\d+",
 )
+# Content inside quotes is data, not shell syntax: `echo 'a > b'` writes
+# nothing even though it contains a `>` character.  Mask quoted regions
+# before the write-marker scan; heredoc bodies (`<<EOF ... EOF`) are stdin
+# input, not writes, and are handled separately by the marker's `>`/`tee`
+# alternatives when combined with an actual file target.
+_QUOTED_REGION_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 # Shell control keywords are structural, not actions: `for`, `do`, `done`,
 # `if`, `then`, `fi`, etc.  A fragment that is only control structure (from
 # quote-aware `_command_parts` splitting) must not fail read-only probes.
@@ -141,7 +147,9 @@ def _command_parts(command: str) -> list[str]:
                 i += 2
             elif ch == "|" and i + 1 < n and command[i + 1] == "|":
                 i += 2
-            elif ch == "&" and buf and buf[-1] in "><":
+            elif ch == "&" and (
+                (buf and buf[-1] in "><") or (i + 1 < n and command[i + 1] in "><")
+            ):
                 buf.append(ch)
                 i += 1
                 continue
@@ -173,8 +181,12 @@ def _simple_command_is_read_only(command: str) -> bool:
     if not stripped_control:
         return True
     command = stripped_control
-    # Scratch-space and fd-dup redirections are not repository writes.
-    if not command or _WRITE_MARKERS.search(_SCRATCH_REDIRECT_RE.sub("", command)):
+    # Scratch-space and fd-dup redirections are not repository writes.  Quote
+    # contents are data (`echo 'a > b'` writes nothing) so mask them first;
+    # heredoc bodies (`<<EOF`) are stdin, and only a real file target (`>` or
+    # `tee`) after the marker check gates.
+    write_scan = _QUOTED_REGION_RE.sub(" ", _SCRATCH_REDIRECT_RE.sub("", command))
+    if not command or _WRITE_MARKERS.search(write_scan):
         return False
     if re.search(r"\b(?:codex|cursor|claude|aider|copilot|gh\s+pr\s+(?:checkout|create))\b", command, re.I):
         return False
