@@ -323,6 +323,70 @@ def test_read_only_operational_probes_are_not_coding_intent(command):
 
 
 @pytest.mark.parametrize("command", [
+    "hermes kanban show t_2ea69c53 --json",
+    "hermes kanban show t_2ea69c53 --json > /tmp/audit.json 2>/dev/null",
+    "hermes kanban list --json > /tmp/board.json 2>/tmp/err",
+    "hermes kanban stats",
+    "hermes kanban diagnostics --json",
+    "hermes kanban runs t_123",
+    "hermes kanban assignees",
+    "hermes kanban log t_123 --tail",
+    "hermes kanban boards list",
+    "hermes kanban boards current",
+    "export PATH=\"$HOME/x:$PATH\"; hermes kanban list --json > /tmp/out.json",
+    "for id in t_1 t_2; do hermes kanban show $id --json > /tmp/out.json; echo done; done",
+    "if [ -f /tmp/x ]; then cat /tmp/x; fi",
+    "git log --oneline -5 2>&1 | head",
+    "git status --short 2>&1",
+    "curl -s https://mc.solobot.cloud/build-info.json > /tmp/bi.json",
+    "python3 -c \"import json; d=json.load(open('/tmp/audit.json')); print(len(d))\"",
+    "python3 -c \"import sqlite3; c=sqlite3.connect('/home/solo/.hermes/kanban.db'); print(c.execute('select count(*) from tasks').fetchone())\"",
+])
+def test_scratch_redirect_export_loop_and_read_probes_are_read_only(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect the board") is False
+
+
+@pytest.mark.parametrize("command", [
+    "hermes kanban boards create dev2",
+    "hermes kanban boards rm dev2",
+    "hermes kanban boards switch dev2",
+    "hermes kanban repair",
+    "hermes kanban gc",
+    "hermes kanban create -t 'new task'",
+    "python3 -c \"open('/tmp/x','w').write('y')\"",
+    # tee is a write command even to scratch (only shell redirection to
+    # scratch is exempt, per the "base command read-only" rule)
+    "echo hi | tee /tmp/out.txt",
+    # loop/conditional body with a mutating command stays gated
+    "if [ -f x ]; then rm x; fi",
+])
+def test_mutating_hermes_verbs_and_interpreter_writes_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Manage the board") is True
+
+
+@pytest.mark.parametrize("code", [
+    "import sqlite3\nc = sqlite3.connect('/tmp/db.sqlite')\nprint(c.execute('select 1').fetchone())",
+    "text = 'a-b'.replace('-', '_')\nprint(text)",
+    "items = [1, 2, 3]\nitems.remove(2)\nprint(items)",
+    "import json\nprint(json.load(open('/tmp/x.json')))",
+])
+def test_execute_code_read_only_probes_are_not_coding_intent(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Inspect state") is False
+
+
+@pytest.mark.parametrize("code", [
+    "import os\nos.remove('/tmp/x')",
+    "from pathlib import Path\nPath('/tmp/x').unlink()",
+    "import shutil\nshutil.rmtree('/tmp/x')",
+    "import os\nos.replace('/tmp/a', '/tmp/b')",
+    "import subprocess\nsubprocess.run(['touch', 'x'])",
+    "open('/tmp/x', 'w').write('y')",
+])
+def test_execute_code_fs_mutations_fail_closed(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Run the script") is True
+
+
+@pytest.mark.parametrize("command", [
     "curl -o /tmp/out.json https://example.com/data",
     "curl --output /tmp/out.json https://example.com/data",
     "curl -O https://example.com/file.bin",
