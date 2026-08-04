@@ -322,6 +322,25 @@ def test_read_only_operational_probes_are_not_coding_intent(command):
     assert is_coding_intent("terminal", {"command": command}, "Inspect runtime state") is False
 
 
+@pytest.mark.parametrize("command", [
+    "curl -o /tmp/out.json https://example.com/data",
+    "curl --output /tmp/out.json https://example.com/data",
+    "curl -O https://example.com/file.bin",
+    "curl --remote-name https://example.com/file.bin",
+    "curl --remote-name-all https://example.com/a https://example.com/b",
+    "curl --output-dir /tmp -O https://example.com/file.bin",
+    "curl -sfo /tmp/out.json https://example.com/data",
+    "curl -d 'a=1' https://example.com/api",
+    "curl --data-binary @payload.json https://example.com/api",
+    "curl -F 'file=@x.txt' https://example.com/upload",
+    "curl -T /tmp/x.txt https://example.com/upload",
+    "curl -X POST https://example.com/api",
+    "curl --request PUT https://example.com/api",
+])
+def test_curl_file_write_and_mutation_forms_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Fetch remote data") is True
+
+
 def test_mutating_shell_probes_are_coding_intent():
     assert is_coding_intent("terminal", {"command": "find . -delete"}, "Inspect the tree") is True
     assert is_coding_intent("terminal", {"command": "git remote add origin https://example.com"}, "Inspect remotes") is True
@@ -408,3 +427,44 @@ def test_canonical_session_association_unlocks_scoped_coding(monkeypatch, tmp_pa
     registry = _registry(calls, "patch")
     assert _payload(registry.dispatch("patch", {}, session_id="chat-associated", user_message="Implement")) == {"ok": True}
     assert calls == ["patch"]
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "message"),
+    [
+        ("patch", {"path": "/unrelated/other-repo/file.py"}, "Implement the fix"),
+        ("write_file", {"path": "/unrelated/other-repo/x.py", "content": "print(1)"}, "Write the module"),
+        ("terminal", {"command": "cd /unrelated && make build", "workdir": "/unrelated"}, "Build the other repo"),
+        ("terminal", {"command": "git -C /unrelated status && git -C /unrelated commit -m x"}, "Commit in other repo"),
+        ("execute_code", {"code": "from hermes_tools import write_file\nwrite_file('/unrelated/x.py', 'x')", "workdir": "/unrelated"}, "Run the script"),
+        ("delegate_task", {"goal": "Implement", "workspace": "/unrelated/other-repo"}, "Implement it"),
+    ],
+)
+def test_associated_session_cannot_unlock_unrelated_targets(monkeypatch, tmp_path, name, args, message):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db
+    from hermes_state import SessionDB
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Session task", assignee="dev", session_id="chat-scoped",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "chat-scoped", "message_id": "m"},
+                "repository": str(tmp_path), "workspace": str(tmp_path),
+            },
+        )
+    db = SessionDB()
+    try:
+        db.create_session("chat-scoped", "cli", model_config={"kanban_task_id": task_id})
+    finally:
+        db.close()
+    calls: list[str] = []
+    registry = _registry(calls, name)
+    result = _payload(registry.dispatch(name, args, session_id="chat-scoped", user_message=message))
+
+    assert result["error_type"] == "kanban_task_scope_mismatch"
+    assert result["task_id"] == task_id
+    assert calls == []

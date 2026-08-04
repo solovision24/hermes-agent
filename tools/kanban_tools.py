@@ -108,11 +108,6 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
-def _check_kanban_create_mode() -> bool:
-    """Expose task intake to ordinary chats; lifecycle stays worker-gated."""
-    return True
-
-
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -2217,7 +2212,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_create_mode,
+    check_fn=_check_kanban_mode,
     emoji="➕",
 )
 

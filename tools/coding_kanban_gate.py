@@ -100,6 +100,27 @@ def _simple_command_is_read_only(command: str) -> bool:
     base = Path(words[0]).name.lower()
     if base not in _READ_ONLY_COMMANDS:
         return False
+    if base == "curl":
+        # curl is read-only only for inspection probes. Output flags that
+        # write files (-o/--output/-O/--remote-name/--output-dir/--remote-header-name)
+        # and request-body/mutation flags (-d/--data*, -F/--form, -T/--upload-file,
+        # -X/--request) fail closed before task association.
+        for word in words[1:]:
+            if word.startswith("--"):
+                name = word[2:].split("=", 1)[0].lower()
+                if name in {
+                    "output", "remote-name", "remote-name-all", "output-dir",
+                    "remote-header-name", "data", "data-raw", "data-binary",
+                    "data-urlencode", "data-ascii", "form", "upload-file",
+                    "request",
+                }:
+                    return False
+            elif word.startswith("-") and len(word) > 1:
+                # Combined short flags (e.g. -sfo) fail closed if any
+                # mutating letter is present; -f (--fail) and -I (--head)
+                # remain safe.
+                if any(c in word[1:] for c in "oOJdFTX"):
+                    return False
     if base == "git":
         try:
             subcommand = next(word for word in words[1:] if not word.startswith("-"))
@@ -400,6 +421,77 @@ def _session_task_id(session_id: str) -> Optional[str]:
         return None
 
 
+def _call_is_scoped_to_task(tool_name: str, args: dict, task) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` whether this call's explicit targets stay
+    inside the associated task's recorded repository/workspace.
+
+    The session-association allow path must not unlock coding calls that
+    target unrelated repositories, workspaces, or paths.  Every explicit
+    target the call names is compared against the task metadata recorded at
+    intake; a mismatch keeps the call gated instead of silently allowing it.
+    """
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    task_repo = _text(metadata.get("repository"))
+    task_ws = _text(metadata.get("workspace")) or _text(getattr(task, "workspace_path", None))
+    bases = [p for p in (task_repo, task_ws) if p]
+    if not bases:
+        return True, "task has no recorded scope"
+
+    def inside(path: str) -> bool:
+        try:
+            candidate = Path(path).expanduser().resolve()
+        except OSError:
+            return False
+        for base in bases:
+            try:
+                base_path = Path(base).expanduser().resolve()
+            except OSError:
+                continue
+            if candidate == base_path or base_path in candidate.parents:
+                return True
+        return False
+
+    if tool_name in {"write_file", "patch"}:
+        path = _text(args.get("path") or args.get("file_path"))
+        if path and not inside(path):
+            return False, f"target path {path!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name == "terminal":
+        workdir = _text(args.get("workdir") or args.get("cwd") or os.environ.get("TERMINAL_CWD"))
+        if workdir and not inside(workdir):
+            return False, f"workdir {workdir!r} is outside the task repository/workspace"
+        # A command that explicitly cd's or targets an absolute path outside
+        # the task workspace must fail closed even without a workdir arg.
+        command = _text(args.get("command"))
+        if command:
+            for part in _command_parts(command):
+                for match in re.finditer(r"\b(?:cd|pushd|git\s+-C)\s+['\"]?([^ '\"]+)", part):
+                    target = match.group(1)
+                    if target.startswith("/") and not inside(target):
+                        return False, f"command target {target!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name == "execute_code":
+        workdir = _text(args.get("workdir") or args.get("cwd"))
+        if workdir and not inside(workdir):
+            return False, f"workdir {workdir!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name == "delegate_task":
+        ws = _text(args.get("workspace") or args.get("workdir"))
+        repo = _text(args.get("repository") or args.get("repo"))
+        if ws and not inside(ws):
+            return False, f"workspace {ws!r} is outside the task repository/workspace"
+        if repo and not inside(repo):
+            return False, f"repository {repo!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name in {"project_create", "project_switch", "codex_app_server"}:
+        return True, ""
+    return True, ""
+
+
 def _persist_session_task_id(session_id: str, task_id: str) -> None:
     if not session_id or not task_id:
         return
@@ -459,7 +551,15 @@ def coding_tool_gate_refusal(
             associated_id, normalized_session
         )
         if associated_task is not None and association_error is None:
-            return None
+            in_scope, scope_reason = _call_is_scoped_to_task(tool_name, args, associated_task)
+            if in_scope:
+                return None
+            return _refusal(
+                error=f"Coding call is outside the associated task's scope: {scope_reason}",
+                tool_name=tool_name,
+                error_type="kanban_task_scope_mismatch",
+                task_id=associated_id,
+            )
 
     agent, agent_error = _requested_coding_agent(args, user_message)
     if agent_error:
