@@ -38,10 +38,16 @@ _READ_ONLY_COMMANDS = frozenset({
     "sort", "stat", "tail", "test", "tree", "uniq", "wc", "which",
     "whoami", "python", "python3", "node", "ruby", "go", "cargo", "npm",
     "date", "ps", "curl", "sqlite3", "gh",
+    "echo", "printf", "true", "false", "env", "id", "hostname", "uname",
+    "realpath", "clear", "tput", "basename",
+    "hermes",
 })
 _GIT_READ_ONLY = frozenset({
     "branch", "diff", "log", "ls-files", "remote", "rev-parse", "show",
     "status", "tag",
+    "worktree", "fetch", "cherry", "merge-base", "rev-list", "cat-file",
+    "for-each-ref", "show-ref", "count-objects", "ls-remote", "describe",
+    "blame",
 })
 _WRITE_MARKERS = re.compile(
     r"(?:^|[^<])(?:>>?|<<|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
@@ -74,9 +80,51 @@ def _first_line(value: str, fallback: str) -> str:
 
 
 def _command_parts(command: str) -> list[str]:
-    """Split a shell command enough to classify each simple command."""
-    parts = re.split(r"\s*(?:&&|\|\||[|;])\s*", command)
-    return [part.strip() for part in parts if part.strip()]
+    """Split a shell command enough to classify each simple command.
+
+    Quote-aware: separators (&&, ||, |, ;) only split OUTSIDE single/double
+    quotes, so a semicolon inside a quoted argument (e.g. a multi-statement
+    sqlite3 query string) is not mistaken for a command separator. A bare
+    fragment from such a split would fail read-only classification and spawn
+    a junk DEV task.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        # Outside quotes: a separator ends the current simple command.
+        if ch in "&|;":
+            if ch == "&" and i + 1 < n and command[i + 1] == "&":
+                i += 2
+            elif ch == "|" and i + 1 < n and command[i + 1] == "|":
+                i += 2
+            else:
+                i += 1
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def _simple_command_is_read_only(command: str) -> bool:
@@ -142,6 +190,12 @@ def _simple_command_is_read_only(command: str) -> bool:
                 return False
         if subcommand == "tag" and any(not word.startswith("-") for word in words[2:]):
             return False
+        if subcommand == "worktree":
+            # Only `git worktree list` is read-only; add/remove/move/repair
+            # mutate the repo and must fail closed.
+            wt_args = [word for word in words[2:] if not word.startswith("-")]
+            if wt_args != ["list"]:
+                return False
     if base in {"python", "python3", "node", "ruby", "go", "cargo", "npm"}:
         # Package/build commands mutate caches or the workspace.  Inline
         # calculations and version/help probes remain available.
@@ -160,6 +214,38 @@ def _simple_command_is_read_only(command: str) -> bool:
         if gh_subcommand not in {"auth", "pr", "run", "repo", "issue"}:
             return False
         if any(word in {"create", "close", "merge", "edit", "delete", "checkout", "comment", "rerun"} for word in words[1:]):
+            return False
+    if base == "hermes":
+        # Read-only Hermes CLI probes must not create gate-junk DEV cards.
+        # Allow read subcommands; fail closed for everything mutating.
+        _HERMES_READ_ONLY = {
+            "webhook": {"list"},
+            "kanban": {"list", "ls", "show", "stats", "diagnostics", "diag",
+                       "context", "runs", "assignees", "notify-list",
+                       "attachments", "log", "tail", "boards", "repair"},
+            "gateway": {"status", "doctor", "version", "health", "info"},
+            "config": {"get", "list", "show"},
+            "cron": {"list"},
+            "session": {"list", "show", "search"},
+            "version": set(),
+            "doctor": set(),
+            "help": set(),
+            "skills": {"list"},
+        }
+        try:
+            hermes_cmd = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        allowed = _HERMES_READ_ONLY.get(hermes_cmd)
+        if allowed is None:
+            return False
+        if not allowed:
+            return True
+        try:
+            hermes_sub = next(word for word in words[2:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if hermes_sub not in allowed:
             return False
     return True
 
@@ -618,7 +704,13 @@ def coding_tool_gate_refusal(
     repository = _repository(workspace, args)
     scope = _text(args.get("scope") or args.get("goal") or args.get("context") or user_message)
     if not scope:
-        scope = "Implement the requested code change."
+        # Tool-only call with no user message: title from the actual tool
+        # invocation so gate-created cards describe the real request.
+        tool_summary = _text(args.get("command") or args.get("path") or args.get("url"))
+        if tool_summary:
+            scope = "Run: " + tool_summary[:200]
+        else:
+            scope = "Implement the requested code change."
     acceptance_value = args.get("acceptance_criteria")
     if isinstance(acceptance_value, str):
         acceptance = [acceptance_value.strip()] if acceptance_value.strip() else []
@@ -666,6 +758,7 @@ def coding_tool_gate_refusal(
                     and candidate_meta.get("origin") == metadata["origin"]
                     and candidate_meta.get("repository") == repository
                     and candidate_meta.get("workspace") == workspace
+                    and candidate.status in ACTIVE_TASK_STATUSES
                 ):
                     existing_id = candidate.id
                     break
