@@ -513,6 +513,9 @@ def test_execute_code_fs_mutations_fail_closed(code):
     "curl --remote-name-all https://example.com/a https://example.com/b",
     "curl --output-dir /tmp -O https://example.com/file.bin",
     "curl --output-dir repo https://example.com/file.bin",
+    "curl --output-dir repo -o out.json https://example.com/file.bin",
+    "curl --output-dir /tmp -o sub/out.json https://example.com/file.bin",
+    "curl --output-dir /tmp -o ~/out.json https://example.com/file.bin",
     "curl -d 'a=1' https://example.com/api",
     "curl --data-binary @payload.json https://example.com/api",
     "curl -F 'file=@x.txt' https://example.com/upload",
@@ -533,6 +536,8 @@ def test_curl_file_write_and_mutation_forms_fail_closed(command):
     "curl -sfo /tmp/out.json https://example.com/data",
     "curl --output=/tmp/out.json https://example.com/data",
     "curl --output-dir /tmp https://example.com/file.bin",
+    "curl --output-dir /tmp -o out.json https://example.com/file.bin",
+    "curl -o out.json --output-dir /tmp https://example.com/file.bin",
     "curl -s https://example.com/health > /dev/null",
 ])
 def test_curl_scratch_output_is_read_only(command):

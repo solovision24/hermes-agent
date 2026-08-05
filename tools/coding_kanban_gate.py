@@ -312,6 +312,18 @@ def _simple_command_is_read_only(command: str) -> bool:
                 return False
 
         i = 1
+        scratch_output_dir = False
+        # curl applies --output-dir regardless of argument order, so resolve
+        # it first: a scratch --output-dir makes a bare-filename -o/--output
+        # destination scratch too (curl applies --output-dir to -o unless the
+        # name already contains a path).
+        for w in words[1:]:
+            if w == "--output-dir":
+                idx = words.index(w)
+                if idx + 1 < len(words):
+                    scratch_output_dir = _scratch_target(words[idx + 1])
+            elif w.startswith("--output-dir="):
+                scratch_output_dir = _scratch_target(w.split("=", 1)[1])
         while i < len(words):
             word = words[i]
             if word.startswith("--"):
@@ -327,7 +339,11 @@ def _simple_command_is_read_only(command: str) -> bool:
                     if not dest and i + 1 < len(words):
                         dest = words[i + 1]
                         i += 1
-                    if not _scratch_target(dest):
+                    if not _scratch_target(dest) and not (
+                        scratch_output_dir
+                        and "/" not in dest
+                        and not dest.startswith("~")
+                    ):
                         return False
                 i += 1
             elif word.startswith("-") and len(word) > 1:
@@ -346,7 +362,11 @@ def _simple_command_is_read_only(command: str) -> bool:
                     if i + 1 < len(words) and not words[i + 1].startswith("-"):
                         dest = words[i + 1]
                         i += 1
-                    if not _scratch_target(dest):
+                    if not _scratch_target(dest) and not (
+                        scratch_output_dir
+                        and "/" not in dest
+                        and not dest.startswith("~")
+                    ):
                         return False
                 i += 1
             else:
