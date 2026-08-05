@@ -785,3 +785,165 @@ def test_review_lane_session_does_not_gain_review_privileges(monkeypatch, tmp_pa
 
     assert result["error_type"] == "kanban_task_required"
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Run-card regression coverage (PR #31 / #33 fixed false positives)
+#
+# The chat-to-DEV gate must never mint a wrapper "Run: ..." card for
+# read-only diagnostics or for `hermes kanban` board operations.  Each test
+# below exercises the FULL gate path through the registry (not just
+# is_coding_intent) and asserts the kanban DB card count stays at zero.
+# ---------------------------------------------------------------------------
+
+
+def _task_rows(conn) -> list:
+    return conn.execute("SELECT id, title, status FROM tasks ORDER BY created_at").fetchall()
+
+
+def _run_card_titles(conn) -> list:
+    return [row[1] for row in conn.execute(
+        "SELECT id, title FROM tasks WHERE title LIKE 'Run:%' ORDER BY created_at"
+    ).fetchall()]
+
+
+def _completed_task_ids(conn) -> set:
+    return {row[0] for row in conn.execute(
+        "SELECT id FROM tasks WHERE status = 'done'"
+    ).fetchall()}
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "message"),
+    [
+        # (1) `cd /tmp && file /etc/hostname` is read-only and creates no card.
+        ("terminal", {"command": "cd /tmp && file /etc/hostname"}, "Inspect the hostname file"),
+        # (2) `hermes kanban complete <existing-id>` is board governance, not
+        # coding: it must complete the target card and create no new card.
+        ("terminal", {"command": "hermes kanban complete t_2e59ceaa"}, "Complete the board card"),
+        # (3) `hermes kanban create 'probe'` is board governance: it must
+        # create only the requested probe card and no wrapper Run card.
+        ("terminal", {"command": "hermes kanban create 'probe'"}, "Create a probe card"),
+        # (4) execute_code importing subprocess and running a read-only
+        # journalctl/grep command creates no card.
+        (
+            "execute_code",
+            {"code": "import subprocess\nsubprocess.run(['journalctl', '-u', 'hermes'], capture_output=True)"},
+            "Inspect the journal",
+        ),
+        (
+            "execute_code",
+            {"code": "import subprocess\nsubprocess.run(['grep', 'needle', '/tmp/log.txt'])"},
+            "Grep the log",
+        ),
+    ],
+)
+def test_read_only_diagnostics_do_not_create_cards(monkeypatch, tmp_path, name, args, message):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+
+    result = _payload(registry.dispatch(
+        name, args, session_id="chat-regression", user_message=message,
+    ))
+
+    # The call is allowed through (no refusal, no handoff) and no card is
+    # minted by the gate.
+    assert result == {"ok": True}
+    assert calls == [name]
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_hermes_kanban_complete_does_not_create_new_card(monkeypatch, tmp_path):
+    """Regression: completing an existing card via the CLI must not mint a
+    wrapper Run: card from the gate path (PR #31)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        target = kanban_db.create_task(conn, title="Target card", assignee="dev", session_id="origin")
+        kanban_db.complete_task(conn, target, result="done")
+
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": f"hermes kanban complete {target}"},
+        session_id="chat-complete",
+        user_message="Complete the board card",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    with kanban_db.connect_closing() as conn:
+        assert _completed_task_ids(conn) == {target}
+        # The only card that exists is the pre-existing target; no wrapper.
+        rows = _task_rows(conn)
+        assert len(rows) == 1
+        assert rows[0][0] == target
+        assert _run_card_titles(conn) == []
+
+
+def test_hermes_kanban_create_probe_creates_only_requested_card(monkeypatch, tmp_path):
+    """Regression: `hermes kanban create 'probe'` from a chat must create
+    exactly the one requested card and no wrapper Run card (PR #31)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": "hermes kanban create 'probe'"},
+        session_id="chat-create",
+        user_message="Create a probe card",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    # The gate itself never creates a card for a board-op terminal command.
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_execute_code_write_via_subprocess_still_creates_card(monkeypatch, tmp_path):
+    """Control: execute_code that runs a WRITE command via subprocess must
+    still create a handoff card (the gate only stops read-only diagnostics)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "execute_code")
+
+    result = _payload(registry.dispatch(
+        "execute_code",
+        {"code": "import subprocess\nsubprocess.run(['touch', 'x'])"},
+        session_id="chat-write",
+        user_message="Run the script",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert calls == []
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        rows = _task_rows(conn)
+        assert len(rows) == 1
+        assert rows[0][0] == result["task_id"]
+        # The handoff card is a real implementation card, never a Run: wrapper.
+        assert _run_card_titles(conn) == []
