@@ -2545,6 +2545,13 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                if b"\x00" in data:
+                                    # Binary (ELF/Mach-O/PE), not a shell
+                                    # script — decoding and scanning it would
+                                    # tokenize machine code and crash the
+                                    # guard on a NUL-containing path
+                                    # (#76762). Treat as "nothing to scan".
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
@@ -2552,7 +2559,17 @@ def terminal_tool(
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        if "\x00" in output:
+                            # The `cat` fallback returns binary decoded as
+                            # text with embedded NUL bytes (e.g. a >1MB
+                            # interpreter like /usr/bin/python3 skips the
+                            # local bounded read). Scanning that text would
+                            # produce a NUL-containing path and crash the
+                            # guard; treat the file as "nothing to scan"
+                            # instead (#76762).
+                            return None
+                        return output
                 except Exception:
                     pass
                 return None

@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte in
+        # a path tokenized from a binary's decoded contents — a guarded
+        # path must never crash the guard (#76762).
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -268,7 +271,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # chunk tells us if this is a binary (NUL bytes) that should be
         # skipped as "nothing to scan" rather than failing closed (#76762).
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     finally:
         os.close(descriptor)
