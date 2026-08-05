@@ -505,13 +505,14 @@ def test_execute_code_fs_mutations_fail_closed(code):
 
 
 @pytest.mark.parametrize("command", [
-    "curl -o /tmp/out.json https://example.com/data",
-    "curl --output /tmp/out.json https://example.com/data",
+    # curl output to a real/repo path or implicit-CWD writes fail closed
+    "curl -o repo/out.json https://example.com/data",
+    "curl --output repo/out.json https://example.com/data",
     "curl -O https://example.com/file.bin",
     "curl --remote-name https://example.com/file.bin",
     "curl --remote-name-all https://example.com/a https://example.com/b",
     "curl --output-dir /tmp -O https://example.com/file.bin",
-    "curl -sfo /tmp/out.json https://example.com/data",
+    "curl --output-dir repo https://example.com/file.bin",
     "curl -d 'a=1' https://example.com/api",
     "curl --data-binary @payload.json https://example.com/api",
     "curl -F 'file=@x.txt' https://example.com/upload",
@@ -521,6 +522,74 @@ def test_execute_code_fs_mutations_fail_closed(code):
 ])
 def test_curl_file_write_and_mutation_forms_fail_closed(command):
     assert is_coding_intent("terminal", {"command": command}, "Fetch remote data") is True
+
+
+@pytest.mark.parametrize("command", [
+    # curl output flags are read-only when the destination is scratch
+    # (/dev/null, /tmp, /var/tmp, or the system temp dir)
+    "curl -o /dev/null https://example.com",
+    "curl -o /tmp/probe.json https://example.com/data",
+    "curl --output /tmp/out.json https://example.com/data",
+    "curl -sfo /tmp/out.json https://example.com/data",
+    "curl --output=/tmp/out.json https://example.com/data",
+    "curl --output-dir /tmp https://example.com/file.bin",
+    "curl -s https://example.com/health > /dev/null",
+])
+def test_curl_scratch_output_is_read_only(command):
+    assert is_coding_intent("terminal", {"command": command}, "Fetch remote data") is False
+
+
+@pytest.mark.parametrize("command", [
+    # systemctl inspection subcommands are read-only
+    "systemctl --user show hermes.service",
+    "systemctl --user status hermes.service",
+    "systemctl is-active hermes.service",
+    "systemctl is-enabled hermes.service",
+    "systemctl list-units",
+    "systemctl list-jobs",
+    "systemctl get-default",
+])
+def test_systemctl_inspection_is_read_only(command):
+    assert is_coding_intent("terminal", {"command": command}, "Check service state") is False
+
+
+@pytest.mark.parametrize("command", [
+    # systemctl mutation subcommands must fail closed
+    "systemctl start hermes.service",
+    "systemctl stop hermes.service",
+    "systemctl restart hermes.service",
+    "systemctl reload hermes.service",
+    "systemctl enable hermes.service",
+    "systemctl disable hermes.service",
+    "systemctl kill hermes.service",
+    "systemctl daemon-reload",
+    "systemctl set-property hermes.service MemoryMax=1G",
+    "systemctl mask hermes.service",
+    "systemctl unmask hermes.service",
+    "systemctl edit hermes.service",
+])
+def test_systemctl_mutations_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Manage services") is True
+
+
+def test_markdown_doc_write_is_not_coding_intent(tmp_path):
+    # .md documentation edits are governance/content work, not code.
+    assert is_coding_intent(
+        "write_file", {"path": str(tmp_path / "notes.md"), "content": "# Notes"},
+        "Update the notes",
+    ) is False
+    assert is_coding_intent(
+        "write_file", {"path": "/home/solo/notes.md", "content": "# Notes"},
+        "Update the notes",
+    ) is False
+
+
+def test_markdown_doc_write_with_code_intent_still_gates(tmp_path):
+    # A .md write whose request explicitly describes code work stays gated.
+    assert is_coding_intent(
+        "write_file", {"path": str(tmp_path / "notes.md"), "content": "# Notes"},
+        "Implement the parser and write the change",
+    ) is True
 
 
 def test_mutating_shell_probes_are_coding_intent():

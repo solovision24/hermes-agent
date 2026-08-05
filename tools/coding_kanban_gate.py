@@ -37,7 +37,7 @@ _READ_ONLY_COMMANDS = frozenset({
     "git", "grep", "head", "jq", "ls", "pwd", "readlink", "rg", "sed",
     "sort", "stat", "tail", "test", "tree", "uniq", "wc", "which",
     "whoami", "python", "python3", "node", "ruby", "go", "cargo", "npm",
-    "date", "ps", "curl", "sqlite3", "gh", "journalctl",
+    "date", "ps", "curl", "sqlite3", "gh", "journalctl", "systemctl",
     "echo", "printf", "true", "false", "env", "id", "hostname", "uname",
     "realpath", "clear", "tput", "basename",
     "hermes",
@@ -49,6 +49,14 @@ _GIT_READ_ONLY = frozenset({
     "worktree", "fetch", "cherry", "merge-base", "rev-list", "cat-file",
     "for-each-ref", "show-ref", "count-objects", "ls-remote", "describe",
     "blame",
+})
+# systemctl subcommands that only inspect units/state.  Everything that
+# mutates units (start/stop/restart/reload/enable/disable/kill/reset-failed/
+# daemon-reload/set-property/mask/unmask/edit) stays fail-closed.
+_SYSTEMCTL_READ_ONLY = frozenset({
+    "show", "status", "is-active", "is-enabled", "is-failed", "is-system-running",
+    "list-units", "list-unit-files", "list-jobs", "list-timers", "list-sockets",
+    "list-machines", "get-default", "cat", "help",
 })
 _WRITE_MARKERS = re.compile(
     r"(?:^|[^<])(?:>>?|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
@@ -271,25 +279,78 @@ def _simple_command_is_read_only(command: str) -> bool:
         return False
     if base == "curl":
         # curl is read-only only for inspection probes. Output flags that
-        # write files (-o/--output/-O/--remote-name/--output-dir/--remote-header-name)
-        # and request-body/mutation flags (-d/--data*, -F/--form, -T/--upload-file,
-        # -X/--request) fail closed before task association.
-        for word in words[1:]:
+        # write to a real file path (-o/--output/--output-dir) are allowed
+        # ONLY when the destination is scratch (/dev/null, /tmp, /var/tmp, or
+        # the system temp dir); repo paths and implicit-CWD writes
+        # (-O/--remote-name/--remote-header-name/--remote-name-all) fail
+        # closed, as do request-body/mutation flags (-d/--data*, -F/--form,
+        # -T/--upload-file, -X/--request).
+        _CURL_SCRATCH_PREFIXES = ("/dev/null", "/tmp", "/var/tmp")
+        _CURL_IMPLICIT_WRITE = {
+            "remote-name", "remote-name-all", "remote-header-name",
+        }
+        _CURL_MUTATING = {
+            "data", "data-raw", "data-binary", "data-urlencode", "data-ascii",
+            "form", "upload-file", "request",
+        }
+
+        def _scratch_target(value: str) -> bool:
+            value = value.strip()
+            if not value:
+                return False
+            if value == "/dev/null":
+                return True
+            for prefix in _CURL_SCRATCH_PREFIXES:
+                if value == prefix or value.startswith(prefix + "/"):
+                    return True
+            tmpdir = os.environ.get("TMPDIR") or "/tmp"
+            try:
+                return Path(value).expanduser().resolve().is_relative_to(
+                    Path(tmpdir).expanduser().resolve()
+                )
+            except OSError:
+                return False
+
+        i = 1
+        while i < len(words):
+            word = words[i]
             if word.startswith("--"):
-                name = word[2:].split("=", 1)[0].lower()
-                if name in {
-                    "output", "remote-name", "remote-name-all", "output-dir",
-                    "remote-header-name", "data", "data-raw", "data-binary",
-                    "data-urlencode", "data-ascii", "form", "upload-file",
-                    "request",
-                }:
+                name, _, inline = word[2:].partition("=")
+                name = name.lower()
+                if name in _CURL_MUTATING:
                     return False
+                if name in _CURL_IMPLICIT_WRITE:
+                    return False
+                if name in {"output", "output-dir"}:
+                    # --output PATH (or --output=PATH); --output-dir DIR.
+                    dest = inline
+                    if not dest and i + 1 < len(words):
+                        dest = words[i + 1]
+                        i += 1
+                    if not _scratch_target(dest):
+                        return False
+                i += 1
             elif word.startswith("-") and len(word) > 1:
-                # Combined short flags (e.g. -sfo) fail closed if any
-                # mutating letter is present; -f (--fail) and -I (--head)
-                # remain safe.
-                if any(c in word[1:] for c in "oOJdFTX"):
-                    return False
+                # Combined short flags (e.g. -sfo).  Any mutating letter
+                # (-d data, -F form, -T upload, -X request, -O implicit
+                # remote-name write) fails closed.  -o takes the next word as
+                # its destination and is allowed only for scratch paths; -f
+                # (--fail) and -I (--head) remain safe.
+                for ch in word[1:]:
+                    if ch in "dFTX":
+                        return False
+                    if ch == "O":
+                        return False
+                if "o" in word[1:]:
+                    dest = ""
+                    if i + 1 < len(words) and not words[i + 1].startswith("-"):
+                        dest = words[i + 1]
+                        i += 1
+                    if not _scratch_target(dest):
+                        return False
+                i += 1
+            else:
+                i += 1
     if base == "git":
         try:
             subcommand = next(word for word in words[1:] if not word.startswith("-"))
@@ -337,6 +398,17 @@ def _simple_command_is_read_only(command: str) -> bool:
         if gh_subcommand not in {"auth", "pr", "run", "repo", "issue"}:
             return False
         if any(word in {"create", "close", "merge", "edit", "delete", "checkout", "comment", "rerun"} for word in words[1:]):
+            return False
+    if base == "systemctl":
+        # systemctl is read-only only for inspection subcommands.  A missing
+        # or mutating subcommand (start/stop/restart/reload/enable/disable/
+        # kill/reset-failed/daemon-reload/set-property/mask/unmask/edit)
+        # fails closed before task association.
+        try:
+            sysctl_sub = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if sysctl_sub not in _SYSTEMCTL_READ_ONLY:
             return False
     if base == "hermes":
         # Read-only Hermes CLI probes must not create gate-junk DEV cards.
@@ -387,8 +459,15 @@ def _write_file_is_coding(args: dict, user_message: Any) -> bool:
     """
     path = _text(args.get("path") or args.get("file_path"))
     message = _text(user_message)
+    suffix = Path(path).suffix.lower() if path else ""
+    # Documentation (.md) writes are governance/content work, not code.
+    # Exempt markdown from the coding-lane classification regardless of
+    # location (repo or not) unless the request explicitly describes code
+    # work.  All code extensions stay gated.
+    _CODE_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".sh"}
+    is_markdown_doc = suffix == ".md"
     report_request = bool(re.search(r"\b(?:report|audit|research|findings|notes?)\b", message, re.I))
-    if (_has_coding_intent(message) or Path(path).suffix.lower() in {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".sh"}) and not report_request:
+    if (_has_coding_intent(message) or (suffix in _CODE_EXTENSIONS and not is_markdown_doc)) and not report_request:
         return True
     if not path:
         return True
@@ -396,6 +475,10 @@ def _write_file_is_coding(args: dict, user_message: Any) -> bool:
         candidate = Path(path).expanduser().resolve()
         repo = Path(_repository(_workspace(args), args)).resolve()
         if candidate == repo or repo in candidate.parents:
+            # Markdown documentation inside a repository is exempt only when
+            # the request is not explicitly code work.
+            if is_markdown_doc and not _has_coding_intent(message):
+                return False
             return True
         if report_request:
             return False
