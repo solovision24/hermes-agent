@@ -352,6 +352,17 @@ def test_scratch_redirect_export_loop_and_read_probes_are_read_only(command):
 
 
 @pytest.mark.parametrize("command", [
+    # env wrapper must NOT defeat the gate (regression for PR #29 review:
+    # env added to _READ_ONLY_COMMANDS without wrapper handling let
+    # `env git commit` etc. classify pass-through)
+    "env git commit -m x",
+    "env git push origin main",
+    "env FOO=1 git add -A",
+    "env -i git commit -m x",
+    "env -u FOO git push",
+    "env --unset=HOME git add -A",
+    "env bash -c \"rm x\"",
+    "env python3 -c \"open('/tmp/x','w').write('y')\"",
     "hermes kanban boards create dev2",
     "hermes kanban boards rm dev2",
     "hermes kanban boards switch dev2",
@@ -374,6 +385,21 @@ def test_scratch_redirect_export_loop_and_read_probes_are_read_only(command):
 ])
 def test_mutating_hermes_verbs_and_interpreter_writes_fail_closed(command):
     assert is_coding_intent("terminal", {"command": command}, "Manage the board") is True
+
+
+@pytest.mark.parametrize("command", [
+    # env wrapper forms that are genuinely read-only must pass through
+    # (regression for PR #29 review acceptance criteria)
+    "env",
+    "env | grep HOME",
+    "env -0",
+    "env -i python3 -c \"print(1)\"",
+    "env python3 --version",
+    "env git status",
+    "env python3 -c \"import json; d=json.load(open('/tmp/audit.json')); print(len(d))\"",
+])
+def test_env_wrapper_read_only_forms_pass_through(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect the board") is False
 
 
 @pytest.mark.parametrize("code", [

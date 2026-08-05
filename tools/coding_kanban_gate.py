@@ -196,13 +196,38 @@ def _simple_command_is_read_only(command: str) -> bool:
         return False
     if not words:
         return True
-    # Environment assignments (`VAR=...`) and `export VAR=...` prefixes are
-    # wrappers; only the wrapped command matters.
-    while words and (
-        ("=" in words[0] and not words[0].startswith("="))
-        or (words[0].lower() == "export" and len(words) > 1 and "=" in words[1] and not words[1].startswith("="))
-    ):
-        words.pop(0)
+    # Environment assignments (`VAR=...`), `export VAR=...`, and `env`
+    # prefixes are wrappers; only the wrapped command matters. `env` is
+    # stripped along with its option tokens (`-i`, `-u NAME`, `--unset=...`,
+    # `VAR=...`) before classifying the wrapped command; a bare `env` with
+    # no wrapped command is read-only (it just prints the environment).
+    while words:
+        w0 = words[0]
+        if "=" in w0 and not w0.startswith("="):
+            words.pop(0)
+            continue
+        if w0.lower() == "export" and len(words) > 1 and "=" in words[1] and not words[1].startswith("="):
+            words.pop(0)
+            continue
+        if w0.lower() == "env":
+            i = 1
+            while i < len(words):
+                w = words[i]
+                if w in ("-i", "-0"):
+                    i += 1
+                elif w in ("-u", "--unset") and i + 1 < len(words):
+                    i += 2
+                elif w.startswith("--unset="):
+                    i += 1
+                elif "=" in w and not w.startswith("="):
+                    i += 1
+                else:
+                    break
+            rest = words[i:]
+            if not rest:
+                return True
+            return _simple_command_is_read_only(" ".join(rest))
+        break
     if not words:
         return True
     base = Path(words[0]).name.lower()
