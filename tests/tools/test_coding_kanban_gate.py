@@ -363,12 +363,6 @@ def test_scratch_redirect_export_loop_and_read_probes_are_read_only(command):
     "env --unset=HOME git add -A",
     "env bash -c \"rm x\"",
     "env python3 -c \"open('/tmp/x','w').write('y')\"",
-    "hermes kanban boards create dev2",
-    "hermes kanban boards rm dev2",
-    "hermes kanban boards switch dev2",
-    "hermes kanban repair",
-    "hermes kanban gc",
-    "hermes kanban create -t 'new task'",
     "python3 -c \"open('/tmp/x','w').write('y')\"",
     # tee is a write command even to scratch (only shell redirection to
     # scratch is exempt, per the "base command read-only" rule)
@@ -400,6 +394,92 @@ def test_mutating_hermes_verbs_and_interpreter_writes_fail_closed(command):
 ])
 def test_env_wrapper_read_only_forms_pass_through(command):
     assert is_coding_intent("terminal", {"command": command}, "Inspect the board") is False
+
+
+@pytest.mark.parametrize("command", [
+    # `cd`/`pushd`/`popd` are directory-change prefixes, not actions: the
+    # wrapped command after the prefix decides read-only vs coding intent.
+    "cd /tmp && file /etc/hostname",
+    "cd /home/solo/.hermes/mission-control/chat-attachments && file a760file",
+    "cd /tmp && git status && cd ..",
+    "pushd /tmp && ls && popd",
+    "git status && cd /tmp",
+    "cd /tmp && ps -ef | grep hermes",
+    "cd /tmp && journalctl -u hermes --no-pager | tail -20",
+    "pushd -n /tmp && pwd && popd -n",
+])
+def test_cd_prefix_read_only_chains_are_not_coding_intent(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect state") is False
+
+
+@pytest.mark.parametrize("command", [
+    # A `cd` prefix must NOT weaken the gate: mutating commands chained after
+    # it still fail closed.
+    "cd /tmp && git commit -m x",
+    "cd /tmp && rm file.txt",
+    "cd repo && git push origin main",
+    "cd /tmp && touch x",
+    "cd /tmp && env git commit -m x",
+])
+def test_cd_prefix_mutation_chains_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Run the change") is True
+
+
+@pytest.mark.parametrize("command", [
+    # Every `hermes kanban <subcommand>` is board governance, never coding:
+    # board ops do not write repository files, so none may become a card.
+    "hermes kanban complete t_2e59ceaa",
+    "hermes kanban create 'probe'",
+    "hermes kanban create -t 'new task'",
+    "hermes kanban boards create dev2",
+    "hermes kanban boards rm dev2",
+    "hermes kanban boards switch dev2",
+    "hermes kanban boards list",
+    "hermes kanban repair",
+    "hermes kanban gc",
+    "hermes kanban list",
+    "hermes kanban show t_123 --json",
+    "hermes kanban dispatch",
+    "hermes kanban unblock t_123",
+    "hermes kanban heal t_123",
+    "hermes kanban archive t_123",
+    "hermes kanban update t_123",
+])
+def test_hermes_kanban_board_ops_are_not_coding_intent(command):
+    assert is_coding_intent("terminal", {"command": command}, "Manage the board") is False
+
+
+@pytest.mark.parametrize("code", [
+    # subprocess/os/hermes_tools wrappers are classified by the wrapped
+    # command, not by the mere presence of the wrapper.
+    "import subprocess\nsubprocess.run(['journalctl', '-u', 'hermes'], capture_output=True)",
+    "import subprocess\nsubprocess.run(['grep', 'needle', '/tmp/log.txt'])",
+    "import subprocess as sp\nsp.run(['git', 'status'], capture_output=True)",
+    "from subprocess import run\nrun(['ls', '-la'])",
+    "import os\nos.system('journalctl -u hermes | tail -20')",
+    "from hermes_tools import terminal\nterminal('journalctl -u hermes')",
+    "from hermes_tools import terminal as t\nt('git status --short')",
+    "import hermes_tools\nhermes_tools.terminal('git status --short')",
+])
+def test_execute_code_read_only_wrappers_are_not_coding_intent(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Inspect state") is False
+
+
+@pytest.mark.parametrize("code", [
+    # Wrapper calls must fail closed when the wrapped command mutates, when
+    # the argument is dynamic, or when a star import hides the tool names.
+    "import subprocess\nsubprocess.run(['touch', 'x'])",
+    "import subprocess\nsubprocess.run(['git', 'commit', '-m', 'x'])",
+    "import subprocess\nsubprocess.run(['bash', '-c', 'rm x'])",
+    "from hermes_tools import terminal\nterminal('git commit -m x')",
+    "import os\nos.system('rm -rf /tmp/x')",
+    "import subprocess\ncmd = ['git', 'status']\nsubprocess.run(cmd)",
+    "from hermes_tools import terminal as t\ncmd = 'git commit -m x'\nt(cmd)",
+    "from hermes_tools import *\nterminal('git status')",
+    "import subprocess\nsubprocess.run(['git', 'status'])\nsubprocess.run(['touch', 'x'])",
+])
+def test_execute_code_wrapper_mutations_fail_closed(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Run the script") is True
 
 
 @pytest.mark.parametrize("code", [

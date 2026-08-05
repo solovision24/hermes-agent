@@ -123,6 +123,40 @@ Default assignee (used when no profile fits a task): {default_assignee}
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
+# A triage card that is exactly one tool-only script run (the coding gate's
+# `Run: <command>` scope format) must promote directly as a single task —
+# no fanout, no LLM.  `run <interpreter> <script>` titles match when the
+# script is an absolute path or a relative path with a known extension;
+# prose titles like `run the marketing campaign` / `run tests` do not.
+_RUN_TITLE_RE = re.compile(
+    r"^run(?:ning)?\s+"
+    r"(?:(?:python|python3|bash|sh|node|ruby|perl|php|deno|bun|go)\s+)?"
+    r"(?:/\S+|[\w./-]+\.(?:py|sh|js|ts|rb|pl|php|bash|zsh|fish|go))\b",
+    re.IGNORECASE,
+)
+
+
+def _tool_only_run_command(task) -> Optional[str]:
+    """Return the single script-run command when ``task`` is exactly one
+    tool-only script run, else ``None``.
+
+    Recognized shapes:
+    - body first line starts ``Run: <command>`` (the gate's tool-only scope),
+    - title matches ``run [interpreter] <script>`` where ``<script>`` is an
+      absolute path or a relative path with a known script extension.
+    """
+    body_first = next(
+        (line.strip() for line in (task.body or "").splitlines() if line.strip()),
+        "",
+    )
+    if re.match(r"^Run:\s+\S", body_first):
+        return body_first[4:].strip() or None
+    title = (task.title or "").strip()
+    if not _RUN_TITLE_RE.match(title):
+        return None
+    command = re.sub(r"^run(?:ning)?\s+", "", title, count=1, flags=re.IGNORECASE).strip()
+    return command or None
+
 
 @dataclass
 class DecomposeOutcome:
@@ -296,6 +330,38 @@ def decompose_task(
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster()
+
+    # Deterministic pre-check BEFORE the auxiliary-LLM call: a triage card
+    # that is exactly one tool-only script run promotes directly as a single
+    # task (no fanout, no LLM).  This stops the coding gate's `Run:` scope
+    # cards from being split into overlapping run+verify duplicates.
+    run_command = _tool_only_run_command(task)
+    if run_command is not None:
+        audit_author = author or _profile_author()
+        with kb.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=None,
+                body=(
+                    f"Run the following command and report the output:\n\n"
+                    f"    {run_command}\n\n"
+                    "Acceptance criteria:\n"
+                    "- Execute the command exactly as given in the recorded workspace.\n"
+                    "- Do not modify repository files.\n"
+                    "- Report the exit code and relevant output."
+                ),
+                assignee=default_assignee,
+                author=audit_author,
+            )
+        if not ok:
+            return DecomposeOutcome(
+                task_id, False, "task moved out of triage before promotion",
+            )
+        return DecomposeOutcome(
+            task_id, True, "single script run (no fanout)",
+            fanout=False, new_title=None,
+        )
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore

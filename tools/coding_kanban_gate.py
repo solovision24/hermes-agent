@@ -37,7 +37,7 @@ _READ_ONLY_COMMANDS = frozenset({
     "git", "grep", "head", "jq", "ls", "pwd", "readlink", "rg", "sed",
     "sort", "stat", "tail", "test", "tree", "uniq", "wc", "which",
     "whoami", "python", "python3", "node", "ruby", "go", "cargo", "npm",
-    "date", "ps", "curl", "sqlite3", "gh",
+    "date", "ps", "curl", "sqlite3", "gh", "journalctl",
     "echo", "printf", "true", "false", "env", "id", "hostname", "uname",
     "realpath", "clear", "tput", "basename",
     "hermes",
@@ -62,6 +62,16 @@ _WRITE_MARKERS = re.compile(
 _SCRATCH_REDIRECT_RE = re.compile(
     r"(?:[0-9]?>>?|&>)\s*(?:/tmp|/var/tmp|/dev/null)\S*|"
     r"[0-9]?>>?\s*&\d+",
+)
+# For `hermes kanban <op>` board ops, only real redirection/write operators
+# (>, >>, &>, tee, sed/perl -i, install, truncate) write repository files.
+# Mutating command words (rm/mv/cp/mkdir/touch/...) can legitimately appear
+# as kanban CLI arguments (`hermes kanban boards rm dev2`) and are NOT writes.
+_HERMES_KANBAN_WRITE_RE = re.compile(
+    r"(?:^|[^<])(?:>>?|&>)\s*\S+|\btee\b|"
+    r"\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
+    r"\binstall\b|\btruncate\b",
+    re.IGNORECASE,
 )
 # Content inside quotes is data, not shell syntax: `echo 'a > b'` writes
 # nothing even though it contains a `>` character.  Mask quoted regions
@@ -186,7 +196,16 @@ def _simple_command_is_read_only(command: str) -> bool:
     # heredoc bodies (`<<EOF`) are stdin, and only a real file target (`>` or
     # `tee`) after the marker check gates.
     write_scan = _QUOTED_REGION_RE.sub(" ", _SCRATCH_REDIRECT_RE.sub("", command))
-    if not command or _WRITE_MARKERS.search(write_scan):
+    if not command:
+        return False
+    # `hermes kanban <op>` board ops never write repository files, so the
+    # generic write-marker scan (which flags mutating command words such as
+    # `rm` even when they are kanban CLI arguments) would misfire.  Only real
+    # redirection/write operators gate a kanban board op.
+    if re.match(r"^\s*hermes\s+kanban\b", command, re.I):
+        if _HERMES_KANBAN_WRITE_RE.search(write_scan):
+            return False
+    elif _WRITE_MARKERS.search(write_scan):
         return False
     if re.search(r"\b(?:codex|cursor|claude|aider|copilot|gh\s+pr\s+(?:checkout|create))\b", command, re.I):
         return False
@@ -223,6 +242,23 @@ def _simple_command_is_read_only(command: str) -> bool:
                     i += 1
                 else:
                     break
+            rest = words[i:]
+            if not rest:
+                return True
+            return _simple_command_is_read_only(" ".join(rest))
+        if w0.lower() in ("cd", "pushd", "popd"):
+            # Directory-change prefixes are wrappers, not actions: `cd /tmp
+            # && file x` changes the working directory but writes nothing.
+            # Strip the command word plus its single operand (the target
+            # directory for cd/pushd; popd takes none), along with the
+            # POSIX directory flags (-L/-P/-e for cd, -n for pushd/popd).
+            # An empty remainder is read-only.
+            i = 1
+            flags = {"-n"} if w0.lower() in ("pushd", "popd") else {"-L", "-P", "-e"}
+            while i < len(words) and words[i] in flags:
+                i += 1
+            if w0.lower() != "popd" and i < len(words):
+                i += 1  # single directory operand
             rest = words[i:]
             if not rest:
                 return True
@@ -304,12 +340,12 @@ def _simple_command_is_read_only(command: str) -> bool:
             return False
     if base == "hermes":
         # Read-only Hermes CLI probes must not create gate-junk DEV cards.
-        # Allow read subcommands; fail closed for everything mutating.
+        # `hermes kanban <anything>` is board governance, not coding — board
+        # ops (complete/archive/create/update/heal/unblock/dispatch/gc/boards
+        # /repair/...) never write repository files. Other hermes subcommands
+        # keep their read-only subcommand allowlists; mutating ones fail closed.
         _HERMES_READ_ONLY = {
             "webhook": {"list"},
-            "kanban": {"list", "ls", "show", "stats", "diagnostics", "diag",
-                       "context", "runs", "assignees", "notify-list",
-                       "attachments", "log", "tail", "boards"},
             "gateway": {"status", "doctor", "version", "health", "info"},
             "config": {"get", "list", "show"},
             "cron": {"list"},
@@ -319,14 +355,14 @@ def _simple_command_is_read_only(command: str) -> bool:
             "help": set(),
             "skills": {"list"},
         }
-        # `boards` is read-only ONLY for list/current inspection; create/rm/
-        # switch/rename/set-workdir mutate board configuration and must fail
-        # closed.  `repair` and `gc` are mutating and deliberately absent.
-        _HERMES_KANBAN_BOARDS_READ_ONLY = frozenset({"list", "current"})
         try:
             hermes_cmd = next(word for word in words[1:] if not word.startswith("-"))
         except StopIteration:
             return False
+        if hermes_cmd == "kanban":
+            # Every kanban subcommand is a board op. Board ops never write
+            # repository files, so none of them is coding intent.
+            return True
         allowed = _HERMES_READ_ONLY.get(hermes_cmd)
         if allowed is None:
             return False
@@ -336,12 +372,6 @@ def _simple_command_is_read_only(command: str) -> bool:
             hermes_sub = next(word for word in words[2:] if not word.startswith("-"))
         except StopIteration:
             return False
-        if hermes_cmd == "kanban" and hermes_sub == "boards":
-            try:
-                boards_sub = next(word for word in words[3:] if not word.startswith("-"))
-            except StopIteration:
-                return False
-            return boards_sub in _HERMES_KANBAN_BOARDS_READ_ONLY
         if hermes_sub not in allowed:
             return False
     return True
@@ -374,43 +404,149 @@ def _write_file_is_coding(args: dict, user_message: Any) -> bool:
     return False
 
 
+_EXECUTE_CODE_MUTATION_RE = re.compile(
+    r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
+    r"\.write(?:_text|_bytes)?\s*\(|"
+    r"\b(?:os|Path|pathlib|shutil)\.(?:unlink|remove|rename|replace|mkdir|rmdir|rmtree|copytree|copy|move)\s*\(|"
+    r"\b(?:unlink|mkdir|rmdir|rmtree)\s*\()",
+    re.I,
+)
+
+
 def _execute_code_is_read_only(code: str) -> bool:
     code = _text(code)
     if not code:
         return True
+    # Direct file mutations always fail closed, independent of how they are
+    # wrapped: open() write modes, .write*(), os/Path/pathlib/shutil
+    # mutation calls, and bare unlink/mkdir/rmdir/rmtree calls.
+    if _EXECUTE_CODE_MUTATION_RE.search(code):
+        return False
     try:
         import ast
         tree = ast.parse(code)
-        aliases = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                for item in node.names:
-                    if item.name in {"write_file", "patch", "terminal"}:
-                        aliases.add(item.asname or item.name)
-            elif isinstance(node, ast.Import):
-                for item in node.names:
-                    if item.name.rsplit(".", 1)[-1] in {"write_file", "patch", "terminal"}:
-                        aliases.add(item.asname or item.name.rsplit(".", 1)[-1])
-        if aliases and any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in aliases
-            for node in ast.walk(tree)
-        ):
-            return False
     except (SyntaxError, ValueError):
         return False
-    if re.search(
-        r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
-        r"\.write(?:_text|_bytes)?\s*\(|"
-        r"\b(?:os|Path|pathlib|shutil)\.(?:unlink|remove|rename|replace|mkdir|rmdir|rmtree|copytree|copy|move)\s*\(|"
-        r"\b(?:unlink|mkdir|rmdir|rmtree)\s*\(|"
-        r"\b(?:subprocess|os\.system|os\.popen)\b|"
-        r"\b(?:write_file|patch|terminal)\s*\()",
-        code,
-        re.I,
-    ):
-        return False
+    return _execute_code_wrappers_read_only(tree)
+
+
+def _execute_code_wrappers_read_only(tree) -> bool:
+    """Classify subprocess/os/hermes_tools wrapper calls by the wrapped command.
+
+    Aliases are resolved from ``import`` / ``from ... import`` statements
+    (e.g. ``import subprocess as sp``, ``from subprocess import run``,
+    ``from hermes_tools import terminal as t``, ``import os``). A bare
+    unaliased ``terminal``/``write_file``/``patch`` call is the tool itself,
+    and ``import hermes_tools [as X]`` + ``X.terminal(...)`` is the tool.
+    ``write_file``/``patch`` calls always fail closed. Other wrappers are
+    classified by the wrapped command with the existing shell classifier
+    (all ``_command_parts`` must be read-only); a wrapper call with a
+    non-literal/dynamic argument fails closed, and ``import *`` from a
+    wrapper module fails closed because the imported names are unknowable.
+    """
+    import ast
+
+    subprocess_modules = {"subprocess"}
+    subprocess_call_names = {"run", "call", "check_call", "check_output", "Popen"}
+    os_modules = {"os"}
+    os_call_names = {"system", "popen"}
+    hermes_tools_modules = set()
+    # name -> canonical tool: write_file / patch / terminal
+    tool_names: dict[str, str] = {
+        "write_file": "write_file",
+        "patch": "patch",
+        "terminal": "terminal",
+    }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                name = item.name
+                leaf = name.rsplit(".", 1)[-1]
+                alias = item.asname or leaf
+                if name == "subprocess":
+                    subprocess_modules.add(alias)
+                elif name == "os":
+                    os_modules.add(alias)
+                elif name == "hermes_tools":
+                    hermes_tools_modules.add(alias)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for item in node.names:
+                if item.name == "*":
+                    # Names from a star import are unknowable; fail closed so
+                    # `from hermes_tools import *` cannot smuggle tools past
+                    # the classifier.
+                    if module in {"hermes_tools", "subprocess", "os"}:
+                        return False
+                    continue
+                alias = item.asname or item.name
+                if module == "subprocess":
+                    subprocess_call_names.add(alias)
+                elif module == "os":
+                    os_call_names.add(alias)
+                elif module == "hermes_tools" and item.name in tool_names:
+                    tool_names[alias] = item.name
+
+    def _first_arg_command(call) -> Optional[str]:
+        """Return the wrapped command when the first argument is a string
+        literal or a list/tuple of string literals; ``None`` when dynamic."""
+        if not call.args:
+            return None
+        arg = call.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, (ast.List, ast.Tuple)):
+            parts: list[str] = []
+            for elt in arg.elts:
+                if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                    return None
+                parts.append(elt.value)
+            if not parts:
+                return None
+            return " ".join(parts)
+        return None
+
+    def _classify_command(command: Optional[str]) -> bool:
+        if command is None:
+            return False
+        return all(_simple_command_is_read_only(part) for part in _command_parts(command))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        mutating = False
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            owner = func.value.id
+            attr = func.attr
+            if owner in subprocess_modules:
+                if attr not in subprocess_call_names:
+                    continue
+                mutating = not _classify_command(_first_arg_command(node))
+            elif owner in os_modules:
+                if attr not in os_call_names:
+                    continue
+                mutating = not _classify_command(_first_arg_command(node))
+            elif owner in hermes_tools_modules:
+                if attr in ("write_file", "patch"):
+                    mutating = True
+                elif attr == "terminal":
+                    mutating = not _classify_command(_first_arg_command(node))
+        elif isinstance(func, ast.Name):
+            name = func.id
+            if name in tool_names:
+                canonical = tool_names[name]
+                if canonical in ("write_file", "patch"):
+                    mutating = True
+                else:
+                    mutating = not _classify_command(_first_arg_command(node))
+            elif name in subprocess_call_names:
+                mutating = not _classify_command(_first_arg_command(node))
+            elif name in os_call_names:
+                mutating = not _classify_command(_first_arg_command(node))
+        if mutating:
+            return False
     return True
 
 
