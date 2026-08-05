@@ -89,6 +89,10 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - A single tool-only script run (a title like ``run gen_scene.py`` or a
+    body starting ``Run: <command>``) is ONE task. Never split it into
+    separate run + verify/analysis children for the same terminal call;
+    emit the full command and a read-only classification in the one task.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -144,17 +148,24 @@ def _tool_only_run_command(task) -> Optional[str]:
     - body first line starts ``Run: <command>`` (the gate's tool-only scope),
     - title matches ``run [interpreter] <script>`` where ``<script>`` is an
       absolute path or a relative path with a known script extension.
+
+    Only the matched script-run prefix is returned from a title, so a card
+    titled ``Run gen_scene.py in /home/solo and verify change`` yields the
+    command ``gen_scene.py`` — never the trailing prose.
     """
     body_first = next(
         (line.strip() for line in (task.body or "").splitlines() if line.strip()),
         "",
     )
-    if re.match(r"^Run:\s+\S", body_first):
+    if re.match(r"^Run:\s+\S", body_first, re.IGNORECASE):
         return body_first[4:].strip() or None
     title = (task.title or "").strip()
-    if not _RUN_TITLE_RE.match(title):
+    match = _RUN_TITLE_RE.match(title)
+    if not match:
         return None
-    command = re.sub(r"^run(?:ning)?\s+", "", title, count=1, flags=re.IGNORECASE).strip()
+    command = re.sub(
+        r"^run(?:ning)?\s+", "", match.group(0), count=1, flags=re.IGNORECASE,
+    ).strip()
     return command or None
 
 
