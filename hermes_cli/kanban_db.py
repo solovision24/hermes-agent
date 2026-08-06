@@ -4482,12 +4482,22 @@ def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
 
     Review claims (``claim_review_task``) stamp their active run metadata
     with ``source_status=review``, so a reviewer requeued by TTL expiry,
-    heartbeat staleness, runtime timeout, crash, or manual reclaim must
-    return to the ``review`` column — the review dispatcher then re-claims
-    it via ``claim_review_task`` with the mandatory ``sdlc-review`` skill.
-    Without this, those paths reset the card to ``ready`` and the ready
-    loop would spawn the card as an ordinary worker with no review skill.
-    Every other requeue goes to ``ready``.
+    heartbeat staleness, runtime timeout, crash, manual reclaim, spawn
+    failure, or unblock must return to the ``review`` column — the review
+    dispatcher then re-claims it via ``claim_review_task`` with the
+    mandatory ``sdlc-review`` skill. Without this, those paths reset the
+    card to ``ready`` and the ready loop would spawn the card as an
+    ordinary worker with no review skill. Every other requeue goes to
+    ``ready``.
+
+    The active-run check is the fast path. When no active review-stamped
+    run exists (the run was closed — e.g. a review card auto-blocked after
+    repeated spawn failures), the most recent claim decides the lane,
+    mirroring the coding gate's review-lane detection: ``claim_review_task``
+    stamps its ``claimed`` event with ``source_status=review``, a plain
+    ready-loop claim after a changes-requested rejection stamps none, and a
+    ``review_submitted`` event also marks the review lane when no claim has
+    happened yet.
     """
     row = conn.execute(
         "SELECT r.metadata FROM task_runs r "
@@ -4501,6 +4511,12 @@ def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
         except (TypeError, ValueError):
             meta = None
         if isinstance(meta, dict) and meta.get("source_status") == "review":
+            return "review"
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == "claimed":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            return "review" if payload.get("source_status") == "review" else "ready"
+        if event.kind == "review_submitted":
             return "review"
     return "ready"
 
@@ -6014,19 +6030,31 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        # A blocked review card returns to the ``review`` column so the
+        # review dispatcher re-claims it via ``claim_review_task`` with the
+        # mandatory ``sdlc-review`` skill — never to ``ready``, where the
+        # ready loop would spawn it without the review skill.  Resolved
+        # before the UPDATE below (which clears ``current_run_id``); for a
+        # card whose review run was already closed by the auto-block, the
+        # event-history fallback in ``_requeue_status`` still detects the
+        # review lane.
+        requeue_status = _requeue_status(conn, task_id)
+        if requeue_status == "review":
+            new_status = "review"
+        else:
+            # Re-gate on parent completion before flipping 'blocked' back to
+            # 'ready'. Unconditionally setting status='ready' here bypasses the
+            # parent-completion invariant (the dispatcher trusts that column);
+            # if parents are still in progress the task must wait in 'todo'
+            # until recompute_ready picks it up. RCA: Bug 2 at
+            # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+            undone_parents = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            new_status = "todo" if undone_parents else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -8010,13 +8038,22 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: transition running → requeue status + clear
+                # claim.  A review claim (``claim_review_task``) must return
+                # to the ``review`` column so the review dispatcher re-claims
+                # it with the mandatory ``sdlc-review`` skill — never to
+                # ``ready``, where the ready loop would spawn it without the
+                # skill.  Resolve the requeue status BEFORE the UPDATE: it
+                # reads the active run's ``source_status`` metadata, which
+                # ``_end_run`` below clears (and overwrites) once the run is
+                # closed.
+                requeue_status = _requeue_status(conn, task_id)
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (requeue_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via

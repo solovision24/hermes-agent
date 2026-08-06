@@ -3,9 +3,10 @@
 A card in ``review`` status is claimed by ``claim_review_task`` (review ->
 running) and dispatched with the mandatory ``sdlc-review`` skill.  Every
 requeue path (TTL expiry, heartbeat staleness, runtime timeout, crash,
-manual reclaim) must return the card to the ``review`` column so the
-review dispatcher re-claims it — never to ``ready``, where the ready loop
-would spawn it as an ordinary worker without the review skill.
+manual reclaim, spawn failure, auto-block + unblock) must return the card
+to the ``review`` column so the review dispatcher re-claims it — never to
+``ready``, where the ready loop would spawn it as an ordinary worker
+without the review skill.
 """
 
 from __future__ import annotations
@@ -127,6 +128,88 @@ def test_normal_running_claim_still_requeues_to_ready(tmp_path):
         assert _status(conn, task_id) == "running"
         _make_claim_stale(conn, task_id)
         kb.release_stale_claims(conn)
+        assert _status(conn, task_id) == "ready"
+    finally:
+        conn.close()
+
+
+def test_review_claim_spawn_failure_requeues_to_review(tmp_path):
+    """A review claim whose spawn fails must return to review, not ready.
+
+    The review dispatch loop records spawn failures via
+    ``_record_spawn_failure`` (workspace-resolution failure or spawn
+    raise).  Below the breaker threshold the card must land back in the
+    ``review`` column so the review dispatcher re-claims it with the
+    mandatory ``sdlc-review`` skill — the ready loop would spawn it as an
+    ordinary worker with no review skill.
+    """
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = _review_running_task(conn)
+        assert _status(conn, task_id) == "running"
+        auto = kb._record_spawn_failure(
+            conn, task_id, "spawn boom", failure_limit=5
+        )
+        assert auto is False
+        assert _status(conn, task_id) == "review", (
+            "spawn-failure: reviewer requeue must preserve review status"
+        )
+    finally:
+        conn.close()
+
+
+def test_normal_running_spawn_failure_requeues_to_ready(tmp_path):
+    """Control: a plain running card's spawn failure still requeues ready."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="plain", assignee="worker")
+        assert kb.claim_task(conn, task_id) is not None
+        assert _status(conn, task_id) == "running"
+        auto = kb._record_spawn_failure(
+            conn, task_id, "spawn boom", failure_limit=5
+        )
+        assert auto is False
+        assert _status(conn, task_id) == "ready"
+    finally:
+        conn.close()
+
+
+def test_unblock_review_card_returns_to_review(tmp_path):
+    """Unblocking an auto-blocked review card returns it to review.
+
+    Repeated spawn failures trip the breaker and park the card in
+    ``blocked``.  Unblocking must consult the review lane and land the
+    card back in the ``review`` column (via the event-history fallback,
+    since the review run was already closed by the auto-block) so the
+    review dispatcher re-claims it with the sdlc-review skill.
+    """
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = _review_running_task(conn)
+        auto = kb._record_spawn_failure(
+            conn, task_id, "boom 1", failure_limit=1
+        )
+        assert auto is True
+        assert _status(conn, task_id) == "blocked"
+        assert kb.unblock_task(conn, task_id) is True
+        assert _status(conn, task_id) == "review", (
+            "unblock: auto-blocked reviewer must return to review status"
+        )
+    finally:
+        conn.close()
+
+
+def test_unblock_plain_card_returns_to_ready(tmp_path):
+    """Control: a plain blocked card still unblocks to ready."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="plain", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', claim_lock=NULL WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        assert kb.unblock_task(conn, task_id) is True
         assert _status(conn, task_id) == "ready"
     finally:
         conn.close()
