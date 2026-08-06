@@ -2891,27 +2891,35 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
-def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Resolve an assignee before persisting it in a Kanban row."""
+def _canonical_assignee(assignee: Optional[str], *, strict: bool = True) -> Optional[str]:
+    """Resolve an assignee before persisting it in a Kanban row.
+
+    New create/assign/reassign ingress is strict: an input that does not
+    resolve to an on-disk profile, a configured external lane, or a
+    configured alias raises :class:`InvalidAssigneeError` BEFORE any DB
+    mutation.  Read/filter paths pass ``strict=False`` so pre-existing
+    legacy rows carrying unresolvable labels stay listable — defensive
+    invalid handling for legacy persisted rows belongs to the dispatcher
+    and diagnostics, never to write ingress.
+    """
     from hermes_cli.kanban_assignees import (
         InvalidAssigneeError,
-        has_configured_assignee_targets,
         resolve_assignee,
     )
 
     try:
         return resolve_assignee(assignee).canonical
     except InvalidAssigneeError:
-        # Pre-registry boards historically allowed arbitrary labels.  Do not
-        # make opening/importing those boards destructive; strict resolution
-        # still applies as soon as aliases or external lanes are configured.
-        if assignee is not None and not has_configured_assignee_targets():
-            from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+        if strict:
+            raise
+        # Legacy read path: keep the label filterable even though it no
+        # longer resolves.  No profile/lane validation — the caller only
+        # wants to match rows that already carry this label.
+        if assignee is None:
+            return None
+        from hermes_cli.profiles import normalize_profile_name
 
-            legacy_name = normalize_profile_name(str(assignee))
-            validate_profile_name(legacy_name)
-            return legacy_name
-        raise
+        return normalize_profile_name(str(assignee))
 
 
 def create_task(
@@ -3412,7 +3420,7 @@ def list_tasks(
     params: list[Any] = []
     if assignee is not None:
         query += " AND assignee = ?"
-        params.append(_canonical_assignee(assignee))
+        params.append(_canonical_assignee(assignee, strict=False))
     if status is not None:
         if status not in VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -4413,13 +4421,13 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
+              SET status        = 'running',
+                  claim_lock    = ?,
+                  claim_expires = ?,
+                  started_at    = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status = 'review'
+              AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4435,8 +4443,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4446,6 +4454,13 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                # Durable marker for requeue paths: a review claim that
+                # gets requeued (TTL expiry, heartbeat staleness, runtime
+                # timeout, crash, manual reclaim) must return to the
+                # ``review`` column so the review dispatcher re-claims it
+                # with the mandatory sdlc-review skill, never the ready
+                # loop.
+                json.dumps({"source_status": "review"}),
             ),
         )
         run_id = run_cur.lastrowid
@@ -4460,6 +4475,34 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the status a requeued task should land in.
+
+    Review claims (``claim_review_task``) stamp their active run metadata
+    with ``source_status=review``, so a reviewer requeued by TTL expiry,
+    heartbeat staleness, runtime timeout, crash, or manual reclaim must
+    return to the ``review`` column — the review dispatcher then re-claims
+    it via ``claim_review_task`` with the mandatory ``sdlc-review`` skill.
+    Without this, those paths reset the card to ``ready`` and the ready
+    loop would spawn the card as an ordinary worker with no review skill.
+    Every other requeue goes to ``ready``.
+    """
+    row = conn.execute(
+        "SELECT r.metadata FROM task_runs r "
+        "JOIN tasks t ON t.current_run_id = r.id "
+        "WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if row and row["metadata"]:
+        try:
+            meta = json.loads(row["metadata"])
+        except (TypeError, ValueError):
+            meta = None
+        if isinstance(meta, dict) and meta.get("source_status") == "review":
+            return "review"
+    return "ready"
 
 
 def heartbeat_claim(
@@ -4599,12 +4642,13 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (requeue_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -4671,12 +4715,13 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        requeue_status = _requeue_status(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (requeue_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -7303,13 +7348,14 @@ def enforce_max_runtime(
                     pass
 
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                (requeue_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -7428,13 +7474,14 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                (requeue_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -7686,12 +7733,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (requeue_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
