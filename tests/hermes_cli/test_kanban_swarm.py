@@ -1,4 +1,6 @@
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_swarm import (
     SwarmWorkerSpec,
@@ -113,5 +115,53 @@ def test_swarm_verifier_and_synthesis_are_dependency_gated(tmp_path):
         )
         kb.recompute_ready(conn)
         assert kb.get_task(conn, created.synthesizer_id).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_swarm_invalid_later_worker_aborts_atomically(tmp_path):
+    """An invalid later worker's assignee must abort the WHOLE swarm.
+
+    Every assignee is pre-validated before the first write: no root, no
+    earlier workers, no partial dispatchable graph.
+    """
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        with pytest.raises(ValueError, match=r"^invalid_assignee:"):
+            create_swarm(
+                conn,
+                goal="Map the market.",
+                workers=[
+                    SwarmWorkerSpec(profile="researcher-a", title="Market scan", body="A"),
+                    SwarmWorkerSpec(profile="definitely-not-a-profile", title="Bogus", body="B"),
+                ],
+                verifier_assignee="reviewer",
+                synthesizer_assignee="writer",
+                created_by="orchestrator",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_swarm_invalid_verifier_synthesizer_or_creator_aborts_atomically(tmp_path):
+    """Invalid verifier / synthesizer / created_by also abort with zero cards."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        for kwarg in (
+            {"verifier_assignee": "definitely-not-a-profile"},
+            {"synthesizer_assignee": "definitely-not-a-profile"},
+            {"created_by": "definitely-not-a-profile"},
+        ):
+            with pytest.raises(ValueError, match=r"^invalid_assignee:"):
+                create_swarm(
+                    conn,
+                    goal="Collect evidence.",
+                    workers=[SwarmWorkerSpec(profile="researcher", title="Evidence", body="E")],
+                    verifier_assignee=kwarg.get("verifier_assignee", "reviewer"),
+                    synthesizer_assignee=kwarg.get("synthesizer_assignee", "writer"),
+                    created_by=kwarg.get("created_by", "orchestrator"),
+                )
+            assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         conn.close()

@@ -26,6 +26,18 @@ def _payload(result):
     return json.loads(result)
 
 
+def _declare_profile(tmp_path, name: str) -> None:
+    """Declare a real on-disk profile in the temp HERMES_HOME.
+
+    Kanban ingress is strict: ``create_task``/``assign_task`` reject an
+    assignee that does not resolve to an on-disk profile or a configured
+    lane/alias.  These gate tests run against a bare temp home, so any
+    synthetic assignee must exist as a profile directory first.
+    """
+    (tmp_path / ".hermes" / "profiles" / name).mkdir(parents=True)
+    (tmp_path / ".hermes" / "profiles" / name / "config.yaml").write_text("model: test\n")
+
+
 def test_feature_request_hands_off_before_patch_and_reports_real_task(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -186,6 +198,7 @@ def test_cursor_is_recorded_only_when_explicit_and_claude_cannot_launch(monkeypa
 def test_existing_canonical_matching_task_is_reused(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
     from hermes_cli import kanban_db
 
     with kanban_db.connect_closing() as conn:
@@ -234,6 +247,7 @@ def test_kanban_unavailable_fails_closed(monkeypatch, tmp_path):
 def test_arbitrary_session_task_does_not_unlock_originating_chat(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "worker")
     from hermes_cli import kanban_db
 
     with kanban_db.connect_closing() as conn:
@@ -250,6 +264,8 @@ def test_arbitrary_session_task_does_not_unlock_originating_chat(monkeypatch, tm
 
 def test_worker_can_change_code_only_from_own_canonical_dev_task(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, "dev")
+    _declare_profile(tmp_path, "worker")
     from hermes_cli import kanban_db
 
     with kanban_db.connect_closing() as conn:
@@ -281,6 +297,7 @@ def test_worker_can_change_code_only_from_own_canonical_dev_task(monkeypatch, tm
 
 def test_fake_task_environment_without_active_run_cannot_unlock_worker(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, "dev")
     from hermes_cli import kanban_db
 
     with kanban_db.connect_closing() as conn:
@@ -639,6 +656,7 @@ def test_mutation_aliases_fail_closed_before_task_association(monkeypatch, tmp_p
 
 def test_specialist_owned_active_worker_can_change_code(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, "forge")
     from hermes_cli import kanban_db
 
     with kanban_db.connect_closing() as conn:
@@ -661,6 +679,7 @@ def test_specialist_owned_active_worker_can_change_code(monkeypatch, tmp_path):
 def test_canonical_session_association_unlocks_scoped_coding(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
     from hermes_cli import kanban_db
     from hermes_state import SessionDB
 
@@ -699,6 +718,7 @@ def test_canonical_session_association_unlocks_scoped_coding(monkeypatch, tmp_pa
 def test_associated_session_cannot_unlock_unrelated_targets(monkeypatch, tmp_path, name, args, message):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
     from hermes_cli import kanban_db
     from hermes_state import SessionDB
 
@@ -732,6 +752,7 @@ def _claim_review_lane_task(monkeypatch, tmp_path, *, assignee="orion", metadata
     task id with ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` set to the
     claimed review run."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, assignee)
     from hermes_cli import kanban_db
 
     with kanban_db.connect_closing() as conn:
@@ -834,6 +855,7 @@ def test_review_lane_worker_read_only_inspection_passes(monkeypatch, tmp_path, c
 def test_review_lane_session_does_not_gain_review_privileges(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "orion")
     from hermes_cli import kanban_db
     from hermes_state import SessionDB
 
@@ -939,6 +961,7 @@ def test_hermes_kanban_complete_does_not_create_new_card(monkeypatch, tmp_path):
     wrapper Run: card from the gate path (PR #31)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
 
     from hermes_cli import kanban_db
 

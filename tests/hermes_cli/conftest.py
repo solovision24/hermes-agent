@@ -6,10 +6,11 @@ import pytest
 
 
 _SYNTHETIC_ASSIGNEES = (
-    "a", "alice", "alpha", "beta", "broken", "coder", "default",
-    "demo", "dev", "elias", "factory", "ops", "orch", "orchestrator",
-    "peer", "reviewer", "setup", "some-profile", "someother", "teknium",
-    "broken-model",
+    "a", "alice", "alpha", "b", "beta", "bob", "broken", "coder", "default",
+    "demo", "dev", "elias", "engineer", "factory", "made_up", "ops", "orch",
+    "orchestrator", "peer", "researcher", "researcher-a", "researcher-b",
+    "reviewer", "setup", "some-profile", "someother", "swarm-orchestrator",
+    "teknium", "broken-model",
     "test-worker", "w", "worker", "worker-a", "worker-d",
     "worker1", "writer", "x",
 )

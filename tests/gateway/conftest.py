@@ -552,3 +552,23 @@ def pytest_configure(config):
         else:
             cache_file.write_text("clean", encoding="utf-8")
 
+
+
+@pytest.fixture(autouse=True)
+def _register_synthetic_assignee_lanes(monkeypatch):
+    """Register kanban test-only labels as explicit resolver targets.
+
+    Gateway notifier tests create kanban tasks with synthetic assignees
+    (``publisher``, ``worker``).  Kanban ingress is strict since the
+    assignee-validation contract, so make those fixtures explicit
+    resolver targets without weakening production validation.
+    """
+    from hermes_cli import profiles
+
+    synthetic = {"publisher", "worker"}
+    real_exists = profiles.profile_exists
+    monkeypatch.setattr(
+        profiles,
+        "profile_exists",
+        lambda name: str(name).strip().casefold() in synthetic or real_exists(name),
+    )

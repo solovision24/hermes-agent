@@ -173,3 +173,67 @@ def test_invalid_legacy_row_gets_actionable_diagnostic(assignee_home):
     assert invalid[0].severity == "error"
     assert invalid[0].detail.startswith("invalid_assignee:")
     assert invalid[0].actions[0].kind == "reassign"
+
+
+def test_create_assign_reassign_reject_on_empty_default_config(tmp_path, monkeypatch):
+    """Unresolved assignees must fail on an EMPTY/default config too.
+
+    The permissive write-path fallback historically accepted any
+    syntactically valid label whenever no external lanes or aliases were
+    configured (the normal default).  The contract now rejects unresolved
+    strings BEFORE mutation on every board, configured or not.
+    """
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    # No profiles dir, no config.yaml -> no lanes, no aliases: default board.
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match=r"^invalid_assignee:"):
+            kb.create_task(conn, title="bad", assignee="definitely-not-a-profile")
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+        task_id = kb.create_task(conn, title="ok", assignee=None)
+        with pytest.raises(ValueError, match=r"^invalid_assignee:"):
+            kb.assign_task(conn, task_id, "definitely-not-a-profile")
+        assert kb.get_task(conn, task_id).assignee is None
+
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='lock', "
+            "claim_expires=?, worker_pid=123 WHERE id=?",
+            (int(time.time()) + 3600, task_id),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match=r"^invalid_assignee:"):
+            kb.reassign_task(conn, task_id, "definitely-not-a-profile", reclaim_first=True)
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        assert (row["status"], row["claim_lock"], row["assignee"]) == (
+            "running", "lock", None,
+        )
+
+
+def test_legacy_invalid_row_stays_listable_by_label(tmp_path, monkeypatch):
+    """A pre-existing invalid row remains READABLE on an empty config.
+
+    ``list_tasks(assignee=...)`` is a read/filter path: filtering by an
+    unresolved label must return matching legacy rows, not raise.
+    """
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="legacy", assignee=None)
+        conn.execute("UPDATE tasks SET assignee='stale-typo' WHERE id=?", (task_id,))
+        conn.commit()
+        rows = kb.list_tasks(conn, assignee="stale-typo")
+        assert [r.id for r in rows] == [task_id]
+        # Unresolved labels for listing never raise even when nothing matches.
+        assert kb.list_tasks(conn, assignee="another-stale-label") == []
