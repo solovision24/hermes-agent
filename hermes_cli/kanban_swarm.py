@@ -108,6 +108,20 @@ def create_swarm(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
+    # Validate EVERY assignee before the first write.  Kanban ingress is
+    # strict since the assignee-validation contract, so an unresolved later
+    # worker (or verifier / synthesizer / created_by) must abort the whole
+    # swarm atomically — no root, no earlier workers, no partial graph —
+    # instead of raising after partial creation and escaping the CLI as a
+    # traceback.
+    from hermes_cli.kanban_assignees import resolve_assignee
+
+    resolve_assignee(created_by, allow_unassigned=False)
+    resolve_assignee(verifier_assignee, allow_unassigned=False)
+    resolve_assignee(synthesizer_assignee, allow_unassigned=False)
+    for i, spec in enumerate(worker_specs, start=1):
+        resolve_assignee(spec.profile, allow_unassigned=False)
+
     root = kb.create_task(
         conn,
         title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",

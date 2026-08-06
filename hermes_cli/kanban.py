@@ -1554,18 +1554,24 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
-    with kb.connect_closing() as conn:
-        created = ks.create_swarm(
-            conn,
-            goal=args.goal,
-            workers=workers,
-            verifier_assignee=args.verifier,
-            synthesizer_assignee=args.synthesizer,
-            tenant=args.tenant,
-            created_by=args.created_by or _profile_author(),
-            priority=args.priority,
-            idempotency_key=getattr(args, "idempotency_key", None),
-        )
+    try:
+        with kb.connect_closing() as conn:
+            created = ks.create_swarm(
+                conn,
+                goal=args.goal,
+                workers=workers,
+                verifier_assignee=args.verifier,
+                synthesizer_assignee=args.synthesizer,
+                tenant=args.tenant,
+                created_by=args.created_by or _profile_author(),
+                priority=args.priority,
+                idempotency_key=getattr(args, "idempotency_key", None),
+            )
+    except ValueError as exc:
+        # create_swarm pre-validates every assignee before the first write;
+        # surface the rejection cleanly instead of a partial graph + traceback.
+        print(f"kanban swarm: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(created.as_dict(), indent=2, ensure_ascii=False))
     else:
