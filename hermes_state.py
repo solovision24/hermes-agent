@@ -7809,6 +7809,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except OSError:
             pass
 
+    def sweep_orphaned_request_dumps(self, sessions_dir: Optional[Path] = None) -> int:
+        """Remove ``request_dump_*.json`` files whose session no longer exists.
+
+        The gateway writes one ``request_dump_{session_id}_{ts}.json`` file
+        per API error (``agent/agent_runtime_helpers.py``).  Session prune /
+        delete only sweeps dumps for sessions being removed in the *same*
+        call, so dumps whose session row vanished earlier (deleted before the
+        dump-sweep feature existed, or via a path that did not pass
+        ``sessions_dir``) accumulate forever — cron sessions are the biggest
+        producer.  This method removes exactly those orphans.
+
+        A file is kept when its parsed session id matches a live session row
+        (either exactly, or through the filename sanitization used by
+        :func:`run_agent._safe_session_filename_component`).  Non-request-dump
+        files and files whose name does not end in the gateway's timestamp
+        shape (``_YYYYMMDD_HHMMSS_ffffff.json``) are left untouched.
+
+        Never raises: a missing *sessions_dir* is a no-op and OSError on any
+        individual file is swallowed (filesystem hiccups must not block
+        maintenance).  Returns the number of files removed.
+        """
+        if sessions_dir is None:
+            return 0
+        try:
+            files = sorted(sessions_dir.glob("request_dump_*.json"))
+        except OSError:
+            return 0
+        if not files:
+            return 0
+        # Parse each filename: request_dump_{session_id}_{YYYYMMDD_HHMMSS_ffffff}.json
+        parsed: list[tuple[Path, str]] = []
+        for p in files:
+            name = p.name
+            m = re.search(r"_\d{8}_\d{6}_\d{6}\.json$", name)
+            if not m:
+                continue
+            sid = name[len("request_dump_"):m.start()]
+            if not sid:
+                continue
+            parsed.append((p, sid))
+        if not parsed:
+            return 0
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM sessions").fetchall()
+        live_ids = {r["id"] if isinstance(r, sqlite3.Row) else r[0] for r in rows}
+        # A dump may carry the sanitized filename component of a live session
+        # id (traversal-shaped ids are sanitized before writing).  Resolve the
+        # sanitized forms lazily so a missing run_agent import never deletes a
+        # live session's dump — worst case the sweep falls back to exact ids.
+        try:
+            from run_agent import _safe_session_filename_component
+            live_ids |= {_safe_session_filename_component(sid) for sid in tuple(live_ids)}
+        except Exception:
+            pass
+        removed = 0
+        for p, sid in parsed:
+            if sid in live_ids:
+                continue
+            try:
+                p.unlink(missing_ok=True)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
     def get_session_delete_targets(self, session_id: str) -> List[str]:
         """Return every session row that :meth:`delete_session` would remove.
 
@@ -9232,9 +9297,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           - ``"skipped"`` (bool) — true if within min_interval_hours of last run
           - ``"pruned"`` (int)   — number of sessions deleted
           - ``"vacuumed"`` (bool) — true if VACUUM ran
+          - ``"orphaned_dumps_removed"`` (int) — request_dump_*.json files
+            swept because their session row no longer exists
           - ``"error"`` (str, optional) — present only on failure
         """
-        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False, "orphaned_dumps_removed": 0}
         try:
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
@@ -9253,6 +9320,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 sessions_dir=sessions_dir,
             )
             result["pruned"] = pruned
+
+            # Orphaned request_dump_*.json files (dumps whose session row is
+            # already gone — cron is the biggest producer) are not tied to any
+            # session being pruned in this call, so sweep them explicitly when
+            # a sessions dir is known.
+            swept = self.sweep_orphaned_request_dumps(sessions_dir)
+            result["orphaned_dumps_removed"] = swept
 
             # Only VACUUM if we actually freed rows, and no more often than
             # once every min_vacuum_interval_days -- a large prune (e.g. the

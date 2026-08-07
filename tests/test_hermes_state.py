@@ -2328,6 +2328,140 @@ class TestAutoMaintenance:
         assert (sessions_dir / "new.jsonl").exists()
 
 
+class TestOrphanedRequestDumpSweep:
+    """``sweep_orphaned_request_dumps`` removes request_dump_*.json files
+    whose session row no longer exists, while preserving dumps whose session
+    is still live and files that are not request dumps.
+
+    The gateway writes ``request_dump_{session_id}_{YYYYMMDD_HHMMSS_ffffff}.json``
+    on API errors (``agent/agent_runtime_helpers.py``).  Session prune/delete
+    only sweeps dumps for sessions removed in the same call, so dumps whose
+    session vanished earlier accumulate forever — cron is the biggest
+    producer.  This sweep is the orphan pass that closes that gap.
+    """
+
+    def _dump_name(self, sid: str, ts: str = "20260101_000000_000001") -> str:
+        return f"request_dump_{sid}_{ts}.json"
+
+    def test_removes_orphan_dump(self, db, tmp_path):
+        db.create_session(session_id="live_sid", source="cli")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        orphan = sessions_dir / self._dump_name("gone_session")
+        live = sessions_dir / self._dump_name("live_sid")
+        orphan.write_text("{}")
+        live.write_text("{}")
+
+        removed = db.sweep_orphaned_request_dumps(sessions_dir)
+
+        assert removed == 1
+        assert not orphan.exists()
+        assert live.exists()  # session row exists -> preserved
+
+    def test_preserves_live_and_active_session_dumps(self, db, tmp_path):
+        db.create_session(session_id="ended_live", source="cli")
+        db.end_session("ended_live", end_reason="done")
+        db.create_session(session_id="active_live", source="cli")  # never ended
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        ended = sessions_dir / self._dump_name("ended_live")
+        active = sessions_dir / self._dump_name("active_live")
+        ended.write_text("{}")
+        active.write_text("{}")
+
+        removed = db.sweep_orphaned_request_dumps(sessions_dir)
+
+        assert removed == 0
+        assert ended.exists()
+        assert active.exists()
+
+    def test_preserves_sanitized_session_dump(self, db, tmp_path):
+        """A dump whose filename uses the sanitized form of a live session id
+        (e.g. an untrusted id collapsed by ``_safe_session_filename_component``)
+        must not be treated as an orphan."""
+        raw_sid = "untrusted/../evil"
+        db.create_session(session_id=raw_sid, source="api")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        # Sanitized component appends a content hash: untrusted___evil_<hash>
+        from run_agent import _safe_session_filename_component
+
+        safe = _safe_session_filename_component(raw_sid)
+        dump = sessions_dir / self._dump_name(safe)
+        dump.write_text("{}")
+
+        removed = db.sweep_orphaned_request_dumps(sessions_dir)
+
+        assert removed == 0
+        assert dump.exists()
+
+    def test_leaves_non_dump_and_malformed_files(self, db, tmp_path):
+        db.create_session(session_id="s1", source="cli")
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        transcript = sessions_dir / "s1.jsonl"
+        unrelated = sessions_dir / "notes.txt"
+        malformed = sessions_dir / "request_dump_no_timestamp.json"
+        transcript.write_text("")
+        unrelated.write_text("x")
+        malformed.write_text("{}")
+
+        removed = db.sweep_orphaned_request_dumps(sessions_dir)
+
+        assert removed == 0
+        assert transcript.exists()
+        assert unrelated.exists()
+        assert malformed.exists()
+
+    def test_none_sessions_dir_is_noop(self, db):
+        assert db.sweep_orphaned_request_dumps(None) == 0
+
+    def test_missing_sessions_dir_is_noop(self, db, tmp_path):
+        assert db.sweep_orphaned_request_dumps(tmp_path / "absent") == 0
+
+    def test_matches_real_cron_dump_shape(self, db, tmp_path):
+        """Real cron dumps embed a timestamp in the session id itself, so the
+        tail match must be anchored to the gateway's trailing
+        ``_YYYYMMDD_HHMMSS_ffffff.json`` segment, not the first digits."""
+        db.create_session(
+            session_id="cron_963565691152_20260704_103029", source="cron"
+        )
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        live = sessions_dir / self._dump_name(
+            "cron_963565691152_20260704_103029", ts="20260704_103041_978169"
+        )
+        live.write_text("{}")
+        orphan = sessions_dir / self._dump_name(
+            "cron_963565691152_20260601_000000", ts="20260601_000001_000000"
+        )
+        orphan.write_text("{}")
+
+        removed = db.sweep_orphaned_request_dumps(sessions_dir)
+
+        assert removed == 1
+        assert live.exists()
+        assert not orphan.exists()
+
+    def test_auto_maintenance_reports_orphaned_dumps_removed(self, db, tmp_path):
+        """maybe_auto_prune_and_vacuum surfaces the sweep count in its result
+        and still sweeps orphans even when no sessions match the retention
+        window."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        orphan = sessions_dir / self._dump_name("long_gone")
+        orphan.write_text("{}")
+        db.create_session(session_id="fresh", source="cli")
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, sessions_dir=sessions_dir
+        )
+
+        assert result["pruned"] == 0
+        assert result["orphaned_dumps_removed"] == 1
+        assert not orphan.exists()
+
+
 
 
 

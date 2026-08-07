@@ -897,7 +897,10 @@ def cmd_sessions(args, sessions_parser=None):
         if action == "prune":
             sessions_dir = get_hermes_home() / "sessions"
             count = db.prune_sessions(sessions_dir=sessions_dir, **filters)
+            swept = db.sweep_orphaned_request_dumps(sessions_dir)
             print(f"Pruned {count} session(s).")
+            if swept:
+                print(f"Removed {swept} orphaned request dump file(s).")
         else:
             count = db.archive_sessions(**filters)
             print(
@@ -1038,6 +1041,12 @@ def cmd_sessions(args, sessions_parser=None):
             f"Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
             f"({_size_delta_label(saved)})"
         )
+        # Sweep orphaned request_dump_*.json files whose session row is gone.
+        sessions_dir = get_hermes_home() / "sessions"
+        if sessions_dir.exists():
+            swept = db.sweep_orphaned_request_dumps(sessions_dir)
+            if swept:
+                print(f"Removed {swept} orphaned request dump file(s).")
 
     elif action == "clean-markers":
         if args.dry_run:

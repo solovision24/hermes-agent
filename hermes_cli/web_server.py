@@ -11396,7 +11396,10 @@ def _prune_sessions(body: SessionPrune):
             sessions_dir=sessions_dir if sessions_dir.exists() else None,
             **filters,
         )
-        return {"ok": True, "removed": removed}
+        swept = db.sweep_orphaned_request_dumps(
+            sessions_dir if sessions_dir.exists() else None
+        )
+        return {"ok": True, "removed": removed, "orphaned_dumps_removed": swept}
     finally:
         db.close()
 

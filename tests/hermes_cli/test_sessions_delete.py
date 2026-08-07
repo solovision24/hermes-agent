@@ -77,6 +77,9 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None):
         def prune_sessions(self, **kwargs):
             return len(rows)
 
+        def sweep_orphaned_request_dumps(self, sessions_dir=None):
+            return 0
+
         def close(self):
             pass
 
@@ -108,3 +111,49 @@ def test_sessions_prune_preview_shows_oldest_newest(monkeypatch, capsys):
     assert "2 session(s) match" in out
     assert f"oldest activity {format_epoch(1_600_000_050.0)}" in out
     assert f"newest activity {format_epoch(1_700_000_050.0)}" in out
+
+
+def test_sessions_prune_reports_orphaned_dump_sweep(monkeypatch, capsys):
+    """`hermes sessions prune` surfaces the orphaned request-dump sweep."""
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    seen = {}
+    rows = [
+        {
+            "id": "20260101_000000_aaaaaa",
+            "source": "cron",
+            "title": "oldest run",
+            "started_at": 1_600_000_000.0,
+            "last_active": 1_600_000_050.0,
+            "ended_at": 1_600_000_100.0,
+            "message_count": 2,
+            "archived": 0,
+        }
+    ]
+
+    class FakeDB:
+        def list_prune_candidates(self, **kwargs):
+            seen.update(kwargs)
+            return rows
+
+        def prune_sessions(self, **kwargs):
+            return len(rows)
+
+        def sweep_orphaned_request_dumps(self, sessions_dir=None):
+            seen["swept_sessions_dir"] = sessions_dir
+            return 7
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+    monkeypatch.setattr(
+        sys, "argv", ["hermes", "sessions", "prune", "--source", "cron", "--yes"]
+    )
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+    main_mod.main()
+
+    out = capsys.readouterr().out
+    assert "Removed 7 orphaned request dump file(s)." in out
+    assert seen["swept_sessions_dir"] is not None
