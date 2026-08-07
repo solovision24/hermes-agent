@@ -986,6 +986,27 @@ def _persist_session_task_id(session_id: str, task_id: str) -> None:
         return
 
 
+def _coding_gate_enabled() -> bool:
+    """Return whether the chat-path coding intake gate is enabled.
+
+    Kill-switch: ``KANBAN_CODING_GATE=disabled`` (env, case-insensitive) or
+    config ``kanban.coding_gate.enabled: false`` disables the gate for
+    chat/cron sessions — coding-intent tool calls are allowed through with
+    no interception and no card minting. The worker path (``HERMES_KANBAN_TASK``
+    set) never consults this switch. Defaults to enabled when unset.
+    """
+    env_value = os.environ.get("KANBAN_CODING_GATE", "").strip().lower()
+    if env_value:
+        return env_value not in {"disabled", "false", "0", "off", "no"}
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = load_config_readonly()
+        return bool(cfg_get(cfg, "kanban", "coding_gate", "enabled", default=True))
+    except Exception:
+        return True
+
+
 def coding_tool_gate_refusal(
     tool_name: str,
     *,
@@ -1012,6 +1033,12 @@ def coding_tool_gate_refusal(
         worker_agent = _text(os.environ.get("HERMES_CODING_AGENT"))
         if worker_agent and worker_agent.casefold() not in SUPPORTED_CODING_AGENTS:
             return _worker_refusal(tool_name, worker_id, "the worker provider is not supported")
+        return None
+
+    # Kill-switch: when the gate is disabled, do not intercept chat/cron
+    # coding calls at all — no card mint, no read-only scoping. The worker
+    # path above is never affected by this switch.
+    if not _coding_gate_enabled():
         return None
 
     normalized_session = _text(session_id)

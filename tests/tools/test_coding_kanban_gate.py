@@ -1044,3 +1044,136 @@ def test_execute_code_write_via_subprocess_still_creates_card(monkeypatch, tmp_p
         assert rows[0][0] == result["task_id"]
         # The handoff card is a real implementation card, never a Run: wrapper.
         assert _run_card_titles(conn) == []
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch coverage: KANBAN_CODING_GATE=disabled / kanban.coding_gate.enabled=false
+# turns off the chat/cron intake path (no card mint, no read-only scoping)
+# while the worker path and the unset default stay unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_kill_switch_env_disabled_allows_chat_terminal_without_card(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("KANBAN_CODING_GATE", "disabled")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": "touch src/new_feature.py && git add -A"},
+        session_id="chat-killswitch",
+        user_message="Implement the new feature",
+    ))
+
+    # Tool call is ALLOWED with no interception and no read-only scoping.
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_kill_switch_env_case_insensitive_and_falsey_values(monkeypatch, tmp_path):
+    for value in ("DISABLED", "False", "0", "off", "no"):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("KANBAN_CODING_GATE", value)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        calls: list[str] = []
+        registry = _registry(calls, "patch")
+        result = _payload(registry.dispatch(
+            "patch", {"scope": "Implement the parser feature"},
+            session_id=f"chat-{value}", user_message="Please implement the parser feature",
+        ))
+        assert result == {"ok": True}, f"KANBAN_CODING_GATE={value!r} should disable the gate"
+        assert calls == ["patch"]
+
+
+def test_kill_switch_config_disabled_allows_chat_tool_without_card(monkeypatch, tmp_path):
+    (tmp_path / ".hermes").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".hermes" / "config.yaml").write_text(
+        "kanban:\n  coding_gate:\n    enabled: false\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("KANBAN_CODING_GATE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": "touch src/new_feature.py"},
+        session_id="chat-killswitch-config",
+        user_message="Implement the new feature",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_kill_switch_worker_path_unaffected(monkeypatch, tmp_path):
+    """Kill-switch disabled must NOT weaken the worker path (canonical DEV
+    worker still owns its task; non-canonical workers are still refused)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("KANBAN_CODING_GATE", "disabled")
+    _declare_profile(tmp_path, "dev")
+    _declare_profile(tmp_path, "worker")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        own_id = kanban_db.create_task(
+            conn, title="worker task", assignee="dev", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+        other_id = kanban_db.create_task(
+            conn, title="other task", assignee="worker", session_id="origin",
+        )
+
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    with kanban_db.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET current_run_id = 42 WHERE id = ?", (own_id,))
+    assert _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", other_id)
+    denied = _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement"))
+    assert denied["error_type"] == "kanban_task_required"
+    assert calls == ["patch"]
+
+
+def test_kill_switch_unset_preserves_existing_behavior(monkeypatch, tmp_path):
+    """Control: with the switch unset, the chat path still hands off coding
+    work to a canonical DEV card exactly as before."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("KANBAN_CODING_GATE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    result = _payload(registry.dispatch(
+        "patch", {"scope": "Implement the parser feature"},
+        session_id="chat-default", task_id="message-default",
+        user_message="Please implement the parser feature",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert result["assignee"] == "dev"
+    assert calls == []
