@@ -779,6 +779,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
                 )
+            except kb.ReviewRequiredError as review_err:
+                # Hard gate: implementation cards that declare an open PR
+                # must enter the review lane (kanban_submit_review or the
+                # submit-review path) BEFORE kanban_complete. The task was
+                # NOT mutated — the worker must route the PR through the
+                # native review handoff and then stop mutating the card.
+                return tool_error(
+                    f"kanban_complete blocked: {review_err} "
+                    f"Your task is still in-flight (no state change). "
+                    f"Call kanban_submit_review (reviewer=orion) with the "
+                    f"PR evidence metadata before completing, or pass an "
+                    f"explicit review_waiver in this completion metadata "
+                    f"if review is genuinely waived."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"

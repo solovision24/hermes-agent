@@ -544,6 +544,102 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_completed_without_review(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """An implementation card was completed while declaring an open PR
+    but never entered the review lane.
+
+    Fires on ``done`` implementation cards (lane DEV/Quill/Chip/Forge,
+    ``task_type: implementation``, or a declared ``coding_agent``) whose
+    completion handoff metadata carries PR evidence (``pr_url`` /
+    ``pr`` / ``pr_number`` / ``review_identity``) but whose event log
+    has no ``review_submitted`` event and whose handoff carries no
+    explicit waiver (``review_waiver`` / ``review_waived`` /
+    ``skip_review``). This is the exact gap class observed when a card
+    was completed directly after opening a PR (t_3a2a1d3d / PR #391):
+    the PR never entered the Review lane, so the reviewer was never
+    dispatched. The completion gate now blocks this class at
+    ``complete_task``; this rule flags cards that predate the gate or
+    bypassed it (e.g. manual CLI completion), so the operator can route
+    the open PR into review retroactively.
+    """
+    if _task_field(task, "status") != "done":
+        return []
+
+    # Implementation-lane detection mirrors the completion gate: only
+    # coding-lane cards are subject to the submit-for-review contract.
+    task_meta = _task_field(task, "metadata", None)
+    if isinstance(task_meta, str):
+        try:
+            task_meta = json.loads(task_meta) or {}
+        except Exception:
+            task_meta = None
+    task_meta = task_meta if isinstance(task_meta, dict) else {}
+    lane = str(task_meta.get("lane") or "").strip().lower()
+    is_implementation = (
+        lane in {"dev", "forge", "quill", "chip"}
+        or str(task_meta.get("task_type") or "").strip().lower() == "implementation"
+        or bool(task_meta.get("coding_agent"))
+    )
+    if not is_implementation:
+        return []
+
+    if any(_event_kind(ev) == "review_submitted" for ev in events):
+        return []
+
+    # Look for PR evidence + waiver on the completed run's handoff.
+    pr_declared = False
+    waived = False
+    for run in runs:
+        if _task_field(run, "outcome") != "completed":
+            continue
+        run_meta = _task_field(run, "metadata", None)
+        if isinstance(run_meta, str):
+            try:
+                run_meta = json.loads(run_meta) or {}
+            except Exception:
+                run_meta = None
+        run_meta = run_meta if isinstance(run_meta, dict) else {}
+        if any(run_meta.get(k) not in (None, "") for k in (
+            "pr_url", "pr", "pr_number", "review_identity", "pull_request"
+        )):
+            pr_declared = True
+        if any(run_meta.get(k) for k in ("review_waiver", "review_waived", "skip_review")):
+            waived = True
+    if not pr_declared or waived:
+        return []
+
+    completed_at = int(_task_field(task, "completed_at", 0) or 0)
+    task_id = _task_field(task, "id") or "<task_id>"
+    return [Diagnostic(
+        kind="completed_without_review",
+        severity="error",
+        title="Implementation card completed with an open PR but no review handoff",
+        detail=(
+            "This implementation card declared PR evidence in its completion "
+            "handoff but never entered the Review lane (no review_submitted "
+            "event). The PR may still be open and unreviewed. Route the PR "
+            "into the native review handoff (kanban_submit_review) so the "
+            "reviewer is dispatched, or confirm the PR was merged/closed "
+            "out-of-band and note the explicit waiver."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="comment",
+                label="Add a comment with the PR URL and review status",
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="reassign",
+                label="Reassign to the reviewer profile",
+                payload={"reclaim_first": False},
+            ),
+        ],
+        first_seen_at=completed_at,
+        last_seen_at=completed_at,
+        data={"task_id": task_id, "lane": lane},
+    )]
+
+
 def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task's unified ``consecutive_failures`` counter is climbing —
     something about this task+profile combo is broken and each retry
@@ -1036,6 +1132,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_completed_without_review,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
@@ -1051,6 +1148,7 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "completed_without_review",
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",

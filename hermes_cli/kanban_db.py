@@ -4941,6 +4941,100 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# Implementation lanes: cards in these lanes carry coding metadata and their
+# pull requests must pass through the native review lane (a ``review_submitted``
+# event) before the card can be completed — or carry an explicit waiver.
+_IMPLEMENTATION_LANES = frozenset({"dev", "forge", "quill", "chip"})
+_REVIEW_WAIVER_KEYS = ("review_waiver", "review_waived", "skip_review")
+
+
+def _task_metadata(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Read a task's structured metadata column (or None)."""
+    row = conn.execute(
+        "SELECT metadata FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or not row["metadata"]:
+        return None
+    return _decode_task_metadata(row["metadata"])
+
+
+def _metadata_declares_pr(metadata: Optional[dict]) -> bool:
+    """True when a handoff metadata dict declares an open pull request.
+
+    Any of the canonical PR-evidence keys (``pr_url``, ``pr``,
+    ``pr_number``, ``review_identity``, ``pull_request``) with a
+    non-empty value counts. This is the same evidence contract the
+    native review handoff uses (``kanban_submit_review``), so a worker
+    that opened a PR and wants to complete the card must either have
+    entered the review lane or pass an explicit waiver.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    for key in ("pr_url", "pr", "pr_number", "review_identity", "pull_request"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            return True
+    return False
+
+
+def _is_implementation_card(metadata: Optional[dict]) -> bool:
+    """True when task metadata marks this card as an implementation card.
+
+    Matches the coding-gate canonical metadata shape (``lane`` in
+    ``_IMPLEMENTATION_LANES``, ``task_type: implementation``, or a
+    ``coding_agent`` present). Research/docs/ops cards do not declare a
+    coding lane and are never gated.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    lane = str(metadata.get("lane") or "").strip().lower()
+    if lane in _IMPLEMENTATION_LANES:
+        return True
+    if str(metadata.get("task_type") or "").strip().lower() == "implementation":
+        return True
+    if metadata.get("coding_agent"):
+        return True
+    return False
+
+
+def _has_review_waiver(metadata: Optional[dict]) -> bool:
+    """True when handoff metadata carries an explicit review waiver."""
+    if not isinstance(metadata, dict):
+        return False
+    return any(metadata.get(key) for key in _REVIEW_WAIVER_KEYS)
+
+
+def _has_review_submitted_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task has entered the review lane at least once."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_submitted' LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+class ReviewRequiredError(ValueError):
+    """Raised by ``complete_task`` when an implementation card declares an
+    open PR but was never submitted for review (no ``review_submitted``
+    event) and carries no explicit waiver.
+
+    Implementation lanes must call ``kanban_submit_review`` (or the
+    submit-review path) when the PR is opened, BEFORE
+    ``kanban_complete``. Kept as ``ValueError`` subclass so existing
+    tool-error handlers treat it as a recoverable user error.
+    """
+
+    def __init__(self, completing_task_id: str):
+        self.completing_task_id = completing_task_id
+        super().__init__(
+            "completion blocked: implementation card declares an open PR but "
+            "was never submitted for review (no review_submitted event). "
+            "Call kanban_submit_review (or the submit-review path) before "
+            "completing, or pass an explicit review_waiver in completion "
+            "metadata."
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5011,6 +5105,41 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: implementation cards that declare an open PR must enter the
+    # review lane (a ``review_submitted`` event) before completion — or
+    # carry an explicit waiver. Prevents workers from opening a PR and
+    # then completing the card directly, skipping the native review
+    # handoff (incident class t_3a2a1d3d / PR #391). A rejected
+    # completion emits an auditable ``completion_blocked_review_required``
+    # event and raises ReviewRequiredError; the task state is untouched.
+    task_meta = _task_metadata(conn, task_id)
+    completion_meta = metadata or {}
+    if (
+        _is_implementation_card(task_meta)
+        and (
+            _metadata_declares_pr(completion_meta)
+            or _metadata_declares_pr(task_meta)
+        )
+        and not _has_review_submitted_event(conn, task_id)
+        and not (
+            _has_review_waiver(completion_meta)
+            or _has_review_waiver(task_meta)
+        )
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_blocked_review_required",
+                {
+                    "summary_preview": (
+                        (summary or result or "").strip().splitlines()[0][:200]
+                        if (summary or result)
+                        else None
+                    ),
+                    "lane": (task_meta or {}).get("lane"),
+                },
+            )
+        raise ReviewRequiredError(task_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,

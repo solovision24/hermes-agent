@@ -116,6 +116,52 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 # reclaim + reassign CLI smoke tests
 # ---------------------------------------------------------------------------
 
+def test_run_slash_complete_implementation_card_requires_review(kanban_home):
+    """CLI complete on an implementation card with PR evidence but no
+    review_submitted event is blocked with a clear message and a non-zero
+    result; an explicit waiver completes it."""
+    import re
+    from hermes_cli import kanban_db as kb
+
+    out1 = kc.run_slash("create 'cli impl card' --assignee dev")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m
+    tid = m.group(1)
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET metadata=? WHERE id=?",
+            (
+                '{"canonical": true, "lane": "DEV", "coding_agent": "codex"}',
+                tid,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    blocked = kc.run_slash(
+        f"complete {tid} --summary 'opened PR' "
+        f"--metadata '{{\"pr\": 391, \"pr_url\": \"https://github.com/acme/repo/pull/391\"}}'"
+    )
+    assert "kanban: completion blocked" in blocked
+    assert "review_submitted" in blocked
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
+    finally:
+        conn.close()
+
+    ok = kc.run_slash(
+        f"complete {tid} --summary 'waived' "
+        f"--metadata '{{\"pr_url\": \"https://github.com/acme/repo/pull/391\", "
+        f"\"review_waiver\": \"docs-only\"}}'"
+    )
+    assert "Completed" in ok
+
+
 def test_run_slash_reclaim_running_task(kanban_home):
     import re
     import time

@@ -2232,13 +2232,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         failed.append(tid)
                         continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.ReviewRequiredError as review_err:
+                # Hard gate: implementation cards that declare an open PR
+                # must enter the review lane before completion. Mirrors the
+                # tool-layer gate in tools/kanban_tools.py:_handle_complete.
+                print(f"kanban: {review_err}", file=sys.stderr)
+                failed.append(tid)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

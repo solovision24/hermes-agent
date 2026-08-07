@@ -58,7 +58,14 @@ The kanban kernel enforces that exactly one of these terminates each run. A work
 
 ## Outputs and the review-required convention
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel enforces this distinction for **implementation lanes** (cards whose metadata declares a coding lane — DEV / Quill / Chip / Forge — a `task_type: implementation`, or a `coding_agent`): a card that declares an open PR in its completion handoff metadata (`pr_url` / `pr` / `pr_number` / `review_identity`) **cannot be completed without a `review_submitted` event**. `complete_task` raises a review-required gate error (surfaced as `kanban_complete blocked: ...` in the tool and CLI), emits a `completion_blocked_review_required` audit event, and leaves the task in-flight. The worker must either:
+
+- Call `kanban_submit_review` (or the submit-review path) with the PR evidence — the terminal handoff that moves the card to the Review lane and dispatches the reviewer; or
+- Pass an explicit waiver in the completion metadata (`review_waiver: <reason>` / `review_waived` / `skip_review`) when review is genuinely not applicable.
+
+Completed implementation cards that declare PR evidence without a `review_submitted` event are auto-flagged by diagnostics (`completed_without_review`), so operators can route the open PR into review retroactively even if the card predates the gate or was completed through a manual CLI path.
+
+The convention for cards that predate the native review lane (or where no native submit path exists yet):
 
 - **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
 - **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.

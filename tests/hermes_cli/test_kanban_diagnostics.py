@@ -62,6 +62,35 @@ def _run(outcome="completed", run_id=1, error=None):
     }
 
 
+def _impl_task(**overrides):
+    """A done implementation-lane task, mirroring the coding-gate canonical
+    metadata shape (lane DEV/Quill/Chip/Forge + coding_agent)."""
+    base = {
+        "id": "t_impl00",
+        "title": "implementation task",
+        "assignee": "dev",
+        "status": "done",
+        "completed_at": int(time.time()),
+        "metadata": {"canonical": True, "lane": "DEV", "coding_agent": "codex"},
+    }
+    base.update(overrides)
+    return base
+
+
+def _completed_run_with_pr(**overrides):
+    base = {
+        "id": 7,
+        "outcome": "completed",
+        "error": None,
+        "metadata": {
+            "pr": 391,
+            "pr_url": "https://github.com/acme/repo/pull/391",
+        },
+    }
+    base.update(overrides)
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------
@@ -95,6 +124,69 @@ def test_stuck_in_blocked_fires_past_threshold():
     assert d.kind == "stuck_in_blocked"
     assert d.severity == "warning"
     assert d.data["age_hours"] >= 48
+
+
+def test_completed_without_review_fires_for_impl_card_with_pr():
+    """A done implementation card whose handoff declares PR evidence but
+    never entered the review lane is flagged (the t_3a2a1d3d / PR #391
+    gap class)."""
+    now = int(time.time())
+    task = _impl_task(completed_at=now - 3600)
+    diags = kd.compute_task_diagnostics(
+        task, [], [_completed_run_with_pr()], now=now,
+    )
+    hits = [d for d in diags if d.kind == "completed_without_review"]
+    assert len(hits) == 1
+    d = hits[0]
+    assert d.severity == "error"
+    assert "review" in d.title.lower()
+    assert d.data["lane"] == "dev"
+
+
+def test_completed_without_review_silent_when_review_submitted():
+    """A review_submitted event (native submit-for-review) clears the rule."""
+    now = int(time.time())
+    task = _impl_task(completed_at=now - 3600)
+    events = [_event("review_submitted", ts=now - 7200, reviewer="orion")]
+    diags = kd.compute_task_diagnostics(
+        task, events, [_completed_run_with_pr()], now=now,
+    )
+    assert not [d for d in diags if d.kind == "completed_without_review"]
+
+
+def test_completed_without_review_silent_when_waived():
+    """An explicit review waiver in the handoff metadata clears the rule."""
+    now = int(time.time())
+    task = _impl_task(completed_at=now - 3600)
+    run = _completed_run_with_pr(
+        metadata={"pr_url": "https://github.com/acme/repo/pull/391",
+                  "review_waiver": "docs-only"},
+    )
+    diags = kd.compute_task_diagnostics(task, [], [run], now=now)
+    assert not [d for d in diags if d.kind == "completed_without_review"]
+
+
+def test_completed_without_review_silent_for_non_implementation():
+    """Research/docs cards with PR evidence are not flagged."""
+    now = int(time.time())
+    task = _impl_task(
+        metadata={"lane": "RESEARCH"},
+        assignee="researcher",
+    )
+    diags = kd.compute_task_diagnostics(
+        task, [], [_completed_run_with_pr()], now=now,
+    )
+    assert not [d for d in diags if d.kind == "completed_without_review"]
+
+
+def test_completed_without_review_silent_when_not_done():
+    """The rule only fires on done cards."""
+    now = int(time.time())
+    task = _impl_task(status="running", completed_at=None)
+    diags = kd.compute_task_diagnostics(
+        task, [], [_completed_run_with_pr()], now=now,
+    )
+    assert not [d for d in diags if d.kind == "completed_without_review"]
 
 
 
