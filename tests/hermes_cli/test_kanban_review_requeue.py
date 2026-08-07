@@ -213,3 +213,154 @@ def test_unblock_plain_card_returns_to_ready(tmp_path):
         assert _status(conn, task_id) == "ready"
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Expired review claim_lock reclaim (t_adc59c08)
+# ---------------------------------------------------------------------------
+# The review-submit path leaves a claim_lock on status='review' cards with a
+# ~15-min TTL. The review dispatcher used to claim only WHERE claim_lock IS
+# NULL, so a submit-time lock that expired unclaimed (busy spawn cap / crash /
+# restart) made the card PERMANENTLY invisible to the review dispatcher.
+# Both claim_review_task and the review dispatch loop must treat an expired
+# claim as reclaimable, and the card must never regress to 'ready'.
+
+
+def _make_expired_review_claim(conn, task_id: str, *, lock: str = "SoLoBot:stale") -> None:
+    """Simulate a review card whose submit-time claim lock expired unclaimed:
+    status='review', lock set, expiry in the past, dead pid, no active run."""
+    now = int(time.time())
+    conn.execute(
+        "UPDATE tasks SET status='review', claim_lock=?, claim_expires=?, "
+        "worker_pid=?, current_run_id=NULL WHERE id=?",
+        (lock, now - 100, 999999, task_id),
+    )
+    conn.commit()
+
+
+def test_claim_review_task_reclaims_expired_claim_lock(tmp_path):
+    """A review card whose submit-time claim expired unclaimed is claimable."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="worker")
+        _make_expired_review_claim(conn, task_id)
+        claimed = kb.claim_review_task(conn, task_id, claimer="worker")
+        assert claimed is not None
+        assert claimed.status == "running"
+        assert _status(conn, task_id) == "running"
+        assert claimed.claim_lock != "SoLoBot:stale"
+    finally:
+        conn.close()
+
+
+def test_claim_review_task_refuses_live_claim_lock(tmp_path):
+    """Control: a live (unexpired) review claim lock is NOT reclaimable."""
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="worker")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='review', claim_lock='SoLoBot:live', "
+            "claim_expires=?, worker_pid=999999, current_run_id=NULL WHERE id=?",
+            (now + 600, task_id),
+        )
+        conn.commit()
+        assert kb.claim_review_task(conn, task_id, claimer="worker") is None
+        assert _status(conn, task_id) == "review"
+    finally:
+        conn.close()
+
+
+def test_review_dispatch_reclaims_expired_claim_lock_and_spawns_with_sdlc_review(
+    monkeypatch, tmp_path
+):
+    """Regression (t_adc59c08): a review card with an expired claim_lock is
+    claimed by the dispatcher on the next tick and spawns a review worker with
+    the mandatory sdlc-review skill; status never regresses to ready."""
+    # Declare a real on-disk profile so the dispatcher's AssigneeResolver
+    # treats the assignee as spawnable.
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "profiles" / "orion").mkdir(parents=True)
+    (hermes_home / "profiles" / "orion" / "config.yaml").write_text("model: test\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    import importlib
+    import sys
+    for mod in list(sys.modules):
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+            del sys.modules[mod]
+    import hermes_cli.kanban_db as kb2
+    importlib.reload(kb2)
+
+    with kb2.connect_closing() as conn:
+        kb2.create_board(slug="default", name="Test")
+        task_id = kb2.create_task(conn, title="review me", assignee="orion")
+        _make_expired_review_claim(conn, task_id)
+
+        spawned: list = []
+
+        def _spawn(task, workspace, *args, **kwargs):
+            spawned.append((task.id, task.skills))
+            return 12345
+
+        result = kb2.dispatch_once(conn, spawn_fn=_spawn)
+
+        # The card must be claimed and spawned with the review skill, and its
+        # status must be 'running' — never 'ready'.
+        assert (task_id, "orion", "") in result.spawned or any(
+            s[0] == task_id for s in result.spawned
+        ), f"card not spawned; result={result.spawned}"
+        assert len(spawned) == 1
+        assert spawned[0][0] == task_id
+        assert spawned[0][1] == ["sdlc-review"], (
+            "review dispatch must force-load sdlc-review skill"
+        )
+        assert _status(conn, task_id) == "running", (
+            "status must be running after review dispatch, never ready"
+        )
+        row = conn.execute(
+            "SELECT status, claim_lock FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] != "SoLoBot:stale"
+
+
+def test_review_dispatch_leaves_live_claim_lock_untouched(monkeypatch, tmp_path):
+    """Control: the dispatcher does NOT steal a live (unexpired) review claim."""
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "profiles" / "orion").mkdir(parents=True)
+    (hermes_home / "profiles" / "orion" / "config.yaml").write_text("model: test\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    import importlib
+    import sys
+    for mod in list(sys.modules):
+        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+            del sys.modules[mod]
+    import hermes_cli.kanban_db as kb2
+    importlib.reload(kb2)
+
+    with kb2.connect_closing() as conn:
+        kb2.create_board(slug="default", name="Test")
+        task_id = kb2.create_task(conn, title="review me", assignee="orion")
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='review', claim_lock='SoLoBot:live', "
+            "claim_expires=?, worker_pid=999999, current_run_id=NULL WHERE id=?",
+            (now + 600, task_id),
+        )
+        conn.commit()
+
+        spawned: list = []
+
+        def _spawn(task, workspace, *args, **kwargs):
+            spawned.append(task.id)
+            return 12345
+
+        result = kb2.dispatch_once(conn, spawn_fn=_spawn)
+
+        assert spawned == []
+        assert _status(conn, task_id) == "review"
+        assert result.spawned == []

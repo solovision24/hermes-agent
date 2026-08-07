@@ -4411,6 +4411,14 @@ def claim_review_task(
     does NOT check parent dependencies — the task already passed that
     gate on its original ``todo -> ready -> running`` transition.
 
+    A card in ``review`` with an **expired** ``claim_lock`` is reclaimable:
+    the review-submit path leaves a claim lock with a short TTL so the
+    dispatcher doesn't grab the card mid-submission, and if that lock
+    expires unclaimed (busy spawn cap, dispatcher crash/restart) the card
+    must not starve invisibly.  The UPDATE below atomically takes the lock
+    when it is free OR expired, so two racing dispatchers can never both
+    claim the same card.
+
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
@@ -4427,9 +4435,9 @@ def claim_review_task(
                   started_at    = COALESCE(started_at, ?)
             WHERE id = ?
               AND status = 'review'
-              AND claim_lock IS NULL
+              AND (claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, now),
         )
         if cur.rowcount != 1:
             return None
@@ -8315,11 +8323,17 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
     should have spawned a review agent.
+
+    Expired claim locks are reclaimable (see :func:`claim_review_task`),
+    so a card whose submit-time lock expired unclaimed still counts as
+    spawnable review work — otherwise health telemetry would report a
+    false "no review to spawn" while the card starves invisibly.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND (claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?)",
+        (int(time.time()),),
     ).fetchall()
     if not rows:
         return False
@@ -8728,10 +8742,20 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
+    #
+    # Expired claim_locks are reclaimable: the review-submit path leaves
+    # a short-TTL claim lock so the dispatcher doesn't grab the card
+    # mid-submission; if that lock expires unclaimed (busy spawn cap,
+    # dispatcher crash/restart) the card must still be visible to the
+    # review dispatcher.  claim_review_task atomically reclaims the card
+    # (free OR expired lock) so the race is safe.
+    review_now = int(time.time())
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "WHERE status = 'review' "
+        "  AND (claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?) "
+        "ORDER BY priority DESC, created_at ASC",
+        (review_now,),
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
