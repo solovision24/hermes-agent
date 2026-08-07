@@ -95,6 +95,81 @@ class TestHostHeaderMiddleware:
 class TestWebSocketHostOriginGuard:
     """WebSocket upgrades must enforce the same dashboard boundary as HTTP."""
 
+    def _ws_reason(self, origin: str, host: str = "127.0.0.1:9119", monkeypatch=None):
+        """Drive ``_ws_host_origin_reason`` with a fake WS carrying the
+        given Host/Origin headers against a loopback bind."""
+        from hermes_cli.web_server import _ws_host_origin_reason, app
+
+        if monkeypatch is not None:
+            monkeypatch.setattr(app.state, "bound_host", "127.0.0.1", raising=False)
+
+        class _FakeHeaders(dict):
+            def get(self, key, default=None):
+                return dict.get(self, key.lower(), default)
+
+        class _FakeWS:
+            headers = _FakeHeaders({"host": host, "origin": origin})
+
+        return _ws_host_origin_reason(_FakeWS())
+
+    def test_tunneled_public_origin_accepted_when_configured(self, monkeypatch):
+        """A Cloudflare-tunnel deployment rewrites the Host header to the
+        loopback bind but leaves the browser's Origin pointing at the public
+        hostname. When the operator declares HERMES_DASHBOARD_PUBLIC_URL,
+        the WS origin guard must accept that host on a loopback bind."""
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.solobot.cloud")
+        reason = self._ws_reason(
+            "https://hermes.solobot.cloud",
+            host="127.0.0.1:9119",
+            monkeypatch=monkeypatch,
+        )
+        assert reason is None
+        # Ensure the helper really read the env (frozenset is not empty).
+        assert ws._declared_public_origin_hosts() == frozenset({"hermes.solobot.cloud"})
+
+    def test_tunneled_public_origin_rejected_without_config(self, monkeypatch):
+        """Without a declared public URL the strict loopback-only origin
+        default must reject the tunneled origin exactly as before."""
+        monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+        reason = self._ws_reason(
+            "https://hermes.solobot.cloud",
+            host="127.0.0.1:9119",
+            monkeypatch=monkeypatch,
+        )
+        assert reason == "origin_mismatch origin=https://hermes.solobot.cloud bound=127.0.0.1"
+
+    def test_public_origin_must_match_declared_host_exactly(self, monkeypatch):
+        """Accepting the declared public origin must not widen the gate to
+        sibling/subdomains or unrelated hosts (DNS-rebinding defence)."""
+        monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.solobot.cloud")
+        for evil in (
+            "https://evil.example",
+            "https://solobot.cloud",
+            "https://hermes.solobot.cloud.evil.example",
+            "https://sub.hermes.solobot.cloud",
+        ):
+            reason = self._ws_reason(
+                evil,
+                host="127.0.0.1:9119",
+                monkeypatch=monkeypatch,
+            )
+            assert reason == f"origin_mismatch origin={evil} bound=127.0.0.1"
+
+    def test_loopback_origin_still_accepted_with_config(self, monkeypatch):
+        """Loopback origins keep working even with a public URL declared —
+        both the local SPA and the tunneled origin must be usable."""
+        monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hermes.solobot.cloud")
+        assert (
+            self._ws_reason(
+                "http://localhost:9119",
+                host="127.0.0.1:9119",
+                monkeypatch=monkeypatch,
+            )
+            is None
+        )
+
     def test_rebinding_websocket_host_is_rejected(self, monkeypatch):
         from fastapi.testclient import TestClient
         from starlette.websockets import WebSocketDisconnect

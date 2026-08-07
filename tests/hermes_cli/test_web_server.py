@@ -103,6 +103,7 @@ def _install_example_plugin(_isolate_hermes_home):
     # the static-asset tests; the API auth tests additionally need the
     # route reorder below.
     web_server._dashboard_plugins_cache = None
+    web_server._PLUGIN_API_ROUTES_MOUNTED = False
     web_server._get_dashboard_plugins(force_rescan=True)
     web_server._mount_plugin_api_routes()
 
@@ -129,6 +130,7 @@ def _install_example_plugin(_isolate_hermes_home):
         # cache for the same reason.
         app.router.routes[:] = original_routes
         web_server._dashboard_plugins_cache = None
+        web_server._PLUGIN_API_ROUTES_MOUNTED = False
 
 
 # ---------------------------------------------------------------------------
@@ -3310,6 +3312,37 @@ class TestPluginAPIAuth:
         assert resp.status_code == 401
 
         # With auth: handler runs.
+        resp = self.auth_client.get("/api/plugins/example/hello")
+        assert resp.status_code == 200
+
+    def test_plugin_api_routes_mount_once_per_process(self):
+        """``_mount_plugin_api_routes()`` must be idempotent per process.
+
+        The import-time mount is the only intended registration point; a
+        re-import / repeated invocation must not re-register the plugin
+        routers (duplicate routes, shadowed matches) or repeat the
+        startup INFO log.  See the audit finding "plugin API routes
+        remounted every ~5s continuously — mount once at startup".
+        """
+        import hermes_cli.web_server as web_server
+
+        # The fixture already mounted once (route count includes the
+        # example plugin). Capture the current routes, then invoke the
+        # mount routine again — the once-per-process guard must make it
+        # a no-op.
+        before = list(web_server.app.router.routes)
+        with patch.object(web_server, "_log") as mock_log:
+            web_server._mount_plugin_api_routes()
+        after = list(web_server.app.router.routes)
+        assert after == before
+        # No INFO mount log on the repeat call (guard logs at DEBUG).
+        info_calls = [
+            c for c in mock_log.info.call_args_list
+            if "Mounted plugin API routes" in str(c)
+        ]
+        assert info_calls == []
+        # And the route still resolves — a no-op guard must not have
+        # dropped the already-mounted plugin.
         resp = self.auth_client.get("/api/plugins/example/hello")
         assert resp.status_code == 200
 

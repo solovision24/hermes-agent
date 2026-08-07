@@ -491,6 +491,37 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
+def _declared_public_origin_hosts() -> frozenset:
+    """Host(s) the operator declared as the dashboard's public origin.
+
+    A loopback-bound dashboard exposed through a Cloudflare tunnel / reverse
+    proxy receives WebSocket handshakes whose ``Origin`` header carries the
+    public hostname (e.g. ``https://hermes.solobot.cloud``) while the proxy
+    rewrites only the HTTP ``Host`` header back to the loopback bind.  The
+    DNS-rebinding Host check then passes, but the Origin check would reject
+    the upgrade unless we also accept the declared public host.
+
+    Resolution mirrors the OAuth ``redirect_uri`` seam:
+    ``HERMES_DASHBOARD_PUBLIC_URL`` env, else ``dashboard.public_url`` in
+    config.yaml (see :func:`hermes_cli.dashboard_auth.prefix.resolve_public_url`).
+    Returns an empty set when no public URL is configured — the strict
+    loopback-only origin default (GHSA-ppp5-vxwm-4cf7) is unchanged.
+    """
+    try:
+        from hermes_cli.dashboard_auth.prefix import resolve_public_url
+        url = resolve_public_url()
+    except Exception:
+        return frozenset()
+    if not url:
+        return frozenset()
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return frozenset()
+    host = (parsed.hostname or "").lower()
+    return frozenset({host}) if host else frozenset()
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -14604,9 +14635,20 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
-        return f"origin_mismatch origin={origin} bound={bound_host}"
-    return None
+    if _is_accepted_host(parsed.netloc, bound_host):
+        return None
+
+    # Reverse-proxy / Cloudflare-tunnel deployments: the proxy rewrites the
+    # HTTP Host header back to the loopback bind (so the Host check above
+    # passes) but leaves the browser's Origin untouched — it still carries
+    # the public hostname.  Accept the operator-declared public origin when
+    # one is configured (HERMES_DASHBOARD_PUBLIC_URL / dashboard.public_url).
+    # Opt-in only: with no public URL configured the strict loopback-only
+    # default (GHSA-ppp5-vxwm-4cf7) is byte-for-byte unchanged.
+    origin_host = (parsed.hostname or "").lower()
+    if origin_host and origin_host in _declared_public_origin_hosts():
+        return None
+    return f"origin_mismatch origin={origin} bound={bound_host}"
 
 
 def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
@@ -17166,8 +17208,26 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+# Once-per-process guard for :func:`_mount_plugin_api_routes`.  Set True
+# by the first (import-time) mount so a re-import or repeated invocation
+# can never re-register the plugin routers or spam the startup log.
+# Tests that deliberately re-mount reset this flag alongside
+# ``_dashboard_plugins_cache``.
+_PLUGIN_API_ROUTES_MOUNTED = False
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
+
+    Runs exactly once per process: the module-level call at import time is
+    the only intended mount point.  A re-import / repeated invocation in
+    the same process is a no-op (guarded by ``_PLUGIN_API_ROUTES_MOUNTED``)
+    so routers are never registered twice and the startup log never spams
+    the ``Mounted plugin API routes`` line.  On the SoLo host the dashboard
+    service was restart-looping (systemd ``Restart=always`` +
+    ``RestartSec=5s``, counter 7317) and gui.log accumulated 27,756 mount
+    lines — the guard makes the code honest even when the deployment keeps
+    recycling the process.
 
     Each plugin's ``api`` field points to a Python file that must expose
     a ``router`` (FastAPI APIRouter).  Routes are mounted under
@@ -17187,6 +17247,11 @@ def _mount_plugin_api_routes():
     execution vector that bypasses the user's intent. (#46435,
     GHSA-mcfc-hp25-cjv7)
     """
+    global _PLUGIN_API_ROUTES_MOUNTED
+    if _PLUGIN_API_ROUTES_MOUNTED:
+        _log.debug("Plugin API routes already mounted; skipping re-mount")
+        return
+    _PLUGIN_API_ROUTES_MOUNTED = True
     # Load the enabled/disabled sets once for the loop.
     try:
         from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
