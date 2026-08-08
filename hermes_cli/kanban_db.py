@@ -5504,6 +5504,58 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+_IMPLEMENTATION_LANES = frozenset({"dev", "forge", "quill", "chip"})
+_REVIEW_WAIVER_KEYS = ("review_waiver", "review_waived", "skip_review")
+
+
+def _task_metadata(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    row = conn.execute("SELECT metadata FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row or not row["metadata"]:
+        return None
+    return _decode_task_metadata(row["metadata"])
+
+
+def _metadata_declares_pr(metadata: Optional[dict]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    return any(metadata.get(key) not in (None, "") for key in (
+        "pr_url", "pr", "pr_number", "review_identity", "pull_request",
+    ))
+
+
+def _is_implementation_card(metadata: Optional[dict]) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    lane = str(metadata.get("lane") or "").strip().lower()
+    return (
+        lane in _IMPLEMENTATION_LANES
+        or str(metadata.get("task_type") or "").strip().lower() == "implementation"
+        or bool(metadata.get("coding_agent"))
+    )
+
+
+def _has_review_waiver(metadata: Optional[dict]) -> bool:
+    return isinstance(metadata, dict) and any(metadata.get(key) for key in _REVIEW_WAIVER_KEYS)
+
+
+def _has_review_submitted_event(conn: sqlite3.Connection, task_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_submitted' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
+class ReviewRequiredError(ValueError):
+    def __init__(self, completing_task_id: str):
+        self.completing_task_id = completing_task_id
+        super().__init__(
+            "completion blocked: implementation card declares an open PR but "
+            "was never submitted for review (no review_submitted event). "
+            "Call kanban_submit_review before completing, or pass an explicit "
+            "review_waiver in completion metadata."
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -5574,6 +5626,22 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    task_meta = _task_metadata(conn, task_id)
+    completion_meta = metadata or {}
+    if (
+        _is_implementation_card(task_meta)
+        and (_metadata_declares_pr(completion_meta) or _metadata_declares_pr(task_meta))
+        and not _has_review_submitted_event(conn, task_id)
+        and not (_has_review_waiver(completion_meta) or _has_review_waiver(task_meta))
+    ):
+        with write_txn(conn):
+            _append_event(conn, task_id, "completion_blocked_review_required", {
+                "summary_preview": ((summary or result or "").strip().splitlines()[0][:200]
+                                     if (summary or result) else None),
+                "lane": (task_meta or {}).get("lane"),
+            })
+        raise ReviewRequiredError(task_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
