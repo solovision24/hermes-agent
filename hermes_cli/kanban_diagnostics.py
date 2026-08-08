@@ -1002,6 +1002,52 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _rule_respawn_guarded(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Explain a task intentionally deferred by the respawn guard.
+
+    ``respawn_guarded`` is an operator-visible dispatcher decision, not a
+    worker absence. It must win over the generic stranded-in-ready rule until
+    a later lifecycle transition changes the task's state.
+    """
+    if _task_field(task, "status") not in {"ready", "review"}:
+        return []
+    latest_relevant = None
+    for ev in reversed(events):
+        if _event_kind(ev) in {
+            "commented", "heartbeat", "claim_extended",
+        }:
+            continue
+        latest_relevant = ev
+        break
+    if latest_relevant is None or _event_kind(latest_relevant) != "respawn_guarded":
+        return []
+    payload = _parse_payload(latest_relevant)
+    reason = str(payload.get("reason") or "unknown")
+    lane = str(payload.get("lane") or _task_field(task, "status") or "ready")
+    task_id = _task_field(task, "id") or "<task_id>"
+    return [Diagnostic(
+        kind="respawn_guarded",
+        severity="warning",
+        title=f"Respawn deferred by {reason} guard",
+        detail=(
+            f"The dispatcher intentionally deferred task {task_id!r} in the "
+            f"{lane} lane because its {reason} guard is active. This is not "
+            "evidence that the worker pool is down; inspect the task history "
+            "or resolve the guard condition before forcing another attempt."
+        ),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label=f"Inspect task events: hermes kanban events {task_id}",
+            payload={"command": f"hermes kanban events {task_id}"},
+            suggested=True,
+        )],
+        first_seen_at=_event_ts(latest_relevant),
+        last_seen_at=_event_ts(latest_relevant),
+        count=1,
+        data={"reason": reason, "lane": lane},
+    )]
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
     claiming it.
@@ -1035,6 +1081,14 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     status = _task_field(task, "status")
     if status != "ready":
         return []
+    # A dispatcher guard is an intentional deferral, not a missing worker.
+    # The dedicated respawn_guarded rule reports the actual reason.
+    for ev in reversed(events):
+        if _event_kind(ev) in {"commented", "heartbeat", "claim_extended"}:
+            continue
+        if _event_kind(ev) == "respawn_guarded":
+            return []
+        break
     # Skip tasks with a live claim — they're being worked on, even if
     # the worker hasn't reported progress yet (run-level liveness
     # extends the claim TTL; we don't want to second-guess that here).
@@ -1137,6 +1191,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
+    _rule_respawn_guarded,
     _rule_stranded_in_ready,
 ]
 
@@ -1153,6 +1208,7 @@ DIAGNOSTIC_KINDS = (
     "repeated_crashes",
     "stuck_in_blocked",
     "block_unblock_cycling",
+    "respawn_guarded",
     "stranded_in_ready",
 )
 

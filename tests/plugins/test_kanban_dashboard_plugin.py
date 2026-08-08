@@ -115,6 +115,19 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_body_accepts_lifecycle_metadata():
+    from plugins.kanban.dashboard.plugin_api import CreateTaskBody
+
+    payload = CreateTaskBody(
+        title="repair existing PR",
+        assignee="dev",
+        metadata={kb.EXISTING_PR_REMEDIATION_METADATA_KEY: True},
+    )
+    assert payload.metadata == {
+        kb.EXISTING_PR_REMEDIATION_METADATA_KEY: True
+    }
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -706,5 +719,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

@@ -1264,6 +1264,11 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object, got {type(metadata).__name__}"
+        )
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1319,6 +1324,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
+                metadata=metadata,
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
@@ -2022,6 +2028,15 @@ KANBAN_CREATE_SCHEMA = {
                     "Per-task runtime cap. When exceeded, the "
                     "dispatcher SIGTERMs the worker and re-queues the "
                     "task with outcome='timed_out'."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional task metadata. The narrowly-scoped "
+                    "'remediate_existing_pr': true flag is required when "
+                    "intentionally repairing an existing PR; ordinary "
+                    "implementation tasks remain duplicate-protected."
                 ),
             },
             "initial_status": {
