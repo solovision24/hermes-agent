@@ -4164,6 +4164,19 @@ def _assert_worker_task_ownership(task_id: str) -> None:
         )
 
 
+def _resolve_reviewer(reviewer: Optional[str]) -> str:
+    """Use Orion when installed, otherwise the guaranteed default profile."""
+    if reviewer:
+        return _canonical_assignee(reviewer) or reviewer
+    try:
+        from hermes_cli.profiles import profile_exists
+        if profile_exists(_DEFAULT_REVIEWER):
+            return _DEFAULT_REVIEWER
+    except Exception:
+        pass
+    return "default"
+
+
 def _canonical_review_metadata(metadata: Optional[dict]) -> tuple[dict, str]:
     """Validate immutable PR identity and return its canonical idempotency key."""
     if not isinstance(metadata, dict):
@@ -4906,8 +4919,8 @@ def submit_for_review(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    reviewer: str,
     summary: str,
+    reviewer: Optional[str] = None,
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
@@ -4918,7 +4931,7 @@ def submit_for_review(
     sides of the handoff and preventing the implementation worker from being
     respawned.
     """
-    reviewer = _canonical_assignee(reviewer or _DEFAULT_REVIEWER)
+    reviewer = _resolve_reviewer(reviewer)
     if not reviewer:
         raise ValueError("reviewer is required")
     if not summary or not summary.strip():
@@ -5013,6 +5026,7 @@ def request_review_changes(
     """Return the same card to its implementer for a changes-requested re-review."""
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
+    _assert_worker_task_ownership(task_id)
     with write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None or row["status"] != "running":
@@ -5540,7 +5554,14 @@ def _has_review_waiver(metadata: Optional[dict]) -> bool:
 
 def _has_review_submitted_event(conn: sqlite3.Connection, task_id: str) -> bool:
     return conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_submitted' LIMIT 1",
+        "SELECT 1 FROM task_events submitted "
+        "WHERE submitted.task_id = ? AND submitted.kind = 'review_submitted' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM task_events changes "
+        "WHERE changes.task_id = submitted.task_id "
+        "AND changes.kind = 'review_changes_requested' "
+        "AND changes.id > submitted.id"
+        ") LIMIT 1",
         (task_id,),
     ).fetchone() is not None
 

@@ -634,7 +634,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "summary", nargs="+", help="Review handoff summary (default reviewer: orion)"
     )
     p_submit_review.add_argument(
-        "--reviewer", default="orion", help="Reviewer profile (default: orion)"
+        "--reviewer", default=None, help="Reviewer profile (default: orion when installed, otherwise default)"
     )
     p_submit_review.add_argument("--metadata", default=None, help="JSON evidence object")
 

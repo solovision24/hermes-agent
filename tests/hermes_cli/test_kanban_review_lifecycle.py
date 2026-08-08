@@ -78,6 +78,67 @@ def test_review_changes_returns_same_card_to_implementer(board):
         assert run["ended_at"] is not None
 
 
+def test_review_changes_requires_worker_ownership(board, monkeypatch):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "different-task")
+        with pytest.raises(PermissionError, match="refusing to mutate"):
+            kb.request_review_changes(
+                conn, task_id, summary="must not mutate sibling",
+                expected_run_id=review.current_run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_changes_requested_invalidates_historical_review_submission(board):
+    with board as conn:
+        task_id = kb.create_task(
+            conn, title="implement", assignee="dev",
+            metadata={"lane": "dev", "task_type": "implementation"},
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, task_id, summary="fix it", expected_run_id=review.current_run_id
+        ) == task_id
+        fix = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert fix is not None
+        with pytest.raises(kb.ReviewRequiredError):
+            kb.complete_task(
+                conn, task_id, summary="done", metadata=REVIEW_METADATA,
+                expected_run_id=fix.current_run_id,
+            )
+
+
+def test_default_review_submission_uses_guaranteed_profile(board, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"dev", "default"})
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kb.get_task(conn, task_id).assignee == "default"
+
+
 def test_review_provenance_survives_status_requeue_and_omitted_source_claim(board):
     from plugins.kanban.dashboard.plugin_api import _set_status_direct
 

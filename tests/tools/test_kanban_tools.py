@@ -40,6 +40,17 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     )
 
 
+def test_review_lifecycle_tools_are_registered_and_worker_gated(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from tools.registry import registry
+
+    assert registry.get_toolset_for_tool("kanban_submit_review") == "kanban"
+    assert registry.get_toolset_for_tool("kanban_review_changes") == "kanban"
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    assert kt._check_kanban_mode() is False
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
