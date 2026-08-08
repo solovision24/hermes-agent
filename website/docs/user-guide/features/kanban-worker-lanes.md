@@ -56,22 +56,19 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review-required convention
+## Outputs and the Review lane
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel enforces this distinction for **implementation lanes** (cards whose metadata declares a coding lane — DEV / Quill / Chip / Forge — a `task_type: implementation`, or a `coding_agent`): a card that declares an open PR in its completion handoff metadata (`pr_url` / `pr` / `pr_number` / `review_identity`) **cannot be completed without a `review_submitted` event**. `complete_task` raises a review-required gate error (surfaced as `kanban_complete blocked: ...` in the tool and CLI), emits a `completion_blocked_review_required` audit event, and leaves the task in-flight. The worker must either:
+For code-changing tasks, implementation is handed to an independent reviewer rather than masquerading as a human blocker:
 
-- Call `kanban_submit_review` (or the submit-review path) with the PR evidence — the terminal handoff that moves the card to the Review lane and dispatches the reviewer; or
-- Pass an explicit waiver in the completion metadata (`review_waiver: <reason>` / `review_waived` / `skip_review`) when review is genuinely not applicable.
+- Call `kanban_submit_review(reviewer=..., summary=..., metadata=...)` with the PR identity (`pr_url`, matching `repo`/`number`, and the full immutable `head_sha`), changed files, tests, and other evidence. The reviewer must be a different, spawnable profile from the implementer.
+- The task moves from `running` to `review`, preserving the implementation run and assigning the reviewer. The dispatcher claims review cards separately, so the implementer is not respawned.
+- Native handoff and GitHub webhook ingestion reconcile by `repo/number/head_sha` in either arrival order. A webhook-first card and a native-first card become one active card; implementation runs and events are retained, and webhook replays do not steal an active reviewer claim.
+- For the CLI, use `hermes kanban submit-review <task> <summary words...>` for the default `orion` reviewer. To select another reviewer, use the unambiguous `--reviewer <profile>` flag; the first summary word is never interpreted as a reviewer.
+- A reviewer approves with `kanban_complete(summary=..., metadata={"approved": true, ...})`.
+- A reviewer requesting changes calls `kanban_review_changes(summary=..., metadata=...)`; the review card completes with findings and one idempotent remediation task is created for the original implementer.
+- Use `kanban_block(reason=...)` only for genuine human input, credentials, capability, dependency, or transient failures. Scheduled tasks remain time-gated and distinct from blocked work.
 
-Completed implementation cards that declare PR evidence without a `review_submitted` event are auto-flagged by diagnostics (`completed_without_review`), so operators can route the open PR into review retroactively even if the card predates the gate or was completed through a manual CLI path.
-
-The convention for cards that predate the native review lane (or where no native submit path exists yet):
-
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
-
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks) and the explicit Review-lane handoff.
 
 ## Logs and audit trail
 

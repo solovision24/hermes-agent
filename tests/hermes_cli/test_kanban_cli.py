@@ -58,6 +58,7 @@ def test_ingest_pr_draft_is_triage_and_deduplicated(kanban_home):
     assert first["assignee"] == "orion"
 
 
+
 def test_submit_review_cli_defaults_reviewer_and_requires_metadata(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="dev")
@@ -419,6 +420,7 @@ def test_submit_review_parser_defaults_orion_for_multi_word_summary():
     ])
     assert args.reviewer == "orion"
     assert args.summary == ["PR", "opened", "and", "verified"]
+
 
 
 def test_submit_review_parser_accepts_explicit_reviewer_flag():
