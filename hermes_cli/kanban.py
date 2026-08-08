@@ -400,6 +400,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument(
+        "--metadata",
+        default=None,
+        help="JSON object of task metadata (use remediate_existing_pr=true only for explicit existing-PR remediation)",
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     p_ingest_pr = sub.add_parser(
@@ -1540,6 +1545,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    metadata = None
+    if getattr(args, "metadata", None):
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must be a JSON object", file=sys.stderr)
+            return 2
     try:
         with kb.connect_closing() as conn:
             task_id = kb.create_task(
@@ -1565,6 +1580,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 goal_mode=bool(getattr(args, "goal_mode", False)),
                 goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", "running"),
+                metadata=metadata,
             )
             task = kb.get_task(conn, task_id)
     except (ValueError, RuntimeError) as exc:
@@ -2631,6 +2647,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
+            ],
+            "rate_limited": res.rate_limited,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2658,6 +2679,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    print(f"Guarded:      {len(res.respawn_guarded)}")
+    for tid, reason in res.respawn_guarded:
+        print(f"  - {tid}: {reason}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""

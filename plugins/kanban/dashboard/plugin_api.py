@@ -616,6 +616,10 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Explicit task-scoped lifecycle controls. In particular,
+    # ``remediate_existing_pr: true`` opts an intentional remediation card
+    # into the existing-PR path; ordinary tasks remain duplicate-protected.
+    metadata: Optional[dict[str, Any]] = None
 
 
 @router.post("/tasks")
@@ -644,6 +648,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            metadata=payload.metadata,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -1061,6 +1066,13 @@ def _set_status_direct(
         if prev is None:
             return False
 
+        source_status = (
+            "review"
+            if prev["status"] == "review"
+            or kanban_db._requeue_status(conn, task_id) == "review"
+            else None
+        )
+
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
         # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
@@ -1099,10 +1111,13 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {new_status} (dashboard/direct)",
             )
+        status_payload = {"status": new_status}
+        if source_status is not None:
+            status_payload["source_status"] = source_status
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            (task_id, run_id, json.dumps(status_payload), int(time.time())),
         )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that

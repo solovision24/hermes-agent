@@ -502,6 +502,32 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_dispatch_dry_run_reports_guarded_task_without_mutating(kanban_home, monkeypatch):
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="existing PR", assignee="dev")
+        assert kb.add_comment(
+            conn, task_id, author="worker",
+            body="PR: https://github.com/acme/repo/pull/1",
+        )
+        assert _set_status_direct(conn, task_id, "ready")
+        assert not kb.has_spawnable_ready(conn)
+
+        result = kb.dispatch_once(
+            conn, dry_run=True, spawn_fn=lambda *_args, **_kwargs: pytest.fail("spawned")
+        )
+
+        assert result.spawned == []
+        assert result.respawn_guarded == [(task_id, "active_pr")]
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='respawn_guarded'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
 
 
 

@@ -62,6 +62,23 @@ def _run(outcome="completed", run_id=1, error=None):
     }
 
 
+def test_respawn_guarded_is_reported_instead_of_stranded_ready():
+    now = int(time.time())
+    task = _task(id="t_guarded", status="ready")
+    events = [_event("respawn_guarded", ts=now - 120, reason="active_pr")]
+
+    diags = kd.compute_task_diagnostics(
+        task,
+        events,
+        [],
+        now=now,
+        config={"stranded_threshold_seconds": 60},
+    )
+
+    assert [d.kind for d in diags] == ["respawn_guarded"]
+    assert diags[0].data == {"reason": "active_pr", "lane": "ready"}
+
+
 # ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------

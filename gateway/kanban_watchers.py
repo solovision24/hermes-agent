@@ -1311,6 +1311,7 @@ class GatewayKanbanWatchersMixin:
         def _ready_nonempty() -> bool:
             """Cheap probe: is there at least one ready+assigned+unclaimed
             task on ANY board whose assignee maps to a real Hermes profile
+            and whose respawn guard is not intentionally suppressing it
             (i.e. one the dispatcher would actually spawn for)?
 
             Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
@@ -1473,20 +1474,29 @@ class GatewayKanbanWatchersMixin:
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):
-                        if res is not None and getattr(res, "spawned", None):
-                            any_spawned = True
-                            # Quiet by default — only log when something actually
-                            # happened, so an idle gateway stays silent.
+                        if res is not None and (
+                            getattr(res, "spawned", None)
+                            or getattr(res, "respawn_guarded", None)
+                        ):
+                            guarded = getattr(res, "respawn_guarded", []) or []
+                            if getattr(res, "spawned", None):
+                                any_spawned = True
+                            # A guard is a deliberate dispatcher decision and
+                            # should be visible in gateway diagnostics even
+                            # when it correctly results in zero spawns.
                             logger.info(
-                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                                "kanban dispatcher [%s]: spawned=%d guarded=%d "
+                                "reclaimed=%d crashed=%d timed_out=%d promoted=%d "
+                                "auto_blocked=%d guard_reasons=%s",
                                 slug,
                                 len(res.spawned),
+                                len(guarded),
                                 res.reclaimed,
                                 len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
                                 len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                                sorted({reason for _task_id, reason in guarded}),
                             )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)

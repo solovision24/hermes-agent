@@ -134,6 +134,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# This is deliberately an exact, task-scoped opt-in.  It is the only way an
+# implementation task may bypass the duplicate-PR respawn guard.
+EXISTING_PR_REMEDIATION_METADATA_KEY = "remediate_existing_pr"
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -4564,6 +4568,7 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                source_status = _latest_requeue_source_status(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4591,7 +4596,13 @@ def recompute_ready(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                _append_event(
+                    conn,
+                    task_id,
+                    "promoted",
+                    {"source_status": source_status}
+                    if source_status is not None else None,
+                )
                 promoted += 1
     return promoted
 
@@ -4662,6 +4673,14 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        # A review-origin card can pass through a generic ``ready`` status
+        # during dashboard/manual recovery.  Preserve that lane even when an
+        # older caller omits ``source_status`` from the claim payload.
+        claim_source_status = (
+            source_status
+            if source_status is not None
+            else _latest_requeue_source_status(conn, task_id)
+        )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4689,8 +4708,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4700,6 +4719,8 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps({"source_status": claim_source_status})
+                if claim_source_status is not None else None,
             ),
         )
         run_id = run_cur.lastrowid
@@ -4708,8 +4729,8 @@ def claim_task(
             (run_id, task_id),
         )
         claim_payload = {"lock": lock, "expires": expires, "run_id": run_id}
-        if source_status is not None:
-            claim_payload["source_status"] = source_status
+        if claim_source_status is not None:
+            claim_payload["source_status"] = claim_source_status
             claim_payload["assignee"] = trow["assignee"] if trow else None
         _append_event(conn, task_id, "claimed", claim_payload, run_id=run_id)
         claimed = get_task(conn, task_id)
@@ -4813,6 +4834,30 @@ def claim_review_task(
         return get_task(conn, task_id)
 
 
+def _latest_requeue_source_status(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the lane carried by the latest lifecycle transition.
+
+    Requeue/status writers use ``source_status`` as durable provenance.  The
+    explicit changes-requested event is a lane reset: it hands the card back
+    to implementation, so historical review events must not leak into the
+    next omitted-source claim.
+    """
+    for event in reversed(list_events(conn, task_id)):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.kind == "review_changes_requested":
+            return None
+        if "source_status" in payload:
+            source_status = payload.get("source_status")
+            return str(source_status) if source_status is not None else None
+        if event.kind == "claimed":
+            return None
+        if event.kind == "review_submitted":
+            return "review"
+    return None
+
+
 def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the status a requeued task should land in.
 
@@ -4848,13 +4893,7 @@ def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
             meta = None
         if isinstance(meta, dict) and meta.get("source_status") == "review":
             return "review"
-    for event in reversed(list_events(conn, task_id)):
-        if event.kind == "claimed":
-            payload = event.payload if isinstance(event.payload, dict) else {}
-            return "review" if payload.get("source_status") == "review" else "ready"
-        if event.kind == "review_submitted":
-            return "review"
-    return "ready"
+    return "review" if _latest_requeue_source_status(conn, task_id) == "review" else "ready"
 
 
 def submit_for_review(
@@ -5178,7 +5217,6 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        recovery_status = "review" if _latest_claim_was_review(conn, row["id"]) else "ready"
         with write_txn(conn):
             requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
@@ -5212,6 +5250,8 @@ def release_stale_claims(
                 "heartbeat_stale": bool(heartbeat_stale),
             }
             payload.update(termination)
+            if requeue_status == "review":
+                payload["source_status"] = "review"
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -5249,7 +5289,6 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    recovery_status = "review" if _latest_claim_was_review(conn, task_id) else "ready"
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
@@ -5279,6 +5318,8 @@ def reclaim_task(
             "prev_lock": prev_lock,
         }
         payload.update(termination)
+        if requeue_status == "review":
+            payload["source_status"] = "review"
         _append_event(
             conn, task_id, "reclaimed",
             payload,
@@ -6289,6 +6330,9 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        source_status = (
+            "review" if _requeue_status(conn, task_id) == "review" else None
+        )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -6329,7 +6373,11 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    **({"source_status": source_status} if source_status else {}),
+                }, run_id=run_id,
             )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
@@ -6387,6 +6435,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    **({"source_status": source_status} if source_status else {}),
                 },
                 run_id=run_id,
             )
@@ -6439,7 +6488,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    **({"source_status": source_status} if source_status else {}),
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -6507,6 +6561,10 @@ def promote_task(
     if dry_run:
         return True, None
 
+    source_status = (
+        "review" if _requeue_status(conn, task_id) == "review" else None
+    )
+
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
@@ -6519,7 +6577,12 @@ def promote_task(
             conn,
             task_id,
             "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
+            {
+                "actor": actor,
+                "reason": reason,
+                "forced": force,
+                **({"source_status": source_status} if source_status else {}),
+            },
         )
 
     return True, None
@@ -6596,10 +6659,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
-        )
+        payload = {"status": new_status}
+        if requeue_status == "review":
+            payload["source_status"] = "review"
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
@@ -7340,6 +7403,7 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        source_status = _requeue_status(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -7367,7 +7431,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {"reason": reason}
+        if source_status == "review":
+            payload["source_status"] = "review"
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 
@@ -7915,6 +7982,8 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                if requeue_status == "review":
+                    payload["source_status"] = "review"
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -8048,6 +8117,8 @@ def detect_stale_running(
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
             }
+            if requeue_status == "review":
+                payload["source_status"] = "review"
             payload.update(termination)
 
             run_id = _end_run(
@@ -8499,6 +8570,7 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        source_status = _requeue_status(conn, task_id)
         failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over both caller-supplied and default
@@ -8557,6 +8629,8 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
+            if source_status == "review":
+                payload["source_status"] = "review"
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
@@ -8599,7 +8673,11 @@ def _record_task_failure(
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {
+                        "error": error[:500],
+                        "failures": failures,
+                        **({"source_status": "review"} if source_status == "review" else {}),
+                    },
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
@@ -8669,17 +8747,22 @@ _clear_spawn_failures = _clear_failure_counter
 
 def _latest_claim_was_review(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether the most recent claim came from the review lane."""
-    row = conn.execute(
-        """
-        SELECT json_extract(payload, '$.source_status') AS source_status
-          FROM task_events
-         WHERE task_id = ? AND kind = 'claimed'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (task_id,),
-    ).fetchone()
-    return bool(row and row["source_status"] == "review")
+    return _latest_requeue_source_status(conn, task_id) == "review"
+
+
+def _is_existing_pr_remediation(row: sqlite3.Row) -> bool:
+    """Return whether a task explicitly opts into existing-PR remediation."""
+    raw_metadata = row["metadata"] if "metadata" in row.keys() else None
+    if not raw_metadata:
+        return False
+    try:
+        metadata = json.loads(raw_metadata)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and metadata.get(EXISTING_PR_REMEDIATION_METADATA_KEY) is True
+    )
 
 
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -8731,7 +8814,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT status, last_failure_error FROM tasks WHERE id = ?",
+        "SELECT status, last_failure_error, metadata FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -8820,6 +8903,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
+    # Only an explicit task metadata opt-in may remediate a PR that already
+    # appears in the card's comments. Ordinary implementation work remains
+    # protected by the active-PR guard.
+    existing_pr_remediation = _is_existing_pr_remediation(row)
+
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
@@ -8831,7 +8919,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # duplicate implementation retry.  Only bypass when the review
             # claim is newer than the PR comment, so an ordinary implementation
             # task with an unrelated historical review event remains guarded.
-            if review_claim:
+            if review_claim or existing_pr_remediation:
                 return None
             return "active_pr"
 
@@ -8853,7 +8941,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -8865,7 +8953,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_exists(row["assignee"]) and check_respawn_guard(conn, row["id"]) is None:
             return True
     return False
 
@@ -8884,7 +8972,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     false "no review to spawn" while the card starves invisibly.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND (claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?)",
         (int(time.time()),),
@@ -8896,7 +8984,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_exists(row["assignee"]) and check_respawn_guard(conn, row["id"]) is None:
             return True
     return False
 
