@@ -9017,6 +9017,10 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # appears in the card's comments. Ordinary implementation work remains
     # protected by the active-PR guard.
     existing_pr_remediation = _is_existing_pr_remediation(row)
+    review_changes_requested = any(
+        event.kind == "review_changes_requested"
+        for event in list_events(conn, task_id)
+    )
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
@@ -9029,7 +9033,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # duplicate implementation retry.  Only bypass when the review
             # claim is newer than the PR comment, so an ordinary implementation
             # task with an unrelated historical review event remains guarded.
-            if review_claim or existing_pr_remediation:
+            if review_claim or existing_pr_remediation or review_changes_requested:
                 return None
             return "active_pr"
 

@@ -418,7 +418,9 @@ def test_submit_review_parser_defaults_orion_for_multi_word_summary():
     args = parser.parse_args([
         "kanban", "submit-review", "t_abc12345", "PR", "opened", "and", "verified"
     ])
-    assert args.reviewer == "orion"
+    # The parser leaves reviewer resolution to the database layer, which
+    # selects a guaranteed installed profile (or the configured reviewer).
+    assert args.reviewer is None
     assert args.summary == ["PR", "opened", "and", "verified"]
 
 
