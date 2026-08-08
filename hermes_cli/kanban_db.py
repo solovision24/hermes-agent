@@ -100,7 +100,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked", "review"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "review", "triage"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3212,7 +3212,7 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status in {"blocked", "review"}:
+                if initial_status in {"blocked", "review", "triage"}:
                     task_status = initial_status
                     if parents:
                         missing = _find_missing_parents(conn, parents)

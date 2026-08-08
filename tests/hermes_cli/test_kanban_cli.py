@@ -46,6 +46,18 @@ def test_ingest_pr_clean_is_review_and_deduplicated(kanban_home):
     assert json.loads(row["payload"])["adapter"] == "github_pr_native_ingest"
 
 
+def test_ingest_pr_draft_is_triage_and_deduplicated(kanban_home):
+    args = (
+        "ingest-pr --repository SoLoVisionLLC/SoLoFamilyPlan --number 112 "
+        "--head-sha " + "a" * 40 + " --title 'Draft review' --draft --json"
+    )
+    first = json.loads(kc.run_slash(args))
+    second = json.loads(kc.run_slash(args))
+    assert first["id"] == second["id"]
+    assert first["status"] == "triage"
+    assert first["assignee"] == "orion"
+
+
 def test_submit_review_cli_defaults_reviewer_and_requires_metadata(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="dev")
