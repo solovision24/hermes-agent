@@ -830,6 +830,28 @@ def test_review_lane_worker_can_run_terminal_via_review_identity_metadata(monkey
     assert calls == ["terminal"]
 
 
+def test_verification_capability_cannot_be_bypassed_by_review_lane_heuristic(monkeypatch, tmp_path):
+    _claim_review_lane_task(
+        monkeypatch,
+        tmp_path,
+        title="Review PR #99 authorization boundaries",
+        metadata={"canonical": True, "capability": "verification", "lane": "VERIFICATION"},
+    )
+    calls: list[str] = []
+    registry = _registry(calls, "write_file")
+
+    result = _payload(registry.dispatch(
+        "write_file",
+        {"path": str(tmp_path / "changed.py"), "content": "print(1)"},
+        session_id="review-worker",
+        user_message="Inspect the PR",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert "verification workers are read-only" in result["error"]
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ("name", "args"),
     [

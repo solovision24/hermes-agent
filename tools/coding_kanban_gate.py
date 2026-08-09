@@ -885,6 +885,15 @@ def _canonical_worker_task(task_id: str, *, tool_name: Optional[str] = None):
     run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
     if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
         return task, "worker is not the active dispatcher run for this task"
+    capability = _text(metadata.get("capability") or metadata.get("task_capability")).lower()
+    if capability == "verification":
+        reason = task_capability_preflight(task)
+        if reason:
+            return task, reason
+        allowed, reason = _verification_tool_allowed(tool_name or "", {})
+        if not allowed:
+            return task, reason
+        return task, None
     if tool_name is not None and _task_is_review_lane(task):
         # Review-lane workers are reviewers (e.g. ``orion``), not
         # implementation profiles.  They need the terminal mutations the SDLC
@@ -896,15 +905,6 @@ def _canonical_worker_task(task_id: str, *, tool_name: Optional[str] = None):
             return task, "review-lane workers cannot write implementation code"
         if tool_name in {"delegate_task", "codex_app_server", "project_create", "project_switch"}:
             return task, "review-lane workers cannot start coding work"
-        return task, None
-    metadata = task.metadata if isinstance(task.metadata, dict) else {}
-    if _text(metadata.get("capability") or metadata.get("task_capability")).lower() == "verification":
-        reason = task_capability_preflight(task)
-        if reason:
-            return task, reason
-        allowed, reason = _verification_tool_allowed(tool_name or "", {})
-        if not allowed:
-            return task, reason
         return task, None
     capability_reason = task_capability_preflight(task)
     if capability_reason:
