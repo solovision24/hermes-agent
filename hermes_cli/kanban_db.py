@@ -7632,6 +7632,11 @@ class DispatchResult:
     """Ready/review task ids with legacy unresolved assignees."""
     invalid_assignee_diagnostics: dict[str, str] = field(default_factory=dict)
     """Actionable diagnostics keyed by legacy task id."""
+    preflight_blocked: list[str] = field(default_factory=list)
+    """Tasks blocked before claim because their capability/lane contract is
+    missing or incompatible with the assigned profile."""
+    capability_diagnostics: dict[str, str] = field(default_factory=dict)
+    """Actionable capability preflight reasons keyed by task id."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9362,6 +9367,25 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Validate the capability/lane contract before claiming or spawning.
+        # This prevents an Orion verification task from entering a worker
+        # that can only satisfy the implementation lane's tool gate.
+        try:
+            from tools.coding_kanban_gate import task_capability_preflight
+            capability_reason = task_capability_preflight(get_task(conn, row["id"]))
+        except Exception as exc:
+            capability_reason = f"capability preflight unavailable: {exc}"
+        if capability_reason:
+            result.preflight_blocked.append(row["id"])
+            result.capability_diagnostics[row["id"]] = capability_reason
+            if not dry_run:
+                block_task(
+                    conn,
+                    row["id"],
+                    reason=f"pre-dispatch capability blocker: {capability_reason}",
+                    kind="capability",
+                )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a

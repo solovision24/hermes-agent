@@ -29,6 +29,8 @@ CODING_TOOLS = frozenset({
 })
 CANONICAL_ASSIGNEE = "dev"
 IMPLEMENTATION_ASSIGNEES = frozenset({"dev", "forge", "quill", "chip"})
+VERIFICATION_ASSIGNEES = frozenset({"orion"})
+TASK_CAPABILITIES = frozenset({"implementation", "review", "verification"})
 SUPPORTED_CODING_AGENTS = frozenset({"codex", "cursor"})
 ACTIVE_TASK_STATUSES = frozenset({"todo", "ready", "running", "review"})
 
@@ -748,6 +750,7 @@ def _metadata(*, agent: str, session_id: str, message_id: str, scope: str, repos
     return {
         "canonical": True,
         "lane": "DEV",
+        "capability": "implementation",
         "coding_agent": agent,
         "origin": {"session_id": session_id, "message_id": message_id},
         "scope": scope,
@@ -769,6 +772,55 @@ def _worker_refusal(tool_name: str, task_id: str, reason: str) -> str:
         tool_name=tool_name,
         task_id=task_id,
     )
+
+
+def task_capability_preflight(task) -> Optional[str]:
+    """Validate the task capability/lane contract before worker spawn."""
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    assignee = _text(getattr(task, "assignee", "")).lower()
+    capability = _text(metadata.get("capability") or metadata.get("task_capability")).lower()
+    lane = _text(metadata.get("lane")).lower()
+    if getattr(task, "status", None) not in ACTIVE_TASK_STATUSES:
+        return f"task status is {getattr(task, 'status', None)!r}"
+    if capability and capability not in TASK_CAPABILITIES:
+        return f"unsupported task capability {capability!r}; expected one of {sorted(TASK_CAPABILITIES)}"
+    if not capability:
+        expected_lane = "dev" if assignee == "dev" else assignee
+        if assignee in IMPLEMENTATION_ASSIGNEES and metadata.get("canonical") is True and lane in {expected_lane, "engineering"}:
+            return None
+        if assignee == "orion":
+            return "missing task capability metadata; declare capability='verification' or capability='review' before dispatch"
+        return "missing task capability metadata; declare implementation, review, or verification before dispatch"
+    if capability == "implementation":
+        if assignee not in IMPLEMENTATION_ASSIGNEES:
+            return "implementation capability requires assignee dev, forge, quill, or chip"
+        expected_lane = "dev" if assignee == "dev" else assignee
+        if metadata.get("canonical") is not True or lane not in {expected_lane, "engineering"}:
+            return "implementation capability requires canonical DEV/ENGINEERING lane metadata"
+    elif capability == "verification":
+        if assignee not in VERIFICATION_ASSIGNEES:
+            return "verification capability requires assignee orion"
+        if metadata.get("canonical") is not True or lane != "verification":
+            return "verification capability requires canonical VERIFICATION lane metadata"
+    elif capability == "review" and assignee != "orion":
+        return "review capability requires assignee orion"
+    return None
+
+
+def _verification_tool_allowed(tool_name: str, function_args: dict) -> tuple[bool, str]:
+    """Keep Orion verification strictly read-only at the tool boundary."""
+    if tool_name in {"write_file", "patch", "delegate_task", "codex_app_server", "project_create", "project_switch"}:
+        return False, "verification workers are read-only and cannot write or start coding work"
+    if tool_name == "terminal":
+        command = _text(function_args.get("command"))
+        if command and not all(_simple_command_is_read_only(part) for part in _command_parts(command)):
+            return False, "verification terminal commands must be read-only"
+    if tool_name == "execute_code":
+        code = _text(function_args.get("code") or function_args.get("command"))
+        masked = _QUOTED_REGION_RE.sub(" ", code)
+        if _INTERPRETER_WRITE_RE.search(code) or _WRITE_MARKERS.search(masked):
+            return False, "verification execute_code must be read-only"
+    return True, ""
 
 
 def _task_is_review_lane(task) -> bool:
@@ -845,6 +897,18 @@ def _canonical_worker_task(task_id: str, *, tool_name: Optional[str] = None):
         if tool_name in {"delegate_task", "codex_app_server", "project_create", "project_switch"}:
             return task, "review-lane workers cannot start coding work"
         return task, None
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    if _text(metadata.get("capability") or metadata.get("task_capability")).lower() == "verification":
+        reason = task_capability_preflight(task)
+        if reason:
+            return task, reason
+        allowed, reason = _verification_tool_allowed(tool_name or "", {})
+        if not allowed:
+            return task, reason
+        return task, None
+    capability_reason = task_capability_preflight(task)
+    if capability_reason:
+        return task, capability_reason
     if task.assignee not in IMPLEMENTATION_ASSIGNEES:
         return task, "task is not assigned to a validated implementation profile"
     if task.status not in ACTIVE_TASK_STATUSES:
@@ -1044,6 +1108,10 @@ def coding_tool_gate_refusal(
         worker_agent = _text(os.environ.get("HERMES_CODING_AGENT"))
         if worker_agent and worker_agent.casefold() not in SUPPORTED_CODING_AGENTS:
             return _worker_refusal(tool_name, worker_id, "the worker provider is not supported")
+        if task is not None and isinstance(task.metadata, dict) and _text(task.metadata.get("capability")).lower() == "verification":
+            allowed, reason = _verification_tool_allowed(tool_name, args)
+            if not allowed:
+                return _worker_refusal(tool_name, worker_id, reason)
         return None
 
     # Kill-switch: when the gate is disabled, do not intercept chat/cron

@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from tools.registry import ToolRegistry
-from tools.coding_kanban_gate import coding_tool_gate_refusal, is_coding_intent
+from tools.coding_kanban_gate import (
+    _verification_tool_allowed,
+    coding_tool_gate_refusal,
+    is_coding_intent,
+    task_capability_preflight,
+)
 
 
 def _registry(calls: list[str], *names: str) -> ToolRegistry:
@@ -1188,3 +1194,51 @@ def test_kill_switch_unset_preserves_existing_behavior(monkeypatch, tmp_path):
     assert result["status"] == "ready"
     assert result["assignee"] == "dev"
     assert calls == []
+
+
+def _capability_task(assignee="orion", capability="verification", lane="VERIFICATION", **metadata):
+    return SimpleNamespace(
+        assignee=assignee,
+        status="ready",
+        metadata={"canonical": True, "capability": capability, "lane": lane, **metadata},
+    )
+
+
+def test_orion_verification_contract_allows_read_only_tools():
+    assert task_capability_preflight(_capability_task()) is None
+    assert _verification_tool_allowed("terminal", {"command": "git status --short"}) == (True, "")
+    assert _verification_tool_allowed("execute_code", {"code": "print(2 + 2)"}) == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("write_file", {"path": "src/x.py", "content": "x"}),
+        ("patch", {"path": "src/x.py"}),
+        ("terminal", {"command": "git commit -am change"}),
+        ("execute_code", {"code": "open('x', 'w').write('x')"}),
+    ],
+)
+def test_orion_verification_contract_denies_writes(tool_name, args):
+    allowed, reason = _verification_tool_allowed(tool_name, args)
+    assert allowed is False
+    assert reason
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        (_capability_task(capability=None), "missing task capability"),
+        (_capability_task(capability="bogus"), "unsupported task capability"),
+        (_capability_task(assignee="dev", capability="verification"), "requires assignee orion"),
+    ],
+)
+def test_malformed_capability_metadata_is_rejected_before_spawn(task, expected):
+    reason = task_capability_preflight(task)
+    assert reason is not None
+    assert expected in reason
+
+
+def test_native_review_contract_remains_separate_from_verification():
+    assert task_capability_preflight(_capability_task(capability="review", lane="REVIEW")) is None
+    assert task_capability_preflight(_capability_task(assignee="dev", capability="implementation", lane="DEV")) is None
