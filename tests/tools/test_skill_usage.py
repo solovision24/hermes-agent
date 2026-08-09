@@ -92,6 +92,21 @@ def test_load_usage_handles_corrupt_file(skills_home):
     assert load_usage() == {}
 
 
+def test_load_usage_handles_non_utf8_bytes(skills_home):
+    """Non-UTF-8 bytes must degrade to {} — never raise UnicodeDecodeError.
+
+    Regression for the ~/.hermes/skills/.usage.json corruption that crashed
+    every background curator write guard with 'owned skill guard lookup
+    failed' (UnicodeDecodeError escaped load_usage because it is a ValueError
+    sibling, not OSError/JSONDecodeError, so the handler never caught it).
+    """
+    from tools.skill_usage import load_usage, _usage_file
+    # Valid JSON prefix followed by binary garbage at byte 803 — the exact
+    # shape of the 2026-08-06 production corruption.
+    _usage_file().write_bytes(b'{"a": {"use_count": 1}}\x00\x1f_\xde\x00\x00\x00')
+    assert load_usage() == {}
+
+
 # ---------------------------------------------------------------------------
 # Counter bumps
 # ---------------------------------------------------------------------------

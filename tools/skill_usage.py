@@ -663,7 +663,16 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # Tolerate non-UTF-8 bytes: a corrupt or partially-overwritten file
+        # must degrade to {} (fail soft) instead of raising UnicodeDecodeError,
+        # which is a ValueError sibling NOT caught by the handler below. The
+        # UnicodeDecodeError escapes and crashes every background curator
+        # write guard ("owned skill guard lookup failed"), bricking autonomous
+        # skill maintenance until a human repairs the file by hand. errors=
+        # "replace" turns the offending byte into U+FFFD; json.loads then
+        # raises JSONDecodeError (caught below) for structural corruption, so
+        # the file resolves to {} exactly as the docstring promises.
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except (OSError, json.JSONDecodeError) as e:
         logger.debug("Failed to read %s: %s", path, e)
         return {}
