@@ -56,15 +56,15 @@ Hermes Kanban 拥有生命周期的真实状态——`ready` → `running` → `
 
 kanban 内核强制要求每次运行恰好由其中一项终止。既未调用任何终止工具又正常退出的 worker 将被视为崩溃。
 
-## 输出与 review-required 约定
+## 输出与原生 Review 流程
 
-对于大多数涉及代码变更的任务，worker 完成的那一刻并不意味着真正*完成*——还需要人工审查。kanban 内核不强制执行这一区分（"涉及代码变更的任务"定义模糊，且在每个代码 worker 上强制 block 而非 complete 会破坏不需要审查的流程）。这是叠加在上层的约定：
+代码变更在合并前可能需要人工审查。Kanban 内核将完成、阻塞和原生 Review 流程分开处理：
 
-- **使用 block 而非 complete**，`reason` 以 `review-required: ` 为前缀，使仪表板 / `hermes kanban show` 将该行显示为等待审查。
-- **先将结构化元数据写入 `kanban_comment`**，因为 `kanban_block` 只携带人类可读的 `reason`。Comment 是持久的注解通道——所有与审计相关的字段（changed_files、tests_run、diff_path 或 PR url、决策记录）都应放在这里。
-- **Reviewer 批准并解除阻塞**，这将重新生成 worker 并附带 comment 线程用于后续跟进；或通过另一条 comment 要求修改，下一次 worker 运行时将通过 `kanban_show` 的上下文看到这些内容。
+- **使用带结构化元数据的 complete**，记录变更文件、测试和 PR 或 diff 证据。
+- **仅在确实需要人工输入时使用 `kanban_block`**；它不是 Review 队列。
+- **通过原生 Kanban Review 流程路由代码变更**，由 Orion 批准实现，或通过同一 PR 流程要求修复。
 
-自动注入的 `KANBAN_GUIDANCE` 同时涵盖 `kanban_complete`（真正终态的任务——拼写修复、文档变更、研究报告）和 `review-required` block 模式。
+自动注入的 `KANBAN_GUIDANCE` 涵盖已完成工作的 `kanban_complete` 和真实阻塞的 `kanban_block`；人工审查由原生 Review 流程处理。
 
 ## 日志与审计追踪
 

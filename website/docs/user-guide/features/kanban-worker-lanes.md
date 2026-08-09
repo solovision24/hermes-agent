@@ -56,15 +56,15 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
-## Outputs and the review-required convention
+## Outputs and the native Review lifecycle
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+Code-changing work may need human review before merge. The Kanban kernel keeps completion and blocking separate from the native Review lifecycle:
 
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
+- **Complete the implementation with structured metadata** describing changed files, tests, and the PR or diff evidence.
+- **Use `kanban_block` only for a genuine blocker** that requires human input; it is not a review queue.
+- **Route code changes through native Kanban Review**, where Orion can approve the implementation or request remediation through the same PR lifecycle.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+The injected `KANBAN_GUIDANCE` covers `kanban_complete` for completed work and `kanban_block` for genuine blockers; human review is handled by the native Review lifecycle.
 
 ## Logs and audit trail
 

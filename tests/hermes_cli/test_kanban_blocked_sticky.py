@@ -2,8 +2,8 @@
 worker-initiated ``kanban_block`` (sticky blocks), but must keep
 auto-recovering circuit-breaker blocks.
 
-The bug: when a worker called ``kanban_block(reason="review-required:
-...")`` to hand off to a human, the dispatcher's ``recompute_ready``
+The bug: when a worker called ``kanban_block(reason="需要人工处理")``
+to hand off to a human, the dispatcher's ``recompute_ready``
 would promote the task back to ``ready`` on the next tick.  The fresh
 worker found nothing to do (work already applied), exited cleanly, and
 got recorded as a ``protocol_violation`` → ``gave_up`` → promote → loop
@@ -54,7 +54,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path) -> None:
-    """A standalone task that a worker explicitly blocks for review
+    """A standalone task that a worker explicitly blocks for human input
     must stay blocked across an arbitrary number of dispatcher ticks.
     Before #28712's fix, ``recompute_ready`` would silently flip it
     back to ``ready`` on the very next tick."""
@@ -63,7 +63,7 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,
-            reason="review-required: please verify ACL change",
+            reason="please verify ACL change",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"
@@ -120,7 +120,7 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,
-            reason="review-required: human eyes please",
+            reason="human eyes please",
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"

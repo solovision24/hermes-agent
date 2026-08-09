@@ -4151,7 +4151,7 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     A ``blocked`` status can come from two very different sources:
 
     * **Worker- or operator-initiated** — a worker called
-      ``kanban_block(reason="review-required: ...")`` (or somebody ran
+      ``kanban_block(reason="human input required")`` (or somebody ran
       ``hermes kanban block <id>``).  This is a deliberate handoff that
       should stay blocked until an operator unblocks it.  The block tool
       emits a ``"blocked"`` event row in ``task_events``.
