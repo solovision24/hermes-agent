@@ -32,6 +32,17 @@ def _payload(result):
     return json.loads(result)
 
 
+def test_legacy_task_without_capability_metadata_remains_dispatchable():
+    task = type("Task", (), {"status": "ready", "assignee": "dev", "metadata": {}})()
+    assert task_capability_preflight(task) is None
+
+
+@pytest.mark.parametrize("metadata", [{"capability": ""}, {"capability": "bogus"}])
+def test_explicit_malformed_capability_metadata_fails_closed(metadata):
+    task = type("Task", (), {"status": "ready", "assignee": "dev", "metadata": metadata})()
+    assert task_capability_preflight(task)
+
+
 def _declare_profile(tmp_path, name: str) -> None:
     """Declare a real on-disk profile in the temp HERMES_HOME.
 

@@ -778,19 +778,23 @@ def task_capability_preflight(task) -> Optional[str]:
     """Validate the task capability/lane contract before worker spawn."""
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
     assignee = _text(getattr(task, "assignee", "")).lower()
-    capability = _text(metadata.get("capability") or metadata.get("task_capability")).lower()
+    capability_key = next(
+        (key for key in ("capability", "task_capability") if key in metadata),
+        None,
+    )
+    capability = _text(metadata.get(capability_key)).lower() if capability_key else ""
     lane = _text(metadata.get("lane")).lower()
     if getattr(task, "status", None) not in ACTIVE_TASK_STATUSES:
         return f"task status is {getattr(task, 'status', None)!r}"
+    # Tasks created before capability routing was introduced intentionally have
+    # no capability key. Keep those legacy cards dispatchable; only validate the
+    # contract when a caller explicitly supplied capability metadata.
+    if capability_key is None:
+        return None
+    if not capability:
+        return "missing task capability metadata; capability must name implementation, review, or verification"
     if capability and capability not in TASK_CAPABILITIES:
         return f"unsupported task capability {capability!r}; expected one of {sorted(TASK_CAPABILITIES)}"
-    if not capability:
-        expected_lane = "dev" if assignee == "dev" else assignee
-        if assignee in IMPLEMENTATION_ASSIGNEES and metadata.get("canonical") is True and lane in {expected_lane, "engineering"}:
-            return None
-        if assignee == "orion":
-            return "missing task capability metadata; declare capability='verification' or capability='review' before dispatch"
-        return "missing task capability metadata; declare implementation, review, or verification before dispatch"
     if capability == "implementation":
         if assignee not in IMPLEMENTATION_ASSIGNEES:
             return "implementation capability requires assignee dev, forge, quill, or chip"
