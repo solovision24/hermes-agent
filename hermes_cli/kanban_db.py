@@ -4379,10 +4379,11 @@ def ingest_pull_request(
         "draft": draft, "checks_passed": checks_passed, "mergeable": mergeable,
         "action": action, "metadata": metadata or {},
     }
+    details_json = json.dumps(details, ensure_ascii=False)
     desired_title = f"Review PR #{pr_number}: {title}"
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, idempotency_key, status, title, body, assignee, current_run_id "
+            "SELECT id, idempotency_key, status, title, body, assignee, current_run_id, metadata "
             "FROM tasks WHERE substr(idempotency_key, 1, length(?)) = ? ORDER BY created_at ASC",
             (key_prefix, key_prefix),
         ).fetchall()
@@ -4421,44 +4422,63 @@ def ingest_pull_request(
                 )
             task_id = str(same_head["id"])
             conn.execute(
-                "UPDATE tasks SET title=?, body=?, assignee=?, status=?, "
+                "UPDATE tasks SET title=?, body=?, assignee=?, status=?, metadata=?, "
                 "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
                 "current_run_id=NULL, started_at=NULL, completed_at=NULL, result=NULL, "
                 "consecutive_failures=0, last_failure_error=NULL WHERE id=?",
-                (desired_title, body, desired_assignee, status, task_id),
+                (desired_title, body, desired_assignee, status, details_json, task_id),
             )
             _append_event(conn, task_id, "github_pr_reopened", details)
             return task_id
 
         if same_head and same_head["status"] != "archived":
             task_id = str(same_head["id"])
+            existing_metadata = {}
+            if same_head["metadata"]:
+                try:
+                    existing_metadata = json.loads(same_head["metadata"])
+                except (TypeError, ValueError):
+                    pass
+            same_head_is_github = existing_metadata.get("source") == "github_pull_request"
             if action == "reopened" and same_head["status"] == "done":
                 conn.execute(
-                    "UPDATE tasks SET title=?, body=?, assignee=?, status='review', "
+                    "UPDATE tasks SET title=?, body=?, assignee=?, status='review', metadata=?, "
                     "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
                     "current_run_id=NULL, completed_at=NULL, result=NULL, "
                     "consecutive_failures=0, last_failure_error=NULL WHERE id=?",
-                    (desired_title, body, desired_assignee, task_id),
+                    (desired_title, body, desired_assignee, details_json, task_id),
                 )
                 _append_event(conn, task_id, "github_pr_reopened", details)
                 return task_id
             # A replay must never steal a reviewer claim or downgrade a card.
             if same_head["status"] in {"running", "review", "done"}:
-                if same_head["title"] != desired_title or same_head["body"] != body:
+                if same_head_is_github and same_head["status"] != "running":
                     conn.execute(
-                        "UPDATE tasks SET title=?, body=? WHERE id=?",
-                        (desired_title, body, task_id),
+                        "UPDATE tasks SET title=?, body=?, assignee=?, status=?, metadata=? WHERE id=?",
+                        (desired_title, body, desired_assignee, status, details_json, task_id),
+                    )
+                    _append_event(conn, task_id, "github_pr_ingested", details)
+                    return task_id
+                if (
+                    same_head["title"] != desired_title
+                    or same_head["body"] != body
+                    or same_head["metadata"] != details_json
+                ):
+                    conn.execute(
+                        "UPDATE tasks SET title=?, body=?, metadata=? WHERE id=?",
+                        (desired_title, body, details_json, task_id),
                     )
                     _append_event(conn, task_id, "github_pr_metadata_updated", details)
                 return task_id
             if (
                 same_head["title"] == desired_title and same_head["body"] == body
                 and same_head["assignee"] == desired_assignee and same_head["status"] == status
+                and same_head["metadata"] == details_json
             ):
                 return task_id
             conn.execute(
-                "UPDATE tasks SET title=?, body=?, assignee=?, status=? WHERE id=?",
-                (desired_title, body, desired_assignee, status, task_id),
+                "UPDATE tasks SET title=?, body=?, assignee=?, status=?, metadata=? WHERE id=?",
+                (desired_title, body, desired_assignee, status, details_json, task_id),
             )
             _append_event(conn, task_id, "github_pr_ingested", details)
             return task_id

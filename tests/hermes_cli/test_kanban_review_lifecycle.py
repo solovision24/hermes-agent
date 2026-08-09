@@ -477,3 +477,68 @@ def test_review_approval_preserves_proof_and_scheduled_is_not_dispatchable(board
         assert kb.schedule_task(conn, scheduled_id, reason="wait for release")
         assert kb.claim_task(conn, scheduled_id) is None
         assert kb.get_task(conn, scheduled_id).status == "scheduled"
+
+
+def test_webhook_same_head_refreshes_live_metadata_and_status(board):
+    with board as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="acme/repo", number=112, head_sha="d" * 40,
+            title="Draft PR", draft=True, reviewer="reviewer",
+        )
+        assert kb.get_task(conn, task_id).metadata["draft"] is True
+
+        promoted_id = kb.ingest_pull_request(
+            conn, repository="ACME/REPO", number=112, head_sha="D" * 40,
+            title="Promoted PR", draft=False, mergeable=True, reviewer="reviewer",
+        )
+        assert promoted_id == task_id
+        promoted = kb.get_task(conn, task_id)
+        assert promoted.status == "review"
+        assert promoted.title == "Review PR #112: Promoted PR"
+        assert promoted.metadata["draft"] is False
+        assert promoted.metadata["mergeable"] is True
+        assert promoted.metadata["head_sha"] == "d" * 40
+
+        blocked_id = kb.ingest_pull_request(
+            conn, repository="acme/repo", number=112, head_sha="d" * 40,
+            title="Promoted PR", draft=False, mergeable=False, reviewer="reviewer",
+        )
+        assert blocked_id == task_id
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.get_task(conn, task_id).metadata["mergeable"] is False
+
+
+def test_webhook_same_head_replay_is_idempotent_after_metadata_refresh(board):
+    with board as conn:
+        kwargs = dict(
+            repository="acme/repo", number=66, head_sha="e" * 40,
+            title="Stable PR", draft=False, mergeable=False, reviewer="reviewer",
+        )
+        task_id = kb.ingest_pull_request(conn, **kwargs)
+        before_events = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()["n"]
+        assert kb.ingest_pull_request(conn, **kwargs) == task_id
+        after_events = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()["n"]
+        assert after_events == before_events
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
+
+
+def test_webhook_closed_and_merged_archive_same_head_cards(board):
+    with board as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="acme/repo", number=70, head_sha="f" * 40,
+            title="Closed PR", reviewer="reviewer",
+        )
+        assert kb.ingest_pull_request(
+            conn, repository="acme/repo", number=70, head_sha="f" * 40,
+            title="Closed PR", action="closed", reviewer="reviewer",
+        ) == task_id
+        assert kb.get_task(conn, task_id).status == "archived"
+        assert kb.ingest_pull_request(
+            conn, repository="acme/repo", number=70, head_sha="f" * 40,
+            title="Closed PR", action="merged", reviewer="reviewer",
+        ) == task_id
+        assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 1
