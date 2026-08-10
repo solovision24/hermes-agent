@@ -20,13 +20,14 @@ def test_workflow_configuration_routes_default_to_forge_or_dev(monkeypatch):
     assert metadata["use_coding_router"] is True
 
 
-def test_workflow_configuration_rejects_direct_coding_agent(monkeypatch):
+@pytest.mark.parametrize("invalid_agent", ["direct", "bogus", "DEV"])
+def test_workflow_configuration_rejects_invalid_coding_agent(monkeypatch, invalid_agent):
     from hermes_cli import kanban_intake
     monkeypatch.setattr(kanban_intake, "_profile_exists", lambda name: name == "dev")
-    with pytest.raises(ValueError, match="coding_agent=direct"):
+    with pytest.raises(ValueError, match="coding_agent="):
         kanban_intake.preflight_workflow_configuration(
             task_type="workflow_configuration", assignee="default",
-            metadata={"coding_agent": "direct"},
+            metadata={"coding_agent": invalid_agent},
         )
 
 
@@ -65,7 +66,7 @@ def test_create_task_normalizes_before_insert_and_rejects_invalid_metadata(tmp_p
         assert task.assignee == "forge"
         assert task.metadata["canonical"] is True
         assert task.metadata["coding_agent"] == "codex"
-        with pytest.raises(ValueError, match="coding_agent=direct"):
+        with pytest.raises(ValueError, match="coding_agent=.*direct"):
             kb.create_task(
                 conn,
                 title="invalid workflow config",

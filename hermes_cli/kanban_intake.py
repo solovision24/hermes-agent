@@ -45,10 +45,10 @@ def preflight_workflow_configuration(*, task_type: Optional[str], assignee: Opti
         return assignee, metadata
     raw = dict(metadata or {})
     coding_agent = raw.get("coding_agent")
-    if coding_agent == "direct":
+    if coding_agent not in (None, "", "codex", "cursor"):
         raise WorkflowConfigurationIntakeError(
-            "invalid workflow_configuration metadata: coding_agent=direct is not allowed; "
-            "use coding_agent=codex (or explicitly cursor), or declare route=dev_direct "
+            f"invalid workflow_configuration metadata: coding_agent={coding_agent!r} is not "
+            "allowed; use coding_agent=codex (or explicitly cursor), or declare route=dev_direct "
             "with use_coding_router=false and omit coding_agent"
         )
     if requested_agent is not None and requested_agent not in {"codex", "cursor"}:
@@ -59,7 +59,7 @@ def preflight_workflow_configuration(*, task_type: Optional[str], assignee: Opti
         raise WorkflowConfigurationIntakeError(
             "invalid workflow_configuration route: dev_direct requires use_coding_router=false"
         )
-    if raw.get("use_coding_router") is False and coding_agent not in (None, ""):
+    if raw.get("use_coding_router") is False and coding_agent is not None:
         raise WorkflowConfigurationIntakeError(
             "invalid workflow_configuration metadata: direct execution must omit coding_agent "
             "(coding_agent=direct is never valid)"
