@@ -226,7 +226,13 @@ def _rule_invalid_assignee(task, events, runs, now, cfg) -> list[Diagnostic]:
     assignee = _task_field(task, "assignee")
     if not assignee:
         return []
-    from hermes_cli.kanban_assignees import InvalidAssigneeError, resolve_assignee
+    from hermes_cli.kanban_assignees import (
+        InvalidAssigneeError,
+        has_configured_assignee_targets,
+        resolve_assignee,
+    )
+    if not has_configured_assignee_targets():
+        return []
     try:
         resolve_assignee(assignee, allow_unassigned=False)
     except InvalidAssigneeError as exc:

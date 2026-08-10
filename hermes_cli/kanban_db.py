@@ -4960,9 +4960,13 @@ def submit_for_review(
     try:
         from hermes_cli.profiles import profile_exists
     except Exception as exc:
-        raise ValueError(f"reviewer profile {reviewer!r} cannot be resolved") from exc
+        raise ValueError(
+            f"reviewer {reviewer!r} does not resolve to an on-disk Hermes profile"
+        ) from exc
     if not profile_exists(reviewer):
-        raise ValueError(f"reviewer profile {reviewer!r} does not exist")
+        raise ValueError(
+            f"reviewer {reviewer!r} does not resolve to an on-disk Hermes profile"
+        )
     _assert_worker_task_ownership(task_id)
     with write_txn(conn):
         row = conn.execute(
@@ -9387,6 +9391,16 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Surface duplicate-PR protection before capability preflight. A
+        # recoverable active-PR guard must be observable in dispatch results,
+        # not silently swallowed as an unrelated capability skip.
+        guard_reason = check_respawn_guard(conn, row["id"])
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(conn, row["id"], "respawn_guarded", {"reason": guard_reason})
+            continue
         # Validate the capability/lane contract before claiming or spawning.
         # This prevents an Orion verification task from entering a worker
         # that can only satisfy the implementation lane's tool gate.
@@ -9416,14 +9430,20 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        from hermes_cli.kanban_assignees import AssigneeResolver, InvalidAssigneeError
-        try:
-            resolved = AssigneeResolver().resolve(row_assignee, allow_unassigned=False)
-        except InvalidAssigneeError as exc:
-            result.skipped_invalid_assignee.append(row["id"])
-            result.invalid_assignee_diagnostics[row["id"]] = str(exc)
-            continue
-        if not resolved.spawnable:
+        from hermes_cli.kanban_assignees import (
+            AssigneeResolver,
+            InvalidAssigneeError,
+            has_configured_assignee_targets,
+        )
+        resolved = None
+        if has_configured_assignee_targets():
+            try:
+                resolved = AssigneeResolver().resolve(row_assignee, allow_unassigned=False)
+            except InvalidAssigneeError as exc:
+                result.skipped_invalid_assignee.append(row["id"])
+                result.invalid_assignee_diagnostics[row["id"]] = str(exc)
+                continue
+        if resolved is not None and not resolved.spawnable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
