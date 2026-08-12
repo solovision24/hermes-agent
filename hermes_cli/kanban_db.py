@@ -91,6 +91,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+from agent.redact import redact_sensitive_text
 
 _log = logging.getLogger(__name__)
 
@@ -284,6 +285,90 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # conventional "temporary failure, retry later" code, and well clear of the
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
+# Distinct worker-boundary sentinels for provider initialization failures.
+# These are intentionally separate from generic crashes so the dispatcher can
+# park provider health problems without calling them worker protocol failures.
+KANBAN_AUTH_EXIT_CODE = 76
+KANBAN_BILLING_EXIT_CODE = 77
+
+
+def write_worker_provider_failure(
+    *,
+    failure_reason: str,
+    error: str,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Persist a bounded provider failure for the dispatcher boundary.
+
+    The worker's exit status only carries a category.  Keep the redacted
+    provider summary beside the worker log so the parent dispatcher can retain
+    the actual exhausted chain without relying on inherited process state.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return None
+    root = os.environ.get("HERMES_KANBAN_LOG_DIR", "").strip()
+    if not root:
+        return None
+    path = Path(root) / f"{task_id}.provider.json"
+    # This is a durable control-plane boundary.  It must redact regardless of
+    # the user's normal logging preference, and before truncation so a secret
+    # cannot be preserved by a shortened prefix/suffix.
+    def _safe(value: object, limit: int) -> str:
+        try:
+            original = str(value)
+            # Force-redaction's prefix matcher intentionally requires a token
+            # boundary; provider/model labels can embed a key after a hyphen.
+            # Catch that durable-boundary case before the general redactor.
+            original = re.sub(
+                r"(?i)sk-[A-Za-z0-9_-]{8,}", "«redacted-secret»", original
+            )
+            # Provider failures are control-plane egress, not file content:
+            # retain the full mandatory redaction set, including ENV and JSON
+            # credential fields.
+            return redact_sensitive_text(
+                original,
+                force=True,
+                redact_url_credentials=True,
+            )[:limit]
+        except Exception:
+            return "«redacted-provider-failure»"
+
+    payload = {
+        "failure_reason": _safe(failure_reason, 64),
+        "error": _safe(error, 500),
+        "provider": _safe(provider or "configured provider", 100),
+        "model": _safe(model or "", 200),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+        return str(path)
+    except OSError:
+        return None
+
+
+def read_worker_provider_failure(task_id: str, *, board: Optional[str] = None) -> dict:
+    """Read and validate the worker-boundary provider failure, if present."""
+    root = os.environ.get("HERMES_KANBAN_LOG_DIR", "").strip()
+    if not root:
+        root = str(worker_logs_dir(board=board))
+    path = Path(root) / f"{task_id}.provider.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        key: str(payload[key])[:limit]
+        for key, limit in (("failure_reason", 64), ("error", 500), ("provider", 100), ("model", 200))
+        if payload.get(key)
+    }
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -5113,6 +5198,11 @@ def request_review_changes(
             (task_id,),
         ).fetchone()
         handoff = json.loads(event["payload"]) if event and event["payload"] else {}
+        submitted_metadata = (
+            dict(handoff["metadata"])
+            if isinstance(handoff.get("metadata"), dict)
+            else {}
+        )
         implementer = _canonical_assignee(handoff.get("original_assignee")) or ""
         if not implementer:
             # Webhook-created external PRs have no Hermes implementation
@@ -5122,6 +5212,47 @@ def request_review_changes(
             if not implementer:
                 return None
         review_metadata = dict(metadata or {})
+        try:
+            task_metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+        except (TypeError, json.JSONDecodeError):
+            task_metadata = {}
+        if not isinstance(task_metadata, dict):
+            task_metadata = {}
+        # Preserve the immutable PR identity from the native submission and
+        # any branch/worktree identity already attached to the card.  External
+        # webhook cards have no implementer, so this is also the point where we
+        # synthesize the complete DEV remediation contract.
+        submitted_nested = submitted_metadata.get("metadata")
+        if not isinstance(submitted_nested, dict):
+            submitted_nested = {}
+        task_nested = task_metadata.get("metadata")
+        if not isinstance(task_nested, dict):
+            task_nested = {}
+        # Webhook-originated review evidence uses the ingest vocabulary
+        # (repository/url plus nested metadata), while native submissions use
+        # repo/pr_url and top-level identity.  Normalize both forms before
+        # synthesizing the remediation contract so the same PR/head survives
+        # the review -> DEV transition.
+        source_metadata = {
+            **task_metadata,
+            **task_nested,
+            **submitted_nested,
+            **submitted_metadata,
+        }
+        source_metadata.setdefault("repo", source_metadata.get("repository"))
+        source_metadata.setdefault("pr_url", source_metadata.get("url"))
+        if not source_metadata.get("pr_url") and source_metadata.get("repo") and source_metadata.get("number"):
+            source_metadata["pr_url"] = (
+                f"https://github.com/{source_metadata['repo']}/pull/{source_metadata['number']}"
+            )
+        source_metadata.setdefault("branch_name", submitted_nested.get("branch_name"))
+        source_metadata.setdefault("branch", submitted_nested.get("branch"))
+        configured_agent = (
+            review_metadata.get("coding_agent")
+            or submitted_metadata.get("coding_agent")
+            or task_metadata.get("coding_agent")
+            or "codex"
+        )
         review_metadata.update({
             "approved": False,
             "reviewer": row["assignee"],
@@ -5131,16 +5262,51 @@ def request_review_changes(
             "changes_requested": True,
             "canonical": True,
             "lane": "DEV",
-            "coding_agent": "codex",
+            "capability": "implementation",
+            "coding_agent": configured_agent,
+            EXISTING_PR_REMEDIATION_METADATA_KEY: True,
+            # Retain the legacy descriptive key for consumers that display it,
+            # while the canonical gate uses remediate_existing_pr.
             "existing_pr_remediation": True,
+            "no_replacement_pr": True,
+            "pr_url": source_metadata.get("pr_url") or handoff.get("pr_url") or review_metadata.get("pr_url"),
+            "repo": source_metadata.get("repo") or handoff.get("repo") or review_metadata.get("repo"),
+            "number": source_metadata.get("number") or handoff.get("number") or review_metadata.get("number"),
+            "head_sha": source_metadata.get("head_sha") or handoff.get("head_sha") or review_metadata.get("head_sha"),
         })
-        try:
-            task_metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-        except (TypeError, json.JSONDecodeError):
-            task_metadata = {}
-        if not isinstance(task_metadata, dict):
-            task_metadata = {}
+        for identity_key in ("branch_name", "branch", "head_ref", "base_branch"):
+            if source_metadata.get(identity_key):
+                review_metadata[identity_key] = source_metadata[identity_key]
         task_metadata.update(review_metadata)
+        if review_metadata.get("coding_agent") not in {"codex", "cursor"}:
+            capability_reason = (
+                "changes-requested remediation requires supported coding agent "
+                f"codex or cursor; got {review_metadata.get('coding_agent')!r}"
+            )
+        else:
+            try:
+                from types import SimpleNamespace
+                from tools.coding_kanban_gate import task_capability_preflight
+                capability_reason = task_capability_preflight(SimpleNamespace(
+                    assignee=implementer, status="ready", metadata=task_metadata,
+                ))
+            except Exception as exc:
+                capability_reason = f"capability preflight unavailable: {exc}"
+        if capability_reason:
+            conn.execute(
+                "UPDATE tasks SET status='blocked', assignee=?, result=?, metadata=?, "
+                "completed_at=NULL, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=? AND status='running' AND current_run_id IS NOT NULL",
+                (implementer, capability_reason, json.dumps(task_metadata, ensure_ascii=False), task_id),
+            )
+            blocked_run_id = _end_run(
+                conn, task_id, outcome="capability_blocked", status="blocked",
+                summary=capability_reason, metadata={**review_metadata, "block_reason": capability_reason},
+            )
+            _append_event(conn, task_id, "review_remediation_blocked", {
+                "reason": capability_reason, "metadata": task_metadata,
+            }, run_id=blocked_run_id or current_run_id)
+            return None
         cur = conn.execute(
             "UPDATE tasks SET status='ready', assignee=?, result=?, metadata=?, completed_at=NULL, "
             "consecutive_failures=0, last_failure_error=NULL, claim_lock=NULL, "
@@ -7782,6 +7948,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"provider_auth"`` / ``"provider_billing"`` — terminal provider
+      failures reported by the worker boundary; these are not worker crashes.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -7803,6 +7971,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_AUTH_EXIT_CODE:
+                return ("provider_auth", code)
+            if code == KANBAN_BILLING_EXIT_CODE:
+                return ("provider_billing", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -8445,7 +8617,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, metadata FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8468,6 +8640,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            provider_unavailable_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -8514,6 +8687,44 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                }
+            elif kind in {"provider_auth", "provider_billing"}:
+                protocol_violation = False
+                provider_unavailable_exit = True
+                category = "authentication" if kind == "provider_auth" else "billing/credits"
+                boundary = read_worker_provider_failure(row["id"])
+                try:
+                    task_metadata = json.loads(row["metadata"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    task_metadata = {}
+                if not isinstance(task_metadata, dict):
+                    task_metadata = {}
+                provider = str(
+                    boundary.get("provider")
+                    or
+                    task_metadata.get("provider_override")
+                    or task_metadata.get("provider")
+                    or "configured provider"
+                ).strip()
+                profile = str(row["assignee"] or "unknown").strip()
+                cause = boundary.get("error")
+                error_text = (
+                    f"provider {category} failure for profile {profile} ({provider}): "
+                    f"{cause or 'provider initialization unavailable'} — "
+                    "refresh credentials or restore provider account credits; "
+                    "task parked without retrying"
+                )[:500]
+                event_kind = "provider_unavailable"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_kind": kind,
+                    "exit_code": code,
+                    "provider_failure": category,
+                    "profile": profile,
+                    "provider": provider,
+                    "safe_cause": error_text,
+                    "worker_cause": cause,
                 }
             else:
                 protocol_violation = False
@@ -8579,7 +8790,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                             "WHERE id = ?",
                             (error_text[:500], row["id"]),
                         )
-                    crashed.append(row["id"])
+                    if not provider_unavailable_exit:
+                        crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
@@ -8608,6 +8820,28 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
+            if error_text.startswith("provider "):
+                provider_outcome = (
+                    "provider_authentication"
+                    if error_text.startswith("provider authentication")
+                    else "provider_billing"
+                )
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE task_runs SET outcome=?, status=? "
+                        "WHERE id=(SELECT id FROM task_runs WHERE task_id=? "
+                        "ORDER BY id DESC LIMIT 1)",
+                        (provider_outcome, provider_outcome, tid),
+                    )
+                _record_task_failure(
+                    conn, tid, error=error_text,
+                    outcome=provider_outcome,
+                    failure_limit=1,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"pid": pid, "claimer": claimer},
+                )
+                continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -8660,8 +8894,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
-                outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                outcome=("provider_authentication" if error_text.startswith("provider authentication")
+                         else "provider_billing" if error_text.startswith("provider billing/credits")
+                         else "crashed"),
+                failure_limit=1 if is_systemic or error_text.startswith("provider ") else None,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -10181,6 +10417,7 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    env["HERMES_KANBAN_LOG_DIR"] = str(log_dir)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,

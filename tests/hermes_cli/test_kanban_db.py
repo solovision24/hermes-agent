@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -316,6 +317,428 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         ]
         assert "rate_limited" in outcomes
         assert "crashed" not in outcomes
+
+
+def test_provider_auth_exit_is_parked_without_protocol_violation(
+    kanban_home, monkeypatch,
+):
+    """Terminal provider auth failures are control-plane blockers, not worker crashes."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="auth", assignee="dev", metadata={"provider": "openai-codex"})
+        kb.claim_task(conn, tid, claimer=f"{host}:auth")
+        pid = 71001
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_AUTH_EXIT_CODE))
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert "authentication" in (task.last_failure_error or "").lower()
+        runs = conn.execute("SELECT outcome, metadata FROM task_runs WHERE task_id=?", (tid,)).fetchall()
+        assert runs[-1]["outcome"] == "provider_authentication"
+        assert "protocol_violation" not in (runs[-1]["metadata"] or "")
+
+
+def test_provider_exit_preserves_worker_boundary_cause_and_provider(
+    kanban_home, monkeypatch,
+):
+    """The dispatcher must retain the bounded classifier summary, not infer a generic exit cause."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    log_dir = kanban_home / "kanban" / "logs"
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(log_dir))
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="auth cause", assignee="dev")
+        kb.claim_task(conn, tid, claimer=f"{host}:auth-cause")
+        pid = 71003
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        _kb.write_worker_provider_failure(
+            failure_reason="auth",
+            error="HTTP 401: openai-codex OAuth token expired; fallback openrouter HTTP 402 insufficient credits",
+            provider="openai-codex -> openrouter",
+            model="gpt-5",
+        )
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_AUTH_EXIT_CODE))
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert "HTTP 401" in (task.last_failure_error or "")
+        assert "openrouter" in (task.last_failure_error or "")
+        assert "openai-codex -> openrouter" in (task.last_failure_error or "")
+        assert "protocol violation" not in (task.last_failure_error or "").lower()
+
+
+def test_provider_boundary_payload_is_bounded_and_missing_is_safe(kanban_home, monkeypatch):
+    """Boundary persistence is bounded and absent sidecar data never breaks reap."""
+    import hermes_cli.kanban_db as _kb
+
+    log_dir = kanban_home / "kanban" / "logs"
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_boundary")
+    path = _kb.write_worker_provider_failure(
+        failure_reason="billing",
+        error="x" * 5000,
+        provider="provider",
+        model="model",
+    )
+    assert path is not None
+    payload = _kb.read_worker_provider_failure("t_boundary")
+    assert len(payload["error"]) == 500
+    assert _kb.read_worker_provider_failure("missing") == {}
+
+
+def test_provider_boundary_payload_force_redacts_credentials(kanban_home, monkeypatch):
+    """Provider sidecars never persist credential material, even when logging redaction is off."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(kanban_home / "kanban" / "logs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_secret_boundary")
+    token = "sk-proj-THISMUSTNOTPERSIST"
+    path = _kb.write_worker_provider_failure(
+        failure_reason="auth",
+        error=f"HTTP 401 Authorization: Bearer {token}",
+        provider=f"openai {token}",
+        model=f"model-{token}",
+    )
+
+    assert path is not None
+    raw = path and Path(path).read_text(encoding="utf-8")
+    assert token not in raw
+    payload = _kb.read_worker_provider_failure("t_secret_boundary")
+    assert token not in json.dumps(payload)
+    assert "401" in payload["error"]
+    assert "auth" == payload["failure_reason"]
+
+
+def test_provider_boundary_redacts_config_and_json_secrets_from_every_field(
+    kanban_home, monkeypatch
+):
+    """Mandatory provider egress must not preserve config-shaped credentials."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(kanban_home / "kanban" / "logs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_structured_secret_boundary")
+    markers = {
+        "env": "env-secret-marker-7f2e",
+        "json": "json-secret-marker-91ac",
+    }
+    path = _kb.write_worker_provider_failure(
+        failure_reason=f'OPENAI_API_KEY={markers["env"]}',
+        error=f'{{"api_key":"{markers["json"]}"}}',
+        provider=f'provider OPENAI_API_KEY={markers["env"]}',
+        model=f'{{"token":"{markers["json"]}"}}',
+    )
+
+    assert path is not None
+    raw = Path(path).read_text(encoding="utf-8")
+    payload = _kb.read_worker_provider_failure("t_structured_secret_boundary")
+    durable = json.dumps(payload)
+    for marker in markers.values():
+        assert marker not in raw
+        assert marker not in durable
+    assert "OPENAI_API_KEY" in payload["failure_reason"]
+
+
+def test_provider_boundary_redacts_url_userinfo_credentials(kanban_home, monkeypatch):
+    """Provider egress must not persist credentials embedded in provider URLs."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(kanban_home / "kanban" / "logs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_url_secret_boundary")
+    marker = "url-secret-marker"
+    path = _kb.write_worker_provider_failure(
+        failure_reason="auth",
+        error=f"HTTP 401 https://user:{marker}@api.example.test/v1",
+        provider=f"https://user:{marker}@api.example.test/v1",
+        model=f"https://user:{marker}@api.example.test/v1",
+    )
+
+    assert path is not None
+    raw = Path(path).read_text(encoding="utf-8")
+    payload = _kb.read_worker_provider_failure("t_url_secret_boundary")
+    assert marker not in raw
+    assert marker not in json.dumps(payload)
+    assert "401" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    ("failure_reason", "exit_code", "exit_kind"),
+    [
+        ("auth_permanent", kb.KANBAN_AUTH_EXIT_CODE, "provider_auth"),
+        ("billing", kb.KANBAN_BILLING_EXIT_CODE, "provider_billing"),
+        ("rate_limit", kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited"),
+    ],
+)
+def test_quiet_cli_provider_exit_reaches_dispatcher_with_classified_cause(
+    kanban_home, monkeypatch, failure_reason, exit_code, exit_kind
+):
+    """The quiet worker boundary must preserve the classifier result for reap."""
+    from types import SimpleNamespace
+
+    import cli as hermes_cli_module
+
+    log_dir = kanban_home / "kanban" / "logs"
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_cli_boundary")
+    result = {
+        "failed": True,
+        "failure_reason": failure_reason,
+        "error": f"HTTP {401 if failure_reason.startswith('auth') else 402 if failure_reason == 'billing' else 429}: provider exhausted",
+    }
+
+    assert hermes_cli_module._kanban_worker_exit_code(
+        result, SimpleNamespace(provider="openai-codex", model="gpt-test")
+    ) == exit_code
+    payload = kb.read_worker_provider_failure("t_cli_boundary")
+    assert payload["failure_reason"] == failure_reason
+    assert payload["provider"] == "openai-codex"
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="boundary", assignee="dev")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        # Rewrite the sidecar for the actual task id used by reap.
+        kb.write_worker_provider_failure(
+            failure_reason=failure_reason,
+            error=result["error"],
+            provider="openai-codex",
+            model="gpt-test",
+        )
+        kb.claim_task(conn, tid, claimer=f"{host}:boundary")
+        pid = 71991
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        kb._record_worker_exit(pid, _exited_status(exit_code))
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, tid)
+        if exit_kind == "rate_limited":
+            assert task.status == "ready"
+        else:
+            assert task.status == "blocked"
+            assert failure_reason.replace("_permanent", "") in (task.last_failure_error or "") or exit_kind in (task.last_failure_error or "")
+        assert not any(e.kind == "protocol_violation" for e in kb.list_events(conn, tid))
+
+
+def test_quiet_cli_provider_fallback_success_does_not_emit_failure_sidecar(
+    kanban_home, monkeypatch
+):
+    """A successful fallback remains a normal clean worker result."""
+    from types import SimpleNamespace
+
+    import cli as hermes_cli_module
+
+    log_dir = kanban_home / "kanban" / "logs"
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fallback_success")
+    result = {"failed": False, "final_response": "fallback succeeded"}
+
+    assert hermes_cli_module._kanban_worker_exit_code(
+        result, SimpleNamespace(provider="openrouter", model="fallback-model")
+    ) == 0
+    assert kb.read_worker_provider_failure("t_fallback_success") == {}
+
+
+def _provider_error(status_code: int, message: str) -> Exception:
+    error = RuntimeError(message)
+    error.status_code = status_code
+    return error
+
+
+def _provider_boundary_agent(error, *, fallback=False):
+    """Create a real AIAgent whose first provider call fails deterministically."""
+    from unittest.mock import MagicMock, patch
+
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.openai.com/v1",
+            provider="openai-codex",
+            api_mode="chat_completions",
+            model="gpt-test",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = error
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent._fallback_chain = [{"provider": "fallback", "model": "fallback-model"}] if fallback else []
+    return agent
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message", "reason"),
+    [
+        (401, "OAuth token expired", "auth"),
+        (402, "insufficient credits", "billing"),
+        (429, "too many requests", "rate_limit"),
+    ],
+)
+def test_real_provider_classifier_to_quiet_cli_boundary(
+    kanban_home, monkeypatch, status_code, message, reason
+):
+    """A real conversation failure must carry classifier output into reap."""
+    from unittest.mock import patch
+    from types import SimpleNamespace
+
+    import cli as hermes_cli_module
+
+    task_id = f"t-real-{status_code}"
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(kanban_home / "kanban" / "logs"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    agent = _provider_boundary_agent(_provider_error(status_code, message))
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("perform the operational task")
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == reason
+    code = hermes_cli_module._kanban_worker_exit_code(result, agent)
+    expected = {
+        "auth": kb.KANBAN_AUTH_EXIT_CODE,
+        "billing": kb.KANBAN_BILLING_EXIT_CODE,
+        "rate_limit": kb.KANBAN_RATE_LIMIT_EXIT_CODE,
+    }[reason]
+    assert code == expected
+    payload = kb.read_worker_provider_failure(task_id)
+    assert payload["failure_reason"] == reason
+    assert str(status_code) in payload["error"]
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="real boundary", assignee="dev")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:real-{status_code}")
+        monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+        kb.write_worker_provider_failure(
+            failure_reason=reason,
+            error=payload["error"],
+            provider=payload["provider"],
+            model=payload["model"],
+        )
+        pid = 74000 + status_code
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        kb._record_worker_exit(pid, _exited_status(code))
+        assert kb.detect_crashed_workers(conn) == []
+        assert not any(e.kind == "protocol_violation" for e in kb.list_events(conn, tid))
+
+
+def test_real_terminal_provider_initialization_never_dispatches_tools(kanban_home):
+    """Provider failure before a response must not execute an operational tool."""
+    from unittest.mock import patch
+
+    agent = _provider_boundary_agent(_provider_error(401, "OAuth token expired"))
+    tool_calls = []
+    agent.tools = [{"type": "function", "function": {"name": "dangerous_tool"}}]
+    # Tool dispatch is performed by the production AIAgent execution seam,
+    # not by an instance ``_handle_function_call`` attribute.  Instrument the
+    # seam that run_conversation actually invokes so this assertion cannot be
+    # vacuous if dispatch is refactored.
+    def record_tool_execution(*args, **kwargs):
+        tool_calls.append((args, kwargs))
+
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=record_tool_execution),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("perform the operational task")
+    assert result["failure_reason"] == "auth"
+    assert tool_calls == []
+
+
+def test_real_failed_primary_successful_fallback_is_clean(kanban_home):
+    """A fallback response must not emit a provider sidecar or sentinel."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    import cli as hermes_cli_module
+
+    agent = _provider_boundary_agent(_provider_error(401, "OAuth token expired"), fallback=True)
+    success = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="fallback ok", tool_calls=None), finish_reason="stop")],
+        usage=None,
+        model="fallback-model",
+    )
+    task_id = "t-real-fallback-success"
+    log_dir = kanban_home / "kanban" / "logs"
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_LOG_DIR", str(log_dir))
+    client = agent.client
+    client.chat.completions.create.side_effect = [_provider_error(401, "OAuth token expired")]
+
+    def activate_fallback(*, reason=None):
+        """Model the real activation side effect without network/auth I/O."""
+        setattr(agent, "provider", "fallback")
+        setattr(agent, "model", "fallback-model")
+        client.chat.completions.create.side_effect = [success]
+        return True
+
+    try:
+        with (
+            patch.object(agent, "_try_activate_fallback", side_effect=activate_fallback),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("perform the operational task")
+        assert result.get("failed") is not True
+        assert result["final_response"] == "fallback ok"
+        assert hermes_cli_module._kanban_worker_exit_code(result, agent) == 0
+        assert kb.read_worker_provider_failure(task_id) == {}
+    finally:
+        monkeypatch.undo()
+
+
+def test_provider_billing_exit_is_parked_without_respawn_loop(
+    kanban_home, monkeypatch,
+):
+    """Permanent credit failures block once and are not repeatedly respawned."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="billing", assignee="dev", metadata={"provider": "openrouter"})
+        kb.claim_task(conn, tid, claimer=f"{host}:billing")
+        pid = 71002
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_BILLING_EXIT_CODE))
+
+        assert kb.detect_crashed_workers(conn) == []
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.check_respawn_guard(conn, tid) is not None
+        assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='protocol_violation'", (tid,)).fetchone()[0] == 0
 
 
 
