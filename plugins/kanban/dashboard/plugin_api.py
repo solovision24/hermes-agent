@@ -148,7 +148,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "failed", "review", "done",
 ]
 
 
@@ -836,6 +836,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    human_gate: Optional[dict] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -890,7 +892,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                ok = kanban_db.block_task(
+                    conn,
+                    task_id,
+                    reason=payload.block_reason,
+                    kind=payload.block_kind,
+                    human_gate=payload.human_gate,
+                    require_human_gate=True,
+                )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -1234,6 +1243,9 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    block_reason: Optional[str] = None
+    block_kind: Optional[str] = None
+    human_gate: Optional[dict] = None
     reclaim_first: bool = False
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -1279,7 +1291,13 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        ok = kanban_db.block_task(
+                            conn,
+                            tid,
+                            reason=payload.block_reason,
+                            kind=payload.block_kind,
+                            human_gate=payload.human_gate,
+                        )
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):

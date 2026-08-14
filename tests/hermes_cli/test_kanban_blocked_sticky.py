@@ -63,7 +63,17 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
         kb.claim_task(conn, tid)
         assert kb.block_task(
             conn, tid,
-            reason="review-required: please verify ACL change",
+            reason="OAuth consent is legally required",
+            kind="capability",
+            human_gate={
+                "category": "identity_or_oauth_consent",
+                "exhausted_paths": [
+                    {"stage": stage, "evidence": f"exhausted {stage}"}
+                    for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+                ],
+                "exact_ask": "Complete the provider OAuth consent screen.",
+                "proposed_default": "Keep the task paused without provider changes.",
+            },
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"
@@ -120,7 +130,17 @@ def test_protocol_violation_loop_is_broken(kanban_home: Path) -> None:
         kb.claim_task(conn, tid)
         kb.block_task(
             conn, tid,
-            reason="review-required: human eyes please",
+            reason="OAuth consent is legally required",
+            kind="capability",
+            human_gate={
+                "category": "identity_or_oauth_consent",
+                "exhausted_paths": [
+                    {"stage": stage, "evidence": f"exhausted {stage}"}
+                    for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+                ],
+                "exact_ask": "Complete the provider OAuth consent screen.",
+                "proposed_default": "Keep the task paused without provider changes.",
+            },
             expected_run_id=kb.get_task(conn, tid).current_run_id,
         )
         assert kb.get_task(conn, tid).status == "blocked"

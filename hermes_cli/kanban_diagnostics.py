@@ -931,6 +931,53 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_human_gate_misuse(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Flag blocked cards that bypassed the irreducible-human gate contract."""
+    if _task_field(task, "status") != "blocked":
+        return []
+    latest_block = None
+    for event in events:
+        if _event_kind(event) == "blocked":
+            latest_block = event
+    if latest_block is None:
+        return []
+    payload = _parse_payload(latest_block)
+    from . import kanban_db
+
+    misuse_reason = kanban_db.validate_human_gate(payload.get("human_gate"))
+    if misuse_reason is None:
+        return []
+    task_id = str(_task_field(task, "id", ""))
+    seen_at = _event_ts(latest_block) or now
+    return [Diagnostic(
+        kind="human_gate_misuse",
+        severity="critical",
+        title="Human gate bypassed autonomous recovery policy",
+        detail=(
+            "This card entered Blocked without an allowlisted irreducible "
+            "category and complete exhausted-path evidence. Route it back to "
+            "an agent owner; ordinary review, CI, repository, provider, and "
+            "deployment recovery must remain autonomous."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="reassign",
+                label="Route to Orion for autonomous recovery",
+                payload={"assignee": "orion", "reclaim_first": False},
+                suggested=True,
+            ),
+            DiagnosticAction(
+                kind="cli_hint",
+                label="Inspect recovery evidence",
+                payload={"command": f"hermes kanban show {task_id}"},
+            ),
+        ],
+        first_seen_at=seen_at,
+        last_seen_at=seen_at,
+        data={"misuse_reason": misuse_reason, "task_id": task_id},
+    )]
+
+
 def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has cycled through blocked → unblocked many times — the
     ``unblock`` is not fixing the underlying problem and the worker
@@ -1195,6 +1242,7 @@ _RULES: list[RuleFn] = [
     _rule_completed_without_review,
     _rule_repeated_failures,
     _rule_repeated_crashes,
+    _rule_human_gate_misuse,
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_respawn_guarded,
@@ -1212,6 +1260,7 @@ DIAGNOSTIC_KINDS = (
     "completed_without_review",
     "repeated_failures",
     "repeated_crashes",
+    "human_gate_misuse",
     "stuck_in_blocked",
     "block_unblock_cycling",
     "respawn_guarded",

@@ -661,7 +661,7 @@ def _handle_review_changes(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
-    summary = str(args.get("summary") or "").strip()
+    summary = str(args.get("summary") or args.get("reason") or "").strip()
     metadata = args.get("metadata")
     if isinstance(metadata, dict):
         metadata = json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
@@ -926,6 +926,7 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    human_gate = args.get("human_gate")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -945,6 +946,9 @@ def _handle_block(args: dict, **kw) -> str:
         # and `transient` (or an unset kind) route back through
         # kanban_complete, which the judge now gates.
         task = kb.get_task(conn, tid)
+        valid_irreducible_capability = (
+            kind == "capability" and kb.validate_human_gate(human_gate) is None
+        )
         if (
             task
             and _review_lane_for_block_guard(task)
@@ -962,6 +966,7 @@ def _handle_block(args: dict, **kw) -> str:
             task
             and task.goal_mode
             and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            and not valid_irreducible_capability
         ):
             conn.close()
             return tool_error(
@@ -976,6 +981,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                human_gate=human_gate,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1845,10 +1851,11 @@ KANBAN_BLOCK_SCHEMA = {
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
+        "needed), 'needs_input'/'capability' only for a structured, allowlisted "
+        "irreducible human gate, or 'transient' (a flaky failure that may clear). "
+        "Machine, provider, repository, CI, review, and deployment failures stay "
+        "agent-owned even after retries are exhausted. ``reason`` is shown on "
+        "the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
@@ -1873,9 +1880,59 @@ KANBAN_BLOCK_SCHEMA = {
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "resumes automatically; 'transient' retries automatically; "
+                    "needs_input/capability require a valid human_gate. "
                     "Omit only if none apply."
                 ),
+            },
+            "human_gate": {
+                "type": "object",
+                "description": (
+                    "Required for needs_input/capability human escalation. "
+                    "Must name an allowlisted irreducible category, provide "
+                    "evidence for every autonomous recovery stage in order, "
+                    "the smallest exact ask, and a proposed safe default."
+                ),
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "identity_or_oauth_consent",
+                            "legal_or_customer_authorization",
+                            "financial_purchase",
+                        ],
+                    },
+                    "exhausted_paths": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "stage": {
+                                    "type": "string",
+                                    "enum": [
+                                        "classify_evidence",
+                                        "bounded_retry_backoff",
+                                        "capability_preflight_repair",
+                                        "qualified_profile_reassignment",
+                                        "configured_provider_tool_fallback",
+                                        "specialist_arbitration_review",
+                                        "safe_reversible_default",
+                                    ],
+                                },
+                                "evidence": {"type": "string"},
+                            },
+                            "required": ["stage", "evidence"],
+                        },
+                    },
+                    "exact_ask": {"type": "string"},
+                    "proposed_default": {"type": "string"},
+                },
+                "required": [
+                    "category",
+                    "exhausted_paths",
+                    "exact_ask",
+                    "proposed_default",
+                ],
             },
             "board": _board_schema_prop(),
         },
@@ -2287,6 +2344,20 @@ KANBAN_REVIEW_CHANGES_SCHEMA = {
     }, "required": ["summary"]},
 }
 
+KANBAN_REQUEST_CHANGES_SCHEMA = {
+    "name": "kanban_request_changes",
+    "description": (
+        "Compatibility alias for requesting implementation changes on the "
+        "currently claimed review card."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reason": {"type": "string"},
+        "metadata": {"type": "object"},
+        "board": _board_schema_prop(),
+    }, "required": ["reason"]},
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2323,6 +2394,15 @@ registry.register(
     name="kanban_review_changes",
     toolset="kanban",
     schema=KANBAN_REVIEW_CHANGES_SCHEMA,
+    handler=_handle_review_changes,
+    check_fn=_check_kanban_mode,
+    emoji="🛠",
+)
+
+registry.register(
+    name="kanban_request_changes",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_CHANGES_SCHEMA,
     handler=_handle_review_changes,
     check_fn=_check_kanban_mode,
     emoji="🛠",

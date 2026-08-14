@@ -46,9 +46,9 @@ def _task(**overrides):
     return base
 
 
-def _event(kind, ts=None, **payload):
+def _event(event_kind, ts=None, **payload):
     return {
-        "kind": kind,
+        "kind": event_kind,
         "created_at": int(ts if ts is not None else time.time()),
         "payload": payload or None,
     }
@@ -107,11 +107,43 @@ def test_stuck_in_blocked_fires_past_threshold():
     diags = kd.compute_task_diagnostics(
         task, events, [], now=now,
     )
-    assert len(diags) == 1
-    d = diags[0]
+    stuck = [diag for diag in diags if diag.kind == "stuck_in_blocked"]
+    assert len(stuck) == 1
+    d = stuck[0]
     assert d.kind == "stuck_in_blocked"
     assert d.severity == "warning"
     assert d.data["age_hours"] >= 48
+
+
+def test_human_gate_misuse_watchdog_flags_unstructured_block():
+    now = int(time.time())
+    task = _task(status="blocked", block_kind="needs_input")
+    events = [
+        _event("blocked", ts=now - 60, reason="need approval", kind="needs_input"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    misuse = [d for d in diags if d.kind == "human_gate_misuse"]
+    assert len(misuse) == 1
+    assert misuse[0].severity == "critical"
+    assert misuse[0].data["misuse_reason"] == "missing_structured_human_gate"
+    assert misuse[0].actions[0].kind == "reassign"
+
+
+def test_human_gate_misuse_watchdog_accepts_valid_irreducible_gate():
+    now = int(time.time())
+    gate = {
+        "category": "legal_or_customer_authorization",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Authorize the binding customer contract.",
+        "proposed_default": "Take no external action.",
+    }
+    task = _task(status="blocked", block_kind="needs_input")
+    events = [_event("blocked", ts=now - 60, kind="needs_input", human_gate=gate)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert not [d for d in diags if d.kind == "human_gate_misuse"]
 
 
 

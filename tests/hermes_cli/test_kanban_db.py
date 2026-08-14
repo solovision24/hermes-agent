@@ -322,7 +322,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
 def test_provider_auth_exit_is_parked_without_protocol_violation(
     kanban_home, monkeypatch,
 ):
-    """Terminal provider auth failures are control-plane blockers, not worker crashes."""
+    """Provider auth failures become Orion-owned terminal failures, not crashes."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -338,7 +338,9 @@ def test_provider_auth_exit_is_parked_without_protocol_violation(
 
         assert kb.detect_crashed_workers(conn) == []
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task is not None
+        assert task.status == "failed"
+        assert task.recovery_owner == "orion"
         assert "authentication" in (task.last_failure_error or "").lower()
         runs = conn.execute("SELECT outcome, metadata FROM task_runs WHERE task_id=?", (tid,)).fetchall()
         assert runs[-1]["outcome"] == "provider_authentication"
@@ -373,7 +375,9 @@ def test_provider_exit_preserves_worker_boundary_cause_and_provider(
 
         assert kb.detect_crashed_workers(conn) == []
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task is not None
+        assert task.status == "failed"
+        assert task.recovery_owner == "orion"
         assert "HTTP 401" in (task.last_failure_error or "")
         assert "openrouter" in (task.last_failure_error or "")
         assert "openai-codex -> openrouter" in (task.last_failure_error or "")
@@ -526,10 +530,12 @@ def test_quiet_cli_provider_exit_reaches_dispatcher_with_classified_cause(
 
         assert kb.detect_crashed_workers(conn) == []
         task = kb.get_task(conn, tid)
+        assert task is not None
         if exit_kind == "rate_limited":
             assert task.status == "ready"
         else:
-            assert task.status == "blocked"
+            assert task.status == "failed"
+            assert task.recovery_owner == "orion"
             assert failure_reason.replace("_permanent", "") in (task.last_failure_error or "") or exit_kind in (task.last_failure_error or "")
         assert not any(e.kind == "protocol_violation" for e in kb.list_events(conn, tid))
 
@@ -721,7 +727,7 @@ def test_real_failed_primary_successful_fallback_is_clean(kanban_home):
 def test_provider_billing_exit_is_parked_without_respawn_loop(
     kanban_home, monkeypatch,
 ):
-    """Permanent credit failures block once and are not repeatedly respawned."""
+    """Permanent credit failures fail once and are not repeatedly respawned."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -736,7 +742,10 @@ def test_provider_billing_exit_is_parked_without_respawn_loop(
         _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_BILLING_EXIT_CODE))
 
         assert kb.detect_crashed_workers(conn) == []
-        assert kb.get_task(conn, tid).status == "blocked"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "failed"
+        assert task.recovery_owner == "orion"
         assert kb.check_respawn_guard(conn, tid) is not None
         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='protocol_violation'", (tid,)).fetchone()[0] == 0
 

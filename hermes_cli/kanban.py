@@ -686,10 +686,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--kind", default=None, choices=sorted(kb.VALID_BLOCK_KINDS),
         help=(
             "Typed block reason. 'dependency' waits in todo (auto-promoted "
-            "when parents finish, no human); 'needs_input'/'capability' go to "
-            "blocked for a human; 'transient' marks a maybe-flaky failure. "
+            "when parents finish, no human); 'needs_input'/'capability' require "
+            "--human-gate; 'transient' marks a maybe-flaky failure. "
             "Repeated same-kind re-blocks after unblock route the task to "
-            "triage to break unblock loops. Omit for a generic block."
+            "triage to break unblock loops."
+        ),
+    )
+    p_block.add_argument(
+        "--human-gate",
+        default=None,
+        help=(
+            "JSON object required for needs_input/capability escalation: "
+            "allowlisted category, ordered exhausted_paths evidence, exact_ask, "
+            "and proposed_default."
         ),
     )
 
@@ -2474,6 +2483,16 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    raw_human_gate = getattr(args, "human_gate", None)
+    human_gate = None
+    if raw_human_gate:
+        try:
+            human_gate = json.loads(raw_human_gate)
+            if not isinstance(human_gate, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"invalid --human-gate JSON: {exc}", file=sys.stderr)
+            return 2
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -2486,6 +2505,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                human_gate=human_gate,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

@@ -15,6 +15,20 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+def _human_gate() -> dict:
+    from hermes_cli import kanban_db as kb
+
+    return {
+        "category": "identity_or_oauth_consent",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Complete the provider OAuth consent screen.",
+        "proposed_default": "Keep the task paused without provider changes.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -46,6 +60,7 @@ def test_review_lifecycle_tools_are_registered_and_worker_gated(monkeypatch, tmp
 
     assert registry.get_toolset_for_tool("kanban_submit_review") == "kanban"
     assert registry.get_toolset_for_tool("kanban_review_changes") == "kanban"
+    assert registry.get_toolset_for_tool("kanban_request_changes") == "kanban"
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     assert kt._check_kanban_mode() is False
@@ -281,7 +296,11 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({
+        "reason": "OAuth consent is legally required",
+        "kind": "capability",
+        "human_gate": _human_gate(),
+    })
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -357,7 +376,20 @@ def test_review_external_human_gate_remains_blockable(monkeypatch, tmp_path):
 
     tid = _make_review_worker_env(monkeypatch, tmp_path)
     reason = "Human gate: owner approval required for production signing"
-    out = json.loads(kt._handle_block({"reason": reason, "kind": "needs_input"}))
+    human_gate = {
+        "category": "legal_or_customer_authorization",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Approve production signing.",
+        "proposed_default": "Keep the task paused.",
+    }
+    out = json.loads(kt._handle_block({
+        "reason": reason,
+        "kind": "needs_input",
+        "human_gate": human_gate,
+    }))
     assert out["ok"] is True
     conn = kb.connect()
     try:
@@ -437,6 +469,16 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         assert kb.get_task(conn, tid).status == "running"
     finally:
         conn.close()
+
+
+def test_block_schema_exposes_canonical_autonomous_recovery_stages():
+    from hermes_cli import kanban_db as kb
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+
+    stage_schema = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["human_gate"][
+        "properties"
+    ]["exhausted_paths"]["items"]["properties"]["stage"]
+    assert stage_schema["enum"] == list(kb.AUTONOMOUS_RECOVERY_STAGES)
 
 
 def test_heartbeat_extends_claim_expires(worker_env):
@@ -785,7 +827,13 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        kb.block_task(
+            conn,
+            other,
+            reason="OAuth consent is legally required",
+            kind="capability",
+            human_gate=_human_gate(),
+        )
     finally:
         conn.close()
 

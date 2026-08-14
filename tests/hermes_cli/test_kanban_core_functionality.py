@@ -428,7 +428,22 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         assert task.last_heartbeat_at is None
 
         assert kb.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
-        assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="current OAuth consent block",
+            kind="capability",
+            human_gate={
+                "category": "identity_or_oauth_consent",
+                "exhausted_paths": [
+                    {"stage": stage, "evidence": f"exhausted {stage}"}
+                    for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+                ],
+                "exact_ask": "Complete the provider OAuth consent screen.",
+                "proposed_default": "Keep the task paused without provider changes.",
+            },
+            expected_run_id=run2.id,
+        )
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
@@ -1356,10 +1371,11 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
                 "below-budget violations must not tick the unified counter"
             )
 
-        # Third consecutive violation: streak hits the bound — blocked.
+        # Third consecutive violation: streak hits the bound — terminal failure.
         _drive_protocol_violation(conn, tid, 991003)
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
+        assert task.status == "failed"
+        assert task.lifecycle_state == "terminal_failed"
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
         assert (gave_up[0].payload or {}).get("protocol_violations") == \

@@ -258,6 +258,42 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
+    with kb.connect_closing() as conn:
+        parent_id = kb.create_task(conn, title="parent task")
+        child_id = kb.create_task(conn, title="child task")
+        kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
+
+    output = kc.run_slash(f"show {child_id}")
+
+    assert f"Task {child_id}: child task" in output
+    assert f"parents:   {parent_id}" in output
+    assert "Cannot operate on a closed database" not in output
+
+
+def test_block_cli_accepts_structured_irreducible_human_gate(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="OAuth consent", assignee="dev")
+        assert kb.claim_task(conn, task_id) is not None
+    gate = {
+        "category": "identity_or_oauth_consent",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Complete the provider OAuth consent screen.",
+        "proposed_default": "Keep the task paused without provider changes.",
+    }
+    output = kc.run_slash(
+        f"block {task_id} 'OAuth consent required' --kind capability "
+        f"--human-gate '{json.dumps(gate)}'"
+    )
+    assert f"Blocked {task_id}" in output
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

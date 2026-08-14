@@ -78,6 +78,146 @@ def test_review_changes_returns_same_card_to_implementer(board):
         assert run["ended_at"] is not None
 
 
+def test_legacy_request_changes_accepts_native_review_submission(board):
+    """The compatibility transition must understand native review handoffs.
+
+    Older reviewer runtimes expose ``kanban_request_changes`` and therefore
+    call ``request_changes``.  A native implementation handoff emits
+    ``review_submitted`` rather than ``review_requested``; both event shapes
+    must route the same card back to its original implementer.
+    """
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            summary="ready",
+            metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Fix the regression test",
+            expected_run_id=review.current_run_id,
+        ) == (True, "dev")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "dev"
+
+
+def test_review_changes_after_pr_bypasses_stale_guards_and_reuses_card(
+    board, monkeypatch
+):
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.add_comment(
+            conn,
+            task_id,
+            author="dev",
+            body="Existing PR: https://github.com/acme/repo/pull/1",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET created_at=? WHERE task_id=?",
+                (now - 1, task_id),
+            )
+        assert kb.submit_for_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            summary="ready",
+            metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'dev', 'done', 'completed', ?, ?)",
+                (task_id, now - 1, now),
+            )
+        assert kb.request_review_changes(
+            conn,
+            task_id,
+            summary="Fix the regression test",
+            expected_run_id=review.current_run_id,
+        ) == task_id
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        comment_count = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert result.spawned == [(task_id, "dev", "")]
+        assert result.respawn_guarded == []
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == comment_count
+
+
+def test_review_reopened_after_pr_bypasses_stale_guards(board, monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    with board as conn:
+        task_id = kb.create_task(conn, title="reopened review", assignee="dev")
+        assert kb.add_comment(
+            conn,
+            task_id,
+            author="dev",
+            body="Existing PR: https://github.com/acme/repo/pull/2",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_comments SET created_at=? WHERE task_id=?",
+                (now - 1, task_id),
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'dev', 'done', 'completed', ?, ?)",
+                (task_id, now - 1, now),
+            )
+            kb._append_event(conn, task_id, "review_reopened", {"assignee": "dev"})
+
+        assert kb.check_respawn_guard(conn, task_id) is None
+
+
+def test_completed_ready_without_review_requeue_remains_guarded(board):
+    with board as conn:
+        task_id = kb.create_task(conn, title="completed", assignee="dev")
+        claimed = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert claimed is not None
+        assert kb.add_comment(
+            conn,
+            task_id,
+            author="dev",
+            body="Existing PR: https://github.com/acme/repo/pull/3",
+        )
+        assert kb.complete_task(
+            conn, task_id, expected_run_id=claimed.current_run_id
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+
+        assert kb.check_respawn_guard(conn, task_id) == "recent_success"
+
+
 def test_review_changes_requires_worker_ownership(board, monkeypatch):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")
