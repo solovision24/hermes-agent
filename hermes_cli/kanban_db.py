@@ -100,7 +100,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "failed", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked", "review", "triage"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -1093,6 +1093,14 @@ class Task:
     # Structured task metadata.  This is intentionally optional so older
     # boards and non-coding cards retain their existing shape.
     metadata: Optional[dict] = None
+    lifecycle_state: Optional[str] = None
+    last_worker_pid: Optional[int] = None
+    last_exit_kind: Optional[str] = None
+    last_exit_code: Optional[int] = None
+    error_category: Optional[str] = None
+    next_retry_at: Optional[int] = None
+    recovery_owner: Optional[str] = None
+    recovery_action: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1192,6 +1200,14 @@ class Task:
                 if "metadata" in keys and row["metadata"]
                 else None
             ),
+            lifecycle_state=row["lifecycle_state"] if "lifecycle_state" in keys else None,
+            last_worker_pid=row["last_worker_pid"] if "last_worker_pid" in keys else None,
+            last_exit_kind=row["last_exit_kind"] if "last_exit_kind" in keys else None,
+            last_exit_code=row["last_exit_code"] if "last_exit_code" in keys else None,
+            error_category=row["error_category"] if "error_category" in keys else None,
+            next_retry_at=row["next_retry_at"] if "next_retry_at" in keys else None,
+            recovery_owner=row["recovery_owner"] if "recovery_owner" in keys else None,
+            recovery_action=row["recovery_action"] if "recovery_action" in keys else None,
         )
 
 
@@ -1380,7 +1396,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
-    metadata             TEXT
+    metadata             TEXT,
+    lifecycle_state TEXT,
+    last_worker_pid INTEGER,
+    last_exit_kind TEXT,
+    last_exit_code INTEGER,
+    error_category TEXT,
+    next_retry_at INTEGER,
+    recovery_owner TEXT,
+    recovery_action TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2494,6 +2518,41 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "max_runtime_seconds" not in cols:
         _add_column_if_missing(
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
+        )
+    for column, declaration in (
+        ("lifecycle_state", "lifecycle_state TEXT"),
+        ("last_worker_pid", "last_worker_pid INTEGER"),
+        ("last_exit_kind", "last_exit_kind TEXT"),
+        ("last_exit_code", "last_exit_code INTEGER"),
+        ("error_category", "error_category TEXT"),
+        ("next_retry_at", "next_retry_at INTEGER"),
+        ("recovery_owner", "recovery_owner TEXT"),
+        ("recovery_action", "recovery_action TEXT"),
+    ):
+        if column not in cols:
+            _add_column_if_missing(conn, "tasks", column, declaration)
+    event_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    if "status" in cols and {"id", "task_id", "kind"}.issubset(event_cols):
+        conn.execute(
+            "UPDATE tasks SET status='failed', lifecycle_state='terminal_failed', "
+            "recovery_owner=COALESCE(recovery_owner, 'orion'), "
+            "recovery_action=COALESCE(recovery_action, 'diagnose and route agent-owned remediation') "
+            "WHERE status='blocked' AND (SELECT kind FROM task_events e "
+            "WHERE e.task_id=tasks.id ORDER BY e.id DESC LIMIT 1)='gave_up'"
+        )
+        conn.execute(
+            "UPDATE tasks SET lifecycle_state=CASE status "
+            "WHEN 'running' THEN 'active' WHEN 'done' THEN 'completed' "
+            "WHEN 'review' THEN 'review' WHEN 'blocked' THEN 'human_blocked' "
+            "WHEN 'failed' THEN 'terminal_failed' ELSE lifecycle_state END "
+            "WHERE lifecycle_state IS NULL"
+        )
+    run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+    if {"id", "task_id", "worker_pid"}.issubset(run_cols):
+        conn.execute(
+            "UPDATE tasks SET last_worker_pid=(SELECT r.worker_pid FROM task_runs r "
+            "WHERE r.task_id=tasks.id AND r.worker_pid IS NOT NULL "
+            "ORDER BY r.id DESC LIMIT 1) WHERE last_worker_pid IS NULL"
         )
     if "last_heartbeat_at" not in cols:
         _add_column_if_missing(
@@ -4124,6 +4183,23 @@ def _append_event(
     )
 
 
+def _safe_failure_text(value: object, *, limit: int = 500) -> str:
+    return str(redact_review_value(str(value or "")))[:limit]
+
+
+def _retry_delay_seconds(failures: int) -> int:
+    return min(3600, 30 * (2 ** max(0, int(failures) - 1)))
+
+
+def _lifecycle_for_outcome(outcome: str) -> Optional[str]:
+    if outcome == "completed": return "completed"
+    if outcome in {"review_requested", "submitted_for_review"}: return "review"
+    if outcome == "blocked": return "human_blocked"
+    if outcome == "gave_up": return "terminal_failed"
+    if outcome in {"crashed", "timed_out", "spawn_failed", "transient", "rate_limited", "reclaimed", "stale", "released"}: return "retry_scheduled"
+    return None
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4150,6 +4226,10 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    run_row = conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    prior_pid = int(run_row["worker_pid"]) if run_row and run_row["worker_pid"] is not None else None
+    safe_error = _safe_failure_text(error) if error else None
+    safe_metadata = redact_review_value(metadata) if metadata else None
     conn.execute(
         """
         UPDATE task_runs
@@ -4160,8 +4240,7 @@ def _end_run(
                metadata      = ?,
                ended_at      = ?,
                claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
+               claim_expires = NULL
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -4169,15 +4248,22 @@ def _end_run(
             status or outcome,
             outcome,
             summary,
-            error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            safe_error,
+            json.dumps(safe_metadata, ensure_ascii=False) if safe_metadata else None,
             now,
             run_id,
         ),
     )
+    lifecycle = _lifecycle_for_outcome(outcome)
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id=NULL, last_worker_pid=COALESCE(?, last_worker_pid), "
+        "lifecycle_state=COALESCE(?, lifecycle_state) WHERE id=?",
+        (prior_pid, lifecycle, task_id),
     )
+    if outcome == "blocked":
+        conn.execute("UPDATE tasks SET recovery_owner='human', recovery_action=?, next_retry_at=NULL WHERE id=?", ((summary or "resolve the explicit human gate")[:500], task_id))
+    elif outcome == "completed":
+        conn.execute("UPDATE tasks SET recovery_owner=NULL, recovery_action=NULL, next_retry_at=NULL, error_category=NULL WHERE id=?", (task_id,))
     return run_id
 
 
@@ -4692,12 +4778,16 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id, status, consecutive_failures, max_retries, next_retry_at, lifecycle_state "
+            "FROM tasks WHERE status IN ('todo', 'blocked', 'failed')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if cur_status == "failed":
+                retry_at = row["next_retry_at"]
+                if row["lifecycle_state"] != "retry_scheduled" or retry_at is None or int(time.time()) < int(retry_at):
+                    continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4712,7 +4802,8 @@ def recompute_ready(
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
                 source_status = _latest_requeue_source_status(conn, task_id)
-                if cur_status == "blocked":
+                resume_status = "review" if source_status == "review" else "ready"
+                if cur_status in {"blocked", "failed"}:
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
                     # guard, a task that repeatedly exhausts its
@@ -4730,9 +4821,8 @@ def recompute_ready(
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
+                        "UPDATE tasks SET status=?, next_retry_at=NULL WHERE id=? AND status=?",
+                        (resume_status, task_id, cur_status),
                     )
                 else:
                     conn.execute(
@@ -4830,7 +4920,9 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
+                   started_at    = COALESCE(started_at, ?),
+                   lifecycle_state = 'active',
+                   next_retry_at = NULL
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
@@ -4921,10 +5013,12 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-              SET status        = 'running',
-                  claim_lock    = ?,
-                  claim_expires = ?,
-                  started_at    = COALESCE(started_at, ?)
+              SET status          = 'running',
+                  claim_lock      = ?,
+                  claim_expires   = ?,
+                  started_at      = COALESCE(started_at, ?),
+                  lifecycle_state = 'active',
+                  next_retry_at   = NULL
             WHERE id = ?
               AND status = 'review'
               AND (claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?)
@@ -5906,7 +6000,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'failed', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -5923,7 +6017,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'failed', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -6632,9 +6726,8 @@ def block_task(
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
       forcing a human-in-the-loop triage decision.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
+    * ``transient`` — enters the machine-failure retry path with bounded
+      backoff. It never becomes a generic human block.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -6643,6 +6736,15 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if kind == "transient":
+        current = get_task(conn, task_id)
+        if current is None or current.status not in {"running", "ready", "review"}:
+            return False
+        if expected_run_id is not None and current.current_run_id != int(expected_run_id):
+            return False
+        _record_task_failure(conn, task_id, reason or "transient worker failure",
+                             outcome="transient", release_claim=True, end_run=True)
+        return True
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6951,24 +7053,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # A blocked review card returns to the ``review`` column so the
-        # review dispatcher re-claims it via ``claim_review_task`` with the
-        # mandatory ``sdlc-review`` skill — never to ``ready``, where the
-        # ready loop would spawn it without the review skill.  Resolved
-        # before the UPDATE below (which clears ``current_run_id``); for a
-        # card whose review run was already closed by the auto-block, the
-        # event-history fallback in ``_requeue_status`` still detects the
-        # review lane.
+        # A blocked or terminal-failed review card returns to the review lane;
+        # other cards are re-gated against their parents before retry.
         requeue_status = _requeue_status(conn, task_id)
         if requeue_status == "review":
             new_status = "review"
         else:
-            # Re-gate on parent completion before flipping 'blocked' back to
-            # 'ready'. Unconditionally setting status='ready' here bypasses the
-            # parent-completion invariant (the dispatcher trusts that column);
-            # if parents are still in progress the task must wait in 'todo'
-            # until recompute_ready picks it up. RCA: Bug 2 at
-            # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
             undone_parents = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks p ON p.id = l.parent_id "
@@ -6986,11 +7076,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
         # still reset here, which is correct: a deliberate unblock is a fresh
         # start for the dispatcher's retry budget.
+        lifecycle = "review" if new_status == "review" else "retry_scheduled"
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
+            "UPDATE tasks SET status=?, current_run_id=NULL, consecutive_failures=0, "
+            "last_failure_error=NULL, lifecycle_state=?, error_category=NULL, next_retry_at=NULL, "
+            "recovery_owner=NULL, recovery_action=NULL WHERE id=? AND status IN ('blocked','failed','scheduled')",
+            (new_status, lifecycle, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -8617,7 +8708,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee, metadata FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, metadata, "
+            "consecutive_failures, current_run_id FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8740,16 +8832,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            requeue_status = _requeue_status(conn, row["id"])
-            if requeue_status == "review":
+            retry_status = _requeue_status(conn, row["id"])
+            event_payload["retry_status"] = retry_status
+            if retry_status == "review":
                 event_payload["source_status"] = "review"
+            projected_failures = int(row["consecutive_failures"] or 0) + (0 if rate_limited_exit else 1)
+            retry_at = int(time.time()) + (_resolve_rate_limit_cooldown_seconds() if rate_limited_exit else _retry_delay_seconds(max(1, projected_failures)))
+            error_category = "rate_limit" if rate_limited_exit else ("protocol_violation" if protocol_violation else "worker_crash")
+            remediation = "verify prior work and perform the required terminal Kanban transition" if protocol_violation else "retry after bounded backoff"
+            event_payload.update({
+                "run_id": row["current_run_id"], "prior_pid": pid,
+                "exit_kind": kind, "exit_code": code,
+                "error_category": error_category, "resulting_task_state": retry_status,
+                "retry_count": projected_failures, "next_retry_at": retry_at,
+                "recovery_owner": "dispatcher", "remediation": remediation,
+            })
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires=NULL, worker_pid=NULL, last_worker_pid=?, last_exit_kind=?, "
+                "last_exit_code=?, error_category=?, lifecycle_state='retry_scheduled', "
+                "next_retry_at=?, recovery_owner='dispatcher', recovery_action=? "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (requeue_status, row["id"], pid, row["claim_lock"]),
-            )
+                (retry_status, pid, kind, code, error_category, retry_at, remediation,
+                 row["id"], pid, row["claim_lock"]),            )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
@@ -8970,129 +9076,69 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
+    error = _safe_failure_text(error)
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
-    blocked = False
+    tripped = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT consecutive_failures, status, max_retries, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
         ).fetchone()
         if row is None:
             return False
-        source_status = _requeue_status(conn, task_id)
+        retry_status = _requeue_status(conn, task_id) if release_claim else ("review" if row["status"] == "review" else "ready")
         failures = int(row["consecutive_failures"]) + 1
-
-        # Per-task override wins over both caller-supplied and default
-        # thresholds. None (the common case) falls through.
-        task_override = (
-            row["max_retries"] if "max_retries" in row.keys() else None
-        )
-        if task_override is not None:
-            effective_limit = int(task_override)
-            limit_source = "task"
-        else:
-            effective_limit = int(failure_limit)
-            limit_source = "dispatcher"
-
-        if force_trip or failures >= effective_limit:
-            # Trip the breaker.
-            if release_claim:
-                # Spawn path: still running, also clear claim state.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
-                conn.execute(
-                    "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
-                    (failures, error[:500], task_id),
-                )
-            run_id = None
-            if end_run:
-                # Only the spawn path has an open run to close.
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome="gave_up", status="gave_up",
-                    error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "trigger_outcome": outcome,
-                        "effective_limit": effective_limit,
-                        "limit_source": limit_source,
-                    },
-                )
-            payload = {
-                "failures": failures,
-                "effective_limit": effective_limit,
-                "limit_source": limit_source,
-                "error": error[:500],
-                "trigger_outcome": outcome,
-            }
-            if event_payload_extra:
-                payload.update(event_payload_extra)
-            if source_status == "review":
-                payload["source_status"] = "review"
-            _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
+        task_override = row["max_retries"] if "max_retries" in row.keys() else None
+        effective_limit = int(task_override) if task_override is not None else int(failure_limit)
+        limit_source = "task" if task_override is not None else "dispatcher"
+        error_category = {"spawn_failed": "spawn_failure", "timed_out": "timeout", "crashed": "worker_crash", "transient": "transient"}.get(outcome, "machine_failure")
+        next_retry_at = int(time.time()) + _retry_delay_seconds(failures)
+        tripped = bool(force_trip or failures >= effective_limit)
+        if tripped:
+            conn.execute(
+                "UPDATE tasks SET status='failed', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "consecutive_failures=?, last_failure_error=?, lifecycle_state='terminal_failed', "
+                "error_category=?, next_retry_at=NULL, recovery_owner='orion', "
+                "recovery_action='diagnose and route agent-owned remediation' "
+                "WHERE id=? AND status IN ('running','ready','review')",
+                (failures, error, error_category, task_id),
             )
-            blocked = True
+            run_id = _end_run(conn, task_id, outcome="gave_up", status="gave_up", error=error,
+                              metadata={"failures": failures, "trigger_outcome": outcome,
+                                        "effective_limit": effective_limit, "limit_source": limit_source,
+                                        "retry_status": retry_status}) if end_run else None
+            payload = {"failures": failures, "effective_limit": effective_limit,
+                       "limit_source": limit_source, "error": error, "trigger_outcome": outcome,
+                       "retry_status": retry_status, "error_category": error_category,
+                       "resulting_task_state": "failed", "retry_count": failures,
+                       "next_retry_at": None, "recovery_owner": "orion",
+                       "remediation": "diagnose and route agent-owned remediation"}
+            if event_payload_extra:
+                payload.update(redact_review_value(event_payload_extra))
+            if retry_status == "review":
+                payload["source_status"] = "review"
+            _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         else:
-            # Below threshold.
-            if release_claim:
-                # Spawn path: transition running → requeue status + clear
-                # claim.  A review claim (``claim_review_task``) must return
-                # to the ``review`` column so the review dispatcher re-claims
-                # it with the mandatory ``sdlc-review`` skill — never to
-                # ``ready``, where the ready loop would spawn it without the
-                # skill.  Resolve the requeue status BEFORE the UPDATE: it
-                # reads the active run's ``source_status`` metadata, which
-                # ``_end_run`` below clears (and overwrites) once the run is
-                # closed.
-                requeue_status = _requeue_status(conn, task_id)
-                conn.execute(
-                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                    "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
-                    (requeue_status, failures, error[:500], task_id),
-                )
-            else:
-                # Timeout/crash path: task is already at ``ready`` via
-                # its own UPDATE. Just bookkeep the counter + last error.
-                conn.execute(
-                    "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
-                )
+            conn.execute(
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "consecutive_failures=?, last_failure_error=?, lifecycle_state='retry_scheduled', "
+                "error_category=?, next_retry_at=?, recovery_owner='dispatcher', "
+                "recovery_action='retry after bounded backoff' WHERE id=? AND status IN ('running','ready','review')",
+                (retry_status, failures, error, error_category, next_retry_at, task_id),
+            )
             if end_run:
-                # Spawn path: close the open run with outcome.
-                run_id = _end_run(
-                    conn, task_id,
-                    outcome=outcome, status=outcome,
-                    error=error[:500],
-                    metadata={"failures": failures},
-                )
-                _append_event(
-                    conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        **({"source_status": "review"} if source_status == "review" else {}),
-                    },
-                    run_id=run_id,
-                )
-            # Timeout/crash path's caller already emitted its own event.
-    return blocked
-
+                run_id = _end_run(conn, task_id, outcome=outcome, status=outcome, error=error,
+                                  metadata={"failures": failures, "retry_status": retry_status,
+                                            "next_retry_at": next_retry_at, "error_category": error_category})
+                event_payload = {"error": error, "failures": failures, "retry_status": retry_status,
+                                 "error_category": error_category, "resulting_task_state": retry_status,
+                                 "retry_count": failures, "next_retry_at": next_retry_at,
+                                 "recovery_owner": "dispatcher", "remediation": "retry after bounded backoff"}
+                if retry_status == "review":
+                    event_payload["source_status"] = "review"
+                _append_event(conn, task_id, outcome, event_payload, run_id=run_id)
+    return tripped
 
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
@@ -9224,7 +9270,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT status, last_failure_error, metadata FROM tasks WHERE id = ?",
+        "SELECT status, last_failure_error, metadata, next_retry_at FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9240,6 +9286,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     )
 
     now = int(time.time())
+    if row["next_retry_at"] is not None and now < int(row["next_retry_at"]):
+        return "retry_backoff"
 
     # 1. Rate-limit cooldown. The most recent run ended ``rate_limited``
     #    (quota wall) — defer while inside the cooldown window, then allow a
@@ -9285,7 +9333,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
-    if err and _RESPAWN_BLOCKER_RE.search(err):
+    if err and _RESPAWN_BLOCKER_RE.search(err) and row["next_retry_at"] is None:
         return "blocker_auth"
 
     # 3. Completed run within guard window — proof of recent success.
