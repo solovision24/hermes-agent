@@ -375,7 +375,20 @@ def test_review_external_human_gate_remains_blockable(monkeypatch, tmp_path):
 
     tid = _make_review_worker_env(monkeypatch, tmp_path)
     reason = "Human gate: owner approval required for production signing"
-    out = json.loads(kt._handle_block({"reason": reason, "kind": "needs_input"}))
+    human_gate = {
+        "category": "legal_or_customer_authorization",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Approve production signing.",
+        "proposed_default": "Keep the task paused.",
+    }
+    out = json.loads(kt._handle_block({
+        "reason": reason,
+        "kind": "needs_input",
+        "human_gate": human_gate,
+    }))
     assert out["ok"] is True
     conn = kb.connect()
     try:

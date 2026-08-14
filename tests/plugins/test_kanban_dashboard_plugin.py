@@ -54,6 +54,18 @@ def _human_gate() -> dict:
     }
 
 
+def _create_test_task(client: TestClient, title: str) -> dict:
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": title,
+            "assignee": "researcher",
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["task"]
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -141,10 +153,7 @@ def test_create_task_body_accepts_lifecycle_metadata():
 
 
 def test_dashboard_block_requires_structured_human_gate(client):
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "ordinary failure", "assignee": "dev"},
-    ).json()["task"]
+    task = _create_test_task(client, "ordinary failure")
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
@@ -159,10 +168,7 @@ def test_dashboard_block_requires_structured_human_gate(client):
 
 
 def test_dashboard_block_accepts_irreducible_human_gate(client):
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "OAuth consent", "assignee": "dev"},
-    ).json()["task"]
+    task = _create_test_task(client, "OAuth consent")
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
@@ -467,13 +473,7 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 
 
 def test_bulk_block_accepts_structured_human_gate(client):
-    tasks = [
-        client.post(
-            "/api/plugins/kanban/tasks",
-            json={"title": title, "assignee": "dev"},
-        ).json()["task"]
-        for title in ("OAuth a", "OAuth b")
-    ]
+    tasks = [_create_test_task(client, title) for title in ("OAuth a", "OAuth b")]
 
     response = client.post(
         "/api/plugins/kanban/tasks/bulk",
