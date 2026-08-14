@@ -898,6 +898,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     reason=payload.block_reason,
                     kind=payload.block_kind,
                     human_gate=payload.human_gate,
+                    require_human_gate=True,
                 )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)

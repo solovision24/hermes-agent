@@ -6788,6 +6788,7 @@ def block_task(
     kind: Optional[str] = None,
     human_gate: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
+    require_human_gate: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6846,9 +6847,9 @@ def block_task(
             return False
         # Direct/internal callers predate structured human gates and do not hold
         # a worker run id. Preserve that ordinary block contract. Worker-owned
-        # transitions (which pass ``expected_run_id``) must still prove an
+        # transitions and explicitly strict surfaces must still prove an
         # irreducible human gate before leaving autonomous recovery.
-        if expected_run_id is None:
+        if expected_run_id is None and not require_human_gate:
             misuse_reason = (
                 validate_human_gate(human_gate) if human_gate is not None else None
             )
