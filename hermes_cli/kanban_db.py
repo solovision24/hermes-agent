@@ -125,6 +125,21 @@ VALID_INITIAL_STATUSES = {"running", "blocked", "review", "triage"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+AUTONOMOUS_RECOVERY_STAGES = (
+    "classify_evidence",
+    "bounded_retry_backoff",
+    "capability_preflight_repair",
+    "qualified_profile_reassignment",
+    "configured_provider_tool_fallback",
+    "specialist_arbitration_review",
+    "safe_reversible_default",
+)
+IRREDUCIBLE_HUMAN_GATE_CATEGORIES = frozenset({
+    "identity_or_oauth_consent",
+    "legal_or_customer_authorization",
+    "financial_purchase",
+})
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -160,6 +175,33 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     raise ValueError(
         f"reasoning_effort must be one of {allowed}, got {effort!r}"
     )
+
+
+def validate_human_gate(human_gate: object) -> Optional[str]:
+    """Return a policy violation code, or ``None`` for a valid human gate."""
+    if not isinstance(human_gate, dict):
+        return "missing_structured_human_gate"
+    if human_gate.get("category") not in IRREDUCIBLE_HUMAN_GATE_CATEGORIES:
+        return "category_not_irreducible"
+    exhausted = human_gate.get("exhausted_paths")
+    if not isinstance(exhausted, list):
+        return "autonomous_paths_not_exhausted"
+    stages: list[str] = []
+    for item in exhausted:
+        if not isinstance(item, dict):
+            return "autonomous_paths_not_exhausted"
+        stage = str(item.get("stage") or "").strip()
+        evidence = str(item.get("evidence") or "").strip()
+        if not stage or not evidence:
+            return "autonomous_paths_not_exhausted"
+        stages.append(stage)
+    if stages != list(AUTONOMOUS_RECOVERY_STAGES):
+        return "autonomous_paths_not_exhausted"
+    if not str(human_gate.get("exact_ask") or "").strip():
+        return "missing_exact_ask"
+    if not str(human_gate.get("proposed_default") or "").strip():
+        return "missing_proposed_default"
+    return None
 
 
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -6704,6 +6746,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    human_gate: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -6742,9 +6785,64 @@ def block_task(
             return False
         if expected_run_id is not None and current.current_run_id != int(expected_run_id):
             return False
-        _record_task_failure(conn, task_id, reason or "transient worker failure",
-                             outcome="transient", release_claim=True, end_run=True)
-        return True
+        recorded = _record_task_failure(
+            conn,
+            task_id,
+            reason or "transient worker failure",
+            outcome="transient",
+            release_claim=True,
+            end_run=True,
+            expected_run_id=expected_run_id,
+        )
+        return recorded is not None
+    if kind != "dependency":
+        current = get_task(conn, task_id)
+        if current is None or current.status not in {"running", "ready", "review"}:
+            return False
+        if (
+            expected_run_id is not None
+            and current.current_run_id != int(expected_run_id)
+        ):
+            return False
+        misuse_reason = (
+            "human_gate_kind_required"
+            if kind not in {"needs_input", "capability"}
+            else validate_human_gate(human_gate)
+        )
+        if misuse_reason is not None:
+            safe_gate = redact_review_value(human_gate) if human_gate else None
+            recorded = _record_task_failure(
+                conn,
+                task_id,
+                reason or "human escalation policy misuse",
+                outcome="human_gate_misuse",
+                force_trip=True,
+                release_claim=True,
+                end_run=True,
+                expected_run_id=expected_run_id,
+                event_payload_extra={
+                    "policy_violation": misuse_reason,
+                    "attempted_block_kind": kind,
+                },
+            )
+            if recorded is None:
+                return False
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "human_gate_rejected",
+                    {
+                        "reason": misuse_reason,
+                        "attempted_block_kind": kind,
+                        "human_gate": safe_gate,
+                        "autonomous_recovery_stages": list(AUTONOMOUS_RECOVERY_STAGES),
+                        "recovery_owner": "orion",
+                        "remediation": "route agent-owned recovery through the autonomous ladder",
+                    },
+                )
+            return True
+        human_gate = redact_review_value(human_gate)
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6929,10 +7027,22 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "recurrences": recurrences,
+                    "human_gate": human_gate,
                     **({"source_status": source_status} if source_status else {}),
                 },
                 run_id=run_id,
             )
+        recovery_action = (
+            human_gate.get("exact_ask")
+            if isinstance(human_gate, dict)
+            else None
+        ) or reason or "resolve the explicit human gate"
+        conn.execute(
+            "UPDATE tasks SET lifecycle_state='human_blocked', "
+            "recovery_owner='human', recovery_action=?, next_retry_at=NULL "
+            "WHERE id=?",
+            (str(recovery_action)[:500], task_id),
+        )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -9031,8 +9141,9 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    expected_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
-) -> bool:
+) -> Optional[bool]:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
 
@@ -9041,8 +9152,10 @@ def _record_task_failure(
     through here so the ``consecutive_failures`` counter and the
     auto-block threshold stay consistent.
 
-    Returns True when the task was auto-blocked (counter reached
-    ``failure_limit``), False when it was just updated in place.
+    Returns True when the task entered terminal failure (counter reached
+    ``failure_limit``), False when it was just updated in place, and None when
+    ``expected_run_id`` no longer owns the task. Ownership is checked inside
+    the write transaction so a stale worker cannot fail a replacement run.
 
     Modes:
 
@@ -9087,6 +9200,11 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        if (
+            expected_run_id is not None
+            and row["current_run_id"] != int(expected_run_id)
+        ):
+            return None
         retry_status = _requeue_status(conn, task_id) if release_claim else ("review" if row["status"] == "review" else "ready")
         failures = int(row["consecutive_failures"]) + 1
         task_override = row["max_retries"] if "max_retries" in row.keys() else None
@@ -9113,7 +9231,8 @@ def _record_task_failure(
                        "retry_status": retry_status, "error_category": error_category,
                        "resulting_task_state": "failed", "retry_count": failures,
                        "next_retry_at": None, "recovery_owner": "orion",
-                       "remediation": "diagnose and route agent-owned remediation"}
+                       "remediation": "diagnose and route agent-owned remediation",
+                       "autonomous_recovery_stages": list(AUTONOMOUS_RECOVERY_STAGES)}
             if event_payload_extra:
                 payload.update(redact_review_value(event_payload_extra))
             if retry_status == "review":
@@ -9149,12 +9268,16 @@ def _record_spawn_failure(
     *,
     failure_limit: int = None,
 ) -> bool:
-    return _record_task_failure(
-        conn, task_id, error,
-        outcome="spawn_failed",
-        failure_limit=failure_limit,
-        release_claim=True,
-        end_run=True,
+    return bool(
+        _record_task_failure(
+            conn,
+            task_id,
+            error,
+            outcome="spawn_failed",
+            failure_limit=failure_limit,
+            release_claim=True,
+            end_run=True,
+        )
     )
 
 

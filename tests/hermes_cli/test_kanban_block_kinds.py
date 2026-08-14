@@ -7,7 +7,7 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
   never enter the human ``blocked`` bucket a cron would keep unblocking.
-* ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
+* Structured ``needs_input`` / ``capability`` human gates land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
@@ -50,6 +50,18 @@ def _make_running_again(conn, tid):
     assert kb.claim_task(conn, tid, claimer="worker") is not None
 
 
+def _human_gate() -> dict:
+    return {
+        "category": "identity_or_oauth_consent",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Complete the provider OAuth consent screen.",
+        "proposed_default": "Keep the task paused without provider changes.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Loop breaker
 # ---------------------------------------------------------------------------
@@ -66,10 +78,10 @@ def _make_running_again(conn, tid):
 def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
-        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.block_task(conn, tid, reason="x", kind="capability", human_gate=_human_gate())
         kb.unblock_task(conn, tid)
         _make_running_again(conn, tid)
-        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.block_task(conn, tid, reason="x", kind="capability", human_gate=_human_gate())
         events = [e for e in kb.list_events(conn, tid)
                   if e.kind == "block_loop_detected"]
         assert events, "expected a block_loop_detected event"

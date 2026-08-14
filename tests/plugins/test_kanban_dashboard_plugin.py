@@ -42,6 +42,18 @@ def _load_plugin_router():
     return mod.router
 
 
+def _human_gate() -> dict:
+    return {
+        "category": "identity_or_oauth_consent",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Complete the provider OAuth consent screen.",
+        "proposed_default": "Keep the task paused without provider changes.",
+    }
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -126,6 +138,47 @@ def test_create_task_body_accepts_lifecycle_metadata():
     assert payload.metadata == {
         kb.EXISTING_PR_REMEDIATION_METADATA_KEY: True
     }
+
+
+def test_dashboard_block_requires_structured_human_gate(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "ordinary failure", "assignee": "dev"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "CI failed"},
+    )
+
+    assert response.status_code == 200, response.text
+    with kb.connect_closing() as conn:
+        stored = kb.get_task(conn, task["id"])
+        assert stored is not None and stored.status == "failed"
+        assert stored.recovery_owner == "orion"
+
+
+def test_dashboard_block_accepts_irreducible_human_gate(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "OAuth consent", "assignee": "dev"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "blocked",
+            "block_reason": "OAuth consent required",
+            "block_kind": "capability",
+            "human_gate": _human_gate(),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    with kb.connect_closing() as conn:
+        stored = kb.get_task(conn, task["id"])
+        assert stored is not None and stored.status == "blocked"
+        assert stored.recovery_owner == "human"
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -413,14 +466,49 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_bulk_block_accepts_structured_human_gate(client):
+    tasks = [
+        client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": title, "assignee": "dev"},
+        ).json()["task"]
+        for title in ("OAuth a", "OAuth b")
+    ]
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task["id"] for task in tasks],
+            "status": "blocked",
+            "block_reason": "OAuth consent required",
+            "block_kind": "capability",
+            "human_gate": _human_gate(),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert all(item["ok"] for item in response.json()["results"])
+    with kb.connect_closing() as conn:
+        stored = [kb.get_task(conn, task["id"]) for task in tasks]
+        assert all(task is not None and task.status == "blocked" for task in stored)
+
+
 def test_bulk_status_ready(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
     c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
     # Parent-less tasks land in "ready" already; push them to blocked first.
     for tid in (a["id"], b["id"], c2["id"]):
-        client.patch(f"/api/plugins/kanban/tasks/{tid}",
-                     json={"status": "blocked", "block_reason": "wait"})
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{tid}",
+            json={
+                "status": "blocked",
+                "block_reason": "OAuth consent required",
+                "block_kind": "capability",
+                "human_gate": _human_gate(),
+            },
+        )
+        assert response.status_code == 200, response.text
 
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"], b["id"], c2["id"]], "status": "ready"})

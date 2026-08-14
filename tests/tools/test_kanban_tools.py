@@ -15,6 +15,20 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+def _human_gate() -> dict:
+    from hermes_cli import kanban_db as kb
+
+    return {
+        "category": "identity_or_oauth_consent",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"exhausted {stage}"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Complete the provider OAuth consent screen.",
+        "proposed_default": "Keep the task paused without provider changes.",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
@@ -281,7 +295,11 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({
+        "reason": "OAuth consent is legally required",
+        "kind": "capability",
+        "human_gate": _human_gate(),
+    })
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
@@ -437,6 +455,16 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         assert kb.get_task(conn, tid).status == "running"
     finally:
         conn.close()
+
+
+def test_block_schema_exposes_canonical_autonomous_recovery_stages():
+    from hermes_cli import kanban_db as kb
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+
+    stage_schema = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["human_gate"][
+        "properties"
+    ]["exhausted_paths"]["items"]["properties"]["stage"]
+    assert stage_schema["enum"] == list(kb.AUTONOMOUS_RECOVERY_STAGES)
 
 
 def test_heartbeat_extends_claim_expires(worker_env):
@@ -785,7 +813,13 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
-        kb.block_task(conn, other, reason="waiting")
+        kb.block_task(
+            conn,
+            other,
+            reason="OAuth consent is legally required",
+            kind="capability",
+            human_gate=_human_gate(),
+        )
     finally:
         conn.close()
 

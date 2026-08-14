@@ -27,6 +27,18 @@ def _event(conn, task_id: str, kind: str) -> dict:
     return json.loads(row["payload"])
 
 
+def _irreducible_human_gate() -> dict:
+    return {
+        "category": "identity_or_oauth_consent",
+        "exhausted_paths": [
+            {"stage": stage, "evidence": f"verified {stage} cannot resolve this consent"}
+            for stage in kb.AUTONOMOUS_RECOVERY_STAGES
+        ],
+        "exact_ask": "Complete the provider OAuth consent screen.",
+        "proposed_default": "Keep the task paused without changing providers.",
+    }
+
+
 def test_completion_clears_active_pid_but_preserves_run_history(conn) -> None:
     task_id = kb.create_task(conn, title="complete", assignee="dev")
     claimed = kb.claim_task(conn, task_id)
@@ -64,16 +76,38 @@ def test_dead_pid_transition_is_complete_and_sanitized(conn, monkeypatch: pytest
     assert event["recovery_owner"] == "dispatcher" and event["remediation"]
 
 
-def test_retry_exhaustion_is_terminal_failed_not_human_blocked(conn) -> None:
-    task_id = kb.create_task(conn, title="spawn", assignee="dev", max_retries=1)
+@pytest.mark.parametrize(
+    ("outcome", "message"),
+    [
+        ("spawn_failed", "worker startup failed"),
+        ("spawn_failed", "provider quota exhausted"),
+        ("crashed", "repository worktree is unavailable"),
+        ("timed_out", "CI verification timed out"),
+    ],
+)
+def test_machine_failure_exhaustion_is_agent_owned_not_human_blocked(
+    conn, outcome: str, message: str
+) -> None:
+    task_id = kb.create_task(conn, title=message, assignee="dev", max_retries=1)
     kb.claim_task(conn, task_id)
-    assert kb._record_spawn_failure(conn, task_id, "provider permanently unavailable", failure_limit=1)
+    assert kb._record_task_failure(
+        conn,
+        task_id,
+        message,
+        outcome=outcome,
+        failure_limit=1,
+        release_claim=True,
+        end_run=True,
+    )
     task = kb.get_task(conn, task_id)
     assert task is not None
     event = _event(conn, task_id, "gave_up")
     assert task.status == "failed" and task.lifecycle_state == "terminal_failed"
-    assert task.recovery_owner == "orion" and task.recovery_action and task.block_kind is None
-    assert event["resulting_task_state"] == "failed" and event["error_category"] == "spawn_failure"
+    assert task.recovery_owner == "orion" and task.recovery_action
+    assert task.block_kind is None and task.recovery_owner != "human"
+    assert event["resulting_task_state"] == "failed"
+    assert event["recovery_owner"] == "orion"
+    assert event["autonomous_recovery_stages"] == list(kb.AUTONOMOUS_RECOVERY_STAGES)
 
 
 def test_retry_backoff_is_visible_and_dispatch_guarded(conn, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,10 +128,71 @@ def test_explicit_block_remains_human_blocked(conn) -> None:
     task_id = kb.create_task(conn, title="decision", assignee="dev")
     claimed = kb.claim_task(conn, task_id)
     assert claimed is not None
-    assert kb.block_task(conn, task_id, reason="OAuth consent is legally required", kind="capability", expected_run_id=claimed.current_run_id)
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="OAuth consent is legally required",
+        kind="capability",
+        human_gate=_irreducible_human_gate(),
+        expected_run_id=claimed.current_run_id,
+    )
     task = kb.get_task(conn, task_id)
     assert task is not None and task.status == "blocked"
     assert task.lifecycle_state == "human_blocked" and task.recovery_owner == "human"
+    blocked = _event(conn, task_id, "blocked")
+    assert blocked["human_gate"]["category"] == "identity_or_oauth_consent"
+    assert blocked["human_gate"]["exact_ask"]
+    assert blocked["human_gate"]["proposed_default"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_reason"),
+    [
+        (None, "human_gate_kind_required"),
+        ("needs_input", "missing_structured_human_gate"),
+        ("capability", "missing_structured_human_gate"),
+    ],
+)
+def test_unstructured_human_gate_is_rejected_to_agent_owned_recovery(
+    conn, kind, expected_reason
+) -> None:
+    task_id = kb.create_task(conn, title="ordinary recovery", assignee="dev")
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="tests are failing; need approval",
+        kind=kind,
+        expected_run_id=claimed.current_run_id,
+    )
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "failed" and task.lifecycle_state == "terminal_failed"
+    assert task.recovery_owner == "orion" and task.block_kind is None
+    rejected = _event(conn, task_id, "human_gate_rejected")
+    assert rejected["reason"] == expected_reason
+
+
+def test_human_gate_category_must_be_irreducible_and_paths_ordered(conn) -> None:
+    task_id = kb.create_task(conn, title="bad escalation", assignee="dev")
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None
+    gate = _irreducible_human_gate()
+    gate["category"] = "code_review"
+    gate["exhausted_paths"] = list(reversed(gate["exhausted_paths"]))
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="maintainer should review",
+        kind="needs_input",
+        human_gate=gate,
+        expected_run_id=claimed.current_run_id,
+    )
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "failed"
+    rejected = _event(conn, task_id, "human_gate_rejected")
+    assert rejected["reason"] in {"category_not_irreducible", "autonomous_paths_not_exhausted"}
 
 
 def test_transient_block_uses_machine_retry_not_human_block(conn) -> None:
@@ -108,6 +203,32 @@ def test_transient_block_uses_machine_retry_not_human_block(conn) -> None:
     task = kb.get_task(conn, task_id)
     assert task is not None and task.status == "ready"
     assert task.lifecycle_state == "retry_scheduled" and task.recovery_owner == "dispatcher"
+
+
+def test_stale_run_cannot_terminal_fail_replacement_run(conn) -> None:
+    task_id = kb.create_task(conn, title="ownership race", assignee="dev")
+    stale = kb.claim_task(conn, task_id, claimer="dev:stale")
+    assert stale is not None and stale.current_run_id is not None
+    assert kb.reclaim_task(conn, task_id, reason="replace stale worker")
+    replacement = kb.claim_task(conn, task_id, claimer="dev:replacement")
+    assert replacement is not None and replacement.current_run_id is not None
+
+    recorded = kb._record_task_failure(
+        conn,
+        task_id,
+        "stale worker attempted terminal failure",
+        outcome="human_gate_misuse",
+        force_trip=True,
+        release_claim=True,
+        end_run=True,
+        expected_run_id=stale.current_run_id,
+    )
+
+    task = kb.get_task(conn, task_id)
+    assert recorded is None
+    assert task is not None and task.status == "running"
+    assert task.current_run_id == replacement.current_run_id
+    assert not [event for event in kb.list_events(conn, task_id) if event.kind == "gave_up"]
 
 
 def test_failure_evidence_redacts_secret_like_values(conn) -> None:
