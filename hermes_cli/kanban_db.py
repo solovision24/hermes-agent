@@ -4225,6 +4225,19 @@ def _append_event(
     )
 
 
+def redact_review_value(value: Any) -> Any:
+    """Redact secrets at the domain boundary for durable review handoffs."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, dict):
+        return {key: redact_review_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_review_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_review_value(item) for item in value)
+    return value
+
+
 def _safe_failure_text(value: object, *, limit: int = 500) -> str:
     return str(redact_review_value(str(value or "")))[:limit]
 
@@ -9377,15 +9390,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
-        seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning. Bypassed when an
-        explicit re-queue event (status change, promote, unblock, reclaim)
-        arrives AFTER that completion — that's a deliberate re-run request.
+        seconds. Useful work already succeeded for this task; wait for an
+        explicit re-queue rather than immediately re-spawning. Bypassed when an
+        explicit re-queue event (status change, promote, unblock, reclaim, or
+        reviewer-requested implementation rework) arrives AFTER that completion
+        — that's a deliberate re-run request.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        opened a PR; re-spawning risks a duplicate PR on the same task. A later
+        reviewer-requested implementation requeue bypasses this rule because it
+        must update that existing PR rather than create duplicate work.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9459,6 +9475,24 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if err and _RESPAWN_BLOCKER_RE.search(err) and row["next_retry_at"] is None:
         return "blocker_auth"
 
+    # A reviewer can explicitly return this same card to its original
+    # implementer via request_review_changes(). That transition is stronger
+    # evidence than the stale success/PR signals below: the existing PR is
+    # precisely what the requeued implementation must update. Keep this
+    # separate from ordinary status/promote/unblock events, which may bypass
+    # a recent completed run but must not bypass duplicate-PR protection.
+    implementation_requeue = conn.execute(
+        "SELECT MAX(created_at) AS created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN ("
+        "'review_changes_requested', 'changes_requested', 'review_reopened')",
+        (task_id,),
+    ).fetchone()
+    implementation_requeued_at = (
+        int(implementation_requeue["created_at"])
+        if implementation_requeue
+        and implementation_requeue["created_at"] is not None
+        else None
+    )
     # 3. Completed run within guard window — proof of recent success.
     #    Exception: an explicit re-queue AFTER that success (an operator
     #    dragging done→ready, a dependency re-promotion, an unblock, a
@@ -9477,7 +9511,9 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "             'review_changes_requested', 'changes_requested', "
+            "             'review_reopened') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -9488,15 +9524,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     # appears in the card's comments. Ordinary implementation work remains
     # protected by the active-PR guard.
     existing_pr_remediation = _is_existing_pr_remediation(row)
-    review_changes_requested = any(
-        event.kind == "review_changes_requested"
-        for event in list_events(conn, task_id)
-    )
-
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
@@ -9504,8 +9536,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             # duplicate implementation retry.  Only bypass when the review
             # claim is newer than the PR comment, so an ordinary implementation
             # task with an unrelated historical review event remains guarded.
-            if review_claim or existing_pr_remediation or review_changes_requested:
+            if review_claim or existing_pr_remediation:
                 return None
+            if (
+                implementation_requeued_at is not None
+                and implementation_requeued_at >= int(c["created_at"])
+            ):
+                continue
             return "active_pr"
 
     return None
