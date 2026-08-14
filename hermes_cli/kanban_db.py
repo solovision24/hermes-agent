@@ -5475,6 +5475,33 @@ def request_review_changes(
     return task_id
 
 
+def request_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Compatibility wrapper for the pre-native review tool contract.
+
+    Older reviewer sessions expose ``kanban_request_changes`` and pass a
+    ``reason``. Route that request through the canonical native transition so
+    a ``review_submitted`` handoff is handled exactly like the newer
+    ``kanban_review_changes`` path instead of looking only for the retired
+    ``review_requested`` event.
+    """
+    remediation = request_review_changes(
+        conn,
+        task_id,
+        summary=reason,
+        expected_run_id=expected_run_id,
+    )
+    if remediation is None:
+        return False, "native review remediation transition refused"
+    task = get_task(conn, task_id)
+    return True, task.assignee if task is not None else None
+
+
 
 def heartbeat_claim(
     conn: sqlite3.Connection,
@@ -6817,11 +6844,20 @@ def block_task(
             and current.current_run_id != int(expected_run_id)
         ):
             return False
-        misuse_reason = (
-            "human_gate_kind_required"
-            if kind not in {"needs_input", "capability"}
-            else validate_human_gate(human_gate)
-        )
+        # Direct/internal callers predate structured human gates and do not hold
+        # a worker run id. Preserve that ordinary block contract. Worker-owned
+        # transitions (which pass ``expected_run_id``) must still prove an
+        # irreducible human gate before leaving autonomous recovery.
+        if expected_run_id is None:
+            misuse_reason = (
+                validate_human_gate(human_gate) if human_gate is not None else None
+            )
+        else:
+            misuse_reason = (
+                "human_gate_kind_required"
+                if kind not in {"needs_input", "capability"}
+                else validate_human_gate(human_gate)
+            )
         if misuse_reason is not None:
             safe_gate = redact_review_value(human_gate) if human_gate else None
             recorded = _record_task_failure(
@@ -9227,13 +9263,31 @@ def _record_task_failure(
         next_retry_at = int(time.time()) + _retry_delay_seconds(failures)
         tripped = bool(force_trip or failures >= effective_limit)
         if tripped:
+            terminal_status = "blocked" if retry_status == "review" else "failed"
+            lifecycle_state = (
+                "human_blocked" if terminal_status == "blocked" else "terminal_failed"
+            )
+            recovery_owner = "human" if terminal_status == "blocked" else "orion"
+            recovery_action = (
+                "unblock to retry review"
+                if terminal_status == "blocked"
+                else "diagnose and route agent-owned remediation"
+            )
             conn.execute(
-                "UPDATE tasks SET status='failed', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
-                "consecutive_failures=?, last_failure_error=?, lifecycle_state='terminal_failed', "
-                "error_category=?, next_retry_at=NULL, recovery_owner='orion', "
-                "recovery_action='diagnose and route agent-owned remediation' "
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "consecutive_failures=?, last_failure_error=?, lifecycle_state=?, "
+                "error_category=?, next_retry_at=NULL, recovery_owner=?, recovery_action=? "
                 "WHERE id=? AND status IN ('running','ready','review')",
-                (failures, error, error_category, task_id),
+                (
+                    terminal_status,
+                    failures,
+                    error,
+                    lifecycle_state,
+                    error_category,
+                    recovery_owner,
+                    recovery_action,
+                    task_id,
+                ),
             )
             run_id = _end_run(conn, task_id, outcome="gave_up", status="gave_up", error=error,
                               metadata={"failures": failures, "trigger_outcome": outcome,
@@ -9242,9 +9296,9 @@ def _record_task_failure(
             payload = {"failures": failures, "effective_limit": effective_limit,
                        "limit_source": limit_source, "error": error, "trigger_outcome": outcome,
                        "retry_status": retry_status, "error_category": error_category,
-                       "resulting_task_state": "failed", "retry_count": failures,
-                       "next_retry_at": None, "recovery_owner": "orion",
-                       "remediation": "diagnose and route agent-owned remediation",
+                       "resulting_task_state": terminal_status, "retry_count": failures,
+                       "next_retry_at": None, "recovery_owner": recovery_owner,
+                       "remediation": recovery_action,
                        "autonomous_recovery_stages": list(AUTONOMOUS_RECOVERY_STAGES)}
             if event_payload_extra:
                 payload.update(redact_review_value(event_payload_extra))

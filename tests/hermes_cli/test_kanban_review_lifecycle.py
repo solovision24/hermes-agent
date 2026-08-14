@@ -78,6 +78,41 @@ def test_review_changes_returns_same_card_to_implementer(board):
         assert run["ended_at"] is not None
 
 
+def test_legacy_request_changes_accepts_native_review_submission(board):
+    """The compatibility transition must understand native review handoffs.
+
+    Older reviewer runtimes expose ``kanban_request_changes`` and therefore
+    call ``request_changes``.  A native implementation handoff emits
+    ``review_submitted`` rather than ``review_requested``; both event shapes
+    must route the same card back to its original implementer.
+    """
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            summary="ready",
+            metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Fix the regression test",
+            expected_run_id=review.current_run_id,
+        ) == (True, "dev")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "dev"
+
+
 def test_review_changes_after_pr_bypasses_stale_guards_and_reuses_card(
     board, monkeypatch
 ):

@@ -60,6 +60,7 @@ def test_review_lifecycle_tools_are_registered_and_worker_gated(monkeypatch, tmp
 
     assert registry.get_toolset_for_tool("kanban_submit_review") == "kanban"
     assert registry.get_toolset_for_tool("kanban_review_changes") == "kanban"
+    assert registry.get_toolset_for_tool("kanban_request_changes") == "kanban"
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     assert kt._check_kanban_mode() is False

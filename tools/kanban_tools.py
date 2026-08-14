@@ -661,7 +661,7 @@ def _handle_review_changes(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
-    summary = str(args.get("summary") or "").strip()
+    summary = str(args.get("summary") or args.get("reason") or "").strip()
     metadata = args.get("metadata")
     if isinstance(metadata, dict):
         metadata = json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
@@ -2344,6 +2344,20 @@ KANBAN_REVIEW_CHANGES_SCHEMA = {
     }, "required": ["summary"]},
 }
 
+KANBAN_REQUEST_CHANGES_SCHEMA = {
+    "name": "kanban_request_changes",
+    "description": (
+        "Compatibility alias for requesting implementation changes on the "
+        "currently claimed review card."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reason": {"type": "string"},
+        "metadata": {"type": "object"},
+        "board": _board_schema_prop(),
+    }, "required": ["reason"]},
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -2380,6 +2394,15 @@ registry.register(
     name="kanban_review_changes",
     toolset="kanban",
     schema=KANBAN_REVIEW_CHANGES_SCHEMA,
+    handler=_handle_review_changes,
+    check_fn=_check_kanban_mode,
+    emoji="🛠",
+)
+
+registry.register(
+    name="kanban_request_changes",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_CHANGES_SCHEMA,
     handler=_handle_review_changes,
     check_fn=_check_kanban_mode,
     emoji="🛠",
