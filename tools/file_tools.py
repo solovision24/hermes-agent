@@ -862,6 +862,25 @@ def _request_protected_instruction_approval(
         return blocked.format(why="requires approval but the approval "
                                   "subsystem is unavailable.")
 
+    try:
+        from hermes_cli.approval_ipc import request_approval, request_supported
+        from agent.redact import redact_sensitive_text
+        if request_supported():
+            result = request_approval(
+                label=display,
+                description=redact_sensitive_text(description, force=True),
+                approval_class="protected_instruction_write",
+                ttl_seconds=_approval._get_approval_timeout(),
+                is_interrupted=_approval.is_interrupted,
+            )
+            if result is not None:
+                if result.choice == "approve":
+                    return None
+                why = "approval prompt timed out without a user response" if result.failure == "timeout" else "was denied by the user"
+                return blocked.format(why=why + ".")
+    except Exception:
+        return blocked.format(why="requires approval but the parent approval channel failed.")
+
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session (Telegram/Discord/Slack). One-operation
     # only — no session/permanent buttons are offered.
