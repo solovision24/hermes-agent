@@ -3956,6 +3956,24 @@ def _present_with_selected_transport(
     allow_permanent: bool,
 ) -> dict:
     """Present through an explicitly selected plugin transport, if any."""
+    try:
+        from hermes_cli.approval_ipc import request_approval, request_supported
+        from agent.redact import redact_sensitive_text
+        if request_supported():
+            result = request_approval(
+                label=redact_sensitive_text(command, force=True),
+                description=redact_sensitive_text(description, force=True),
+                approval_class=pattern_key,
+                ttl_seconds=_get_approval_timeout(),
+                is_interrupted=is_interrupted,
+            )
+            if result is not None:
+                return {"selected": True, "choice": "once" if result.choice == "approve" else "deny",
+                        "failure": result.failure, "fallback": None, "name": "parent_process_ipc"}
+    except Exception:
+        logger.warning("Parent approval IPC failed", exc_info=True)
+        return {"selected": True, "choice": "deny", "failure": "error",
+                "fallback": None, "name": "parent_process_ipc"}
     name, fallback = _get_approval_transport_config()
     if name == "builtin":
         return {"selected": False}
