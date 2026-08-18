@@ -5993,17 +5993,6 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
-                # Temporary Telegram group prefix fallback: a shared-bot gateway
-                # posts every specialist's reply under one name/avatar, so a
-                # profile-routed GROUP reply carries an uppercase profile tag
-                # (e.g. [ORION]) so the agent is identifiable. DMs, other
-                # platforms, and Mission Control are untouched; a reply that
-                # already starts with a [TAG] prefix is never double-prefixed.
-                if text_content:
-                    text_content = _telegram_group_profile_prefix(
-                        event.source, text_content,
-                    )
-
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -6092,6 +6081,23 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
+                # Temporary Telegram group prefix fallback: a shared-bot gateway
+                # posts every specialist's reply under one name/avatar, so a
+                # profile-routed GROUP reply carries an uppercase profile tag
+                # (e.g. [ORION]) so the agent is identifiable. DMs, other
+                # platforms, and Mission Control are untouched; a reply that
+                # already starts with a [TAG] prefix is never double-prefixed.
+                #
+                # Applied AFTER the auto-TTS and caption blocks so speech
+                # synthesis (prepare_tts_text) and the 1024-char caption-
+                # eligibility check see the unprefixed reply — the tag must
+                # not be spoken aloud or push a boundary caption over the
+                # Telegram caption length limit.
+                if text_content and not _tts_caption_delivered:
+                    text_content = _telegram_group_profile_prefix(
+                        event.source, text_content,
+                    )
+
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
