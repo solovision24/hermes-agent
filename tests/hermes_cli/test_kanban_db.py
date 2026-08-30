@@ -246,7 +246,7 @@ def test_unconfigured_provider_recovery_records_skipped_stages(kanban_home):
             release_claim=True,
             end_run=True,
         )
-        
+
         # Second failure - should trip breaker
         assert kb.claim_task(conn, task_id, claimer="host:worker2") is not None
         assert kb._record_task_failure(
