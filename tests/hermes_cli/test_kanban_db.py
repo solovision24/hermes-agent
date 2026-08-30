@@ -163,8 +163,8 @@ def test_exhausted_failure_records_typed_recovery_contract(kanban_home):
         assert "cause_specific" in recovery_attempt.payload
 
 
-def test_autonomous_recovery_stages_execution_crash(kanban_home):
-    """Test that autonomous recovery stages execute for worker crash."""
+def test_exhausted_crash_records_only_actions_that_ran(kanban_home):
+    """An exhausted crash must not claim that another retry happened."""
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="crash recovery", assignee="dev")
         assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
@@ -191,17 +191,19 @@ def test_autonomous_recovery_stages_execution_crash(kanban_home):
         classify = next(s for s in recovery["stages_executed"] if s["stage"] == "classify_evidence")
         assert classify["executed"] is True
         assert "worker_crash" in classify["evidence"]
-        # Verify stage 2: bounded_retry_backoff executed (crash is transient)
+        # The bounded retries happened before the breaker; the breaker must not
+        # falsely claim that another retry ran.
         retry = next(s for s in recovery["stages_executed"] if s["stage"] == "bounded_retry_backoff")
-        assert retry["executed"] is True
-        assert recovery["retry_at"] is not None
+        assert retry["executed"] is False
+        assert retry["skipped_reason"] == "retry_budget_exhausted"
+        assert recovery["retry_at"] is None
         # Verify stage 7: safe_reversible_default executed
         safe = next(s for s in recovery["stages_executed"] if s["stage"] == "safe_reversible_default")
         assert safe["executed"] is True
 
 
-def test_autonomous_recovery_stages_execution_timeout(kanban_home):
-    """Test that autonomous recovery stages execute for timeout."""
+def test_exhausted_timeout_has_no_fictitious_retry_time(kanban_home):
+    """A blocked timeout has no retry_at until an operator unblocks it."""
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="timeout recovery", assignee="dev")
         assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
@@ -221,11 +223,11 @@ def test_autonomous_recovery_stages_execution_timeout(kanban_home):
         assert task.status == "blocked"
         recovery = task.metadata["recovery"]
         assert recovery["classified_cause"] == "timeout"
-        assert recovery["retry_at"] is not None
+        assert recovery["retry_at"] is None
 
 
-def test_autonomous_recovery_stages_execution_provider_failure(kanban_home):
-    """Test that autonomous recovery stages execute for provider failure."""
+def test_unconfigured_provider_recovery_records_skipped_stages(kanban_home):
+    """No configured repair/fallback means those stages are skipped truthfully."""
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="provider failure recovery", assignee="dev")
         assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
@@ -258,25 +260,23 @@ def test_autonomous_recovery_stages_execution_provider_failure(kanban_home):
         assert task.status == "blocked"
         recovery = task.metadata["recovery"]
         assert recovery["classified_cause"] == "provider_failure"
-        # Verify capability_preflight_repair executed
         capability = next(s for s in recovery["stages_executed"] if s["stage"] == "capability_preflight_repair")
-        assert capability["executed"] is True
-        assert "Provider auth/billing failure detected" in capability["evidence"]
-        # Verify provider fallback executed
+        assert capability["executed"] is False
+        assert capability["skipped_reason"] == "no_authorized_repair"
         fallback = next(s for s in recovery["stages_executed"] if s["stage"] == "configured_provider_tool_fallback")
-        assert fallback["executed"] is True
-        # Verify specialist arbitration executed (at limit)
+        assert fallback["executed"] is False
+        assert fallback["skipped_reason"] == "no_configured_fallback"
         specialist = next(s for s in recovery["stages_executed"] if s["stage"] == "specialist_arbitration_review")
-        assert specialist["executed"] is True
-        # Verify safe reversible default executed
+        assert specialist["executed"] is False
+        assert specialist["skipped_reason"] == "no_specialist"
         safe = next(s for s in recovery["stages_executed"] if s["stage"] == "safe_reversible_default")
         assert safe["executed"] is True
         assert "next_action" in recovery and recovery["next_action"]
         assert "clear_condition" in recovery and recovery["clear_condition"]
 
 
-def test_autonomous_recovery_stages_execution_rate_limited(kanban_home):
-    """Test that autonomous recovery stages execute for rate limit (requeues, not blocks)."""
+def test_forced_rate_limit_exhaustion_does_not_invent_cooldown_retry(kanban_home):
+    """The synthetic breaker path blocks without claiming a retry was queued."""
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="rate limited recovery", assignee="dev")
         assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
@@ -303,11 +303,145 @@ def test_autonomous_recovery_stages_execution_rate_limited(kanban_home):
         assert task.status == "blocked"
         recovery = task.metadata["recovery"]
         assert recovery["classified_cause"] == "rate_limited"
-        # Verify safe reversible default for rate_limited sets retry_at
         safe = next(s for s in recovery["stages_executed"] if s["stage"] == "safe_reversible_default")
         assert safe["executed"] is True
-        assert recovery["retry_at"] is not None
-        assert "cooldown" in recovery["next_action"].lower()
+        assert recovery["retry_at"] is None
+        assert "unblock" in recovery["next_action"].lower()
+
+
+def test_dispatcher_applies_configured_profile_recovery_before_blocking(
+    kanban_home, monkeypatch
+):
+    """The real dispatch path must reassign the same card before exhaustion."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "profile_exists", lambda name: name in {"dev", "backup"}
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="same-card profile recovery",
+            assignee="dev",
+            metadata={
+                "recovery_policy": {"qualified_profiles": ["backup"]},
+            },
+        )
+
+        def cannot_spawn(task, workspace):
+            raise RuntimeError("profile worker bootstrap crashed")
+
+        first = kb.dispatch_once(
+            conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
+        )
+
+        assert task_id not in first.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.assignee == "backup"
+        assert task.id == task_id
+        assert task.metadata["recovery"]["action"] == "qualified_profile_reassignment"
+        assert task.metadata["recovery"]["from_assignee"] == "dev"
+        assert task.metadata["recovery"]["to_assignee"] == "backup"
+        assert any(
+            event.kind == "autonomous_recovery_requeued"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_provider_failure_uses_configured_model_fallback_on_same_card(
+    kanban_home, monkeypatch
+):
+    """Provider failure detection must apply an authorized task override."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="provider fallback recovery",
+            assignee="dev",
+            metadata={
+                "recovery_policy": {
+                    "provider_fallbacks": [
+                        {"provider": "openrouter", "model": "fallback/model"}
+                    ]
+                }
+            },
+        )
+        claimed = kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:test")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 7654321)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("provider_auth", 78))
+        monkeypatch.setattr(
+            kb,
+            "read_worker_provider_failure",
+            lambda task_id: {"provider": "primary", "error": "token rejected"},
+        )
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.model_override == "fallback/model"
+        assert task.provider_override == "openrouter"
+        assert task.metadata["recovery"]["action"] == "configured_provider_tool_fallback"
+        run = kb.list_runs(conn, task_id)[-1]
+        assert run.outcome == "provider_authentication"
+
+
+def test_failed_status_migration_rolls_back_on_verification_failure(
+    kanban_home, monkeypatch
+):
+    """A failed verifier must leave the live row untouched and keep backup proof."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="rollback migration", assignee="dev")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+
+    monkeypatch.setattr(
+        kb,
+        "_verify_failed_status_migration",
+        lambda conn, task_ids: (_ for _ in ()).throw(RuntimeError("forced mismatch")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="forced mismatch"):
+        kb.init_db(db_path)
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        assert raw.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "failed"
+    finally:
+        raw.close()
+    assert db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak").exists()
+
+
+def test_failed_status_migration_closes_referenced_active_run(kanban_home):
+    """Migration must not orphan a running task_runs row when clearing its pointer."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="active legacy run", assignee="dev")
+        claimed = kb.claim_task(conn, task_id, claimer="host:worker")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert run["status"] == "recovery_exhausted"
+        assert run["outcome"] == "legacy_failed_migrated"
+        assert run["ended_at"] is not None
 
 
 def test_migration_backup_and_verification(kanban_home, tmp_path):

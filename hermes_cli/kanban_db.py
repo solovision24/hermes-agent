@@ -2453,300 +2453,228 @@ def _execute_autonomous_recovery_stages(
     attempts: int,
     owner: str,
     task_metadata: dict,
-) -> tuple[list[dict], dict]:
-    """Execute the bounded autonomous recovery ladder and return (stages_executed, cause_specific_fields).
+) -> tuple[list[dict], dict, Optional[dict]]:
+    """Attempt one authorized recovery action and record truthful evidence.
 
-    Each stage is attempted with evidence; stages that are skipped or not applicable
-    are recorded with evidence="not_applicable" or "skipped: <reason>".
-    Returns a list of stage records and cause-specific blocker fields (next_action,
-    clear_condition, retry_at, classified_cause).
+    Policy is opt-in under ``metadata.recovery_policy``.  The function never
+    invents an owner/model/skill repair: it executes only values explicitly
+    supplied on the card, once each, and returns the selected action so the
+    caller can requeue the same task atomically.  Inapplicable stages are
+    recorded as skipped, never as executed.
     """
-    stages_executed = []
+    cause_map = {
+        "crashed": "worker_crash",
+        "timed_out": "timeout",
+        "spawn_failed": "spawn_failure",
+        "provider_authentication": "provider_failure",
+        "provider_billing": "provider_failure",
+        "protocol_violation": "protocol_violation",
+        "rate_limited": "rate_limited",
+    }
+    classified_cause = cause_map.get(outcome, outcome)
     cause_specific = {
-        "classified_cause": outcome,
+        "classified_cause": classified_cause,
         "next_action": None,
         "clear_condition": None,
         "retry_at": None,
     }
+    records: list[dict] = []
 
-    # Helper to record a stage outcome
-    def record_stage(stage_name: str, executed: bool, evidence: str, skipped_reason: Optional[str] = None):
-        stage_record = {
-            "stage": stage_name,
+    def record(stage: str, executed: bool, evidence: str, skipped: Optional[str] = None) -> None:
+        records.append({
+            "stage": stage,
             "executed": executed,
-            "evidence": evidence[:1000] if evidence else "",
-            "skipped_reason": skipped_reason,
+            "evidence": (evidence or "")[:1000],
+            "skipped_reason": skipped,
             "attempt_number": attempts,
-        }
-        stages_executed.append(stage_record)
+        })
 
-    # Stage 1: classify_evidence
-    # Classify the failure cause from outcome/error and extract actionable details
-    classified_cause = outcome
-    cause_detail = error[:500] if error else "no error detail"
-    if outcome == "crashed":
-        classified_cause = "worker_crash"
-    elif outcome == "timed_out":
-        classified_cause = "timeout"
-    elif outcome == "spawn_failed":
-        classified_cause = "spawn_failure"
-    elif outcome in ("provider_authentication", "provider_billing"):
-        classified_cause = "provider_failure"
-    elif outcome == "protocol_violation":
-        classified_cause = "protocol_violation"
-    elif outcome == "rate_limited":
-        classified_cause = "rate_limited"
-
-    record_stage(
+    record(
         "classify_evidence",
-        executed=True,
-        evidence=f"outcome={outcome}, classified_cause={classified_cause}, detail={cause_detail}",
+        True,
+        f"outcome={outcome}; classified_cause={classified_cause}; error={(error or 'none')[:500]}",
     )
-    cause_specific["classified_cause"] = classified_cause
-
-    # Stage 2: bounded_retry_backoff
-    # Check if a bounded retry with backoff is applicable
-    retry_backoff_executed = False
-    retry_backoff_evidence = ""
-    if classified_cause in ("worker_crash", "timeout", "spawn_failure", "rate_limited"):
-        # These failure types are transient and may benefit from retry
-        retry_backoff_executed = True
-        retry_backoff_evidence = (
-            f"Transient failure type '{classified_cause}' qualifies for bounded retry. "
-            f"Attempt {attempts} of max {DEFAULT_FAILURE_LIMIT}. "
-            f"Backoff would apply on next dispatch tick."
-        )
-    else:
-        retry_backoff_evidence = f"Failure type '{classified_cause}' is not transient; bounded retry not applicable."
-
-    record_stage(
+    record(
         "bounded_retry_backoff",
-        executed=retry_backoff_executed,
-        evidence=retry_backoff_evidence,
-        skipped_reason=None if retry_backoff_executed else "non_transient_failure_type",
+        False,
+        f"failure counter reached its configured bound at attempt {attempts}",
+        "retry_budget_exhausted",
     )
 
-    if retry_backoff_executed:
-        cause_specific["retry_at"] = int(time.time()) + 300  # 5 minutes default backoff
-        cause_specific["clear_condition"] = (
-            "Worker completes successfully on retry; consecutive_failures resets to 0."
+    policy = task_metadata.get("recovery_policy")
+    if not isinstance(policy, dict):
+        policy = {}
+    history = task_metadata.get("recovery_history")
+    if not isinstance(history, list):
+        history = []
+    used = {
+        str(item.get("key"))
+        for item in history
+        if isinstance(item, dict) and item.get("key")
+    }
+    action: Optional[dict] = None
+
+    # Capability repair is limited to an explicitly configured replacement
+    # skill set.  Merely diagnosing a missing capability is not execution.
+    skill_fallbacks = policy.get("skill_fallbacks")
+    if classified_cause == "spawn_failure" and isinstance(skill_fallbacks, list):
+        for index, skills in enumerate(skill_fallbacks):
+            key = f"skills:{index}"
+            if key in used or not isinstance(skills, list):
+                continue
+            normalized = [str(skill).strip() for skill in skills if str(skill).strip()]
+            if not normalized:
+                continue
+            conn.execute("UPDATE tasks SET skills=? WHERE id=?", (json.dumps(normalized), task_id))
+            action = {"stage": "capability_preflight_repair", "key": key, "skills": normalized}
+            record("capability_preflight_repair", True, f"installed configured task skill set {normalized!r}")
+            break
+    if not any(item["stage"] == "capability_preflight_repair" for item in records):
+        record(
+            "capability_preflight_repair",
+            False,
+            "no unused, explicitly authorized task skill repair was configured",
+            "no_authorized_repair",
         )
 
-    # Stage 3: capability_preflight_repair
-    # Check if missing skill/config/auth can be repaired
-    capability_repair_executed = False
-    capability_repair_evidence = ""
-    if classified_cause == "spawn_failure":
-        # Could be missing profile, skill, or config
-        capability_repair_executed = True
-        capability_repair_evidence = (
-            "Spawn failure may indicate missing profile, skill, or config. "
-            "Dispatcher preflight (check_respawn_guard + task_capability_preflight) "
-            "already validates profile existence and skill resolution before spawn. "
-            "If a skill was missing, the preflight would have blocked the task as 'capability'. "
-            "No further repair action available at this layer."
+    # Reassign only to an explicitly listed, on-disk profile.
+    if action is None and classified_cause in {"worker_crash", "spawn_failure", "provider_failure"}:
+        candidates = policy.get("qualified_profiles")
+        if isinstance(candidates, list):
+            try:
+                from hermes_cli.profiles import profile_exists
+            except Exception:
+                profile_exists = lambda _name: False
+            for candidate_raw in candidates:
+                candidate = _canonical_assignee(str(candidate_raw))
+                key = f"profile:{candidate}"
+                if not candidate or candidate == owner or key in used or not profile_exists(candidate):
+                    continue
+                conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (candidate, task_id))
+                action = {
+                    "stage": "qualified_profile_reassignment",
+                    "key": key,
+                    "from_assignee": owner,
+                    "to_assignee": candidate,
+                }
+                record(
+                    "qualified_profile_reassignment",
+                    True,
+                    f"reassigned same task from {owner!r} to verified profile {candidate!r}",
+                )
+                break
+    if not any(item["stage"] == "qualified_profile_reassignment" for item in records):
+        record(
+            "qualified_profile_reassignment",
+            False,
+            "no unused configured on-disk profile matched this cause",
+            "no_qualified_profile",
         )
-    elif classified_cause == "provider_failure":
-        capability_repair_executed = True
-        capability_repair_evidence = (
-            "Provider auth/billing failure detected. Repair requires human action: "
-            "refresh credentials (hermes auth), restore account credits, or configure "
-            "fallback provider chain. Automatic repair not possible."
+
+    # Provider/model overrides are task-local and therefore reversible.  A
+    # fallback without both values is ignored rather than guessed.
+    if action is None and classified_cause in {"provider_failure", "rate_limited"}:
+        fallbacks = policy.get("provider_fallbacks")
+        if isinstance(fallbacks, list):
+            for index, fallback in enumerate(fallbacks):
+                key = f"provider:{index}"
+                if key in used or not isinstance(fallback, dict):
+                    continue
+                provider = str(fallback.get("provider") or "").strip()
+                model = str(fallback.get("model") or "").strip()
+                if not provider or not model:
+                    continue
+                conn.execute(
+                    "UPDATE tasks SET provider_override=?, model_override=? WHERE id=?",
+                    (provider, model, task_id),
+                )
+                action = {
+                    "stage": "configured_provider_tool_fallback",
+                    "key": key,
+                    "provider": provider,
+                    "model": model,
+                }
+                record(
+                    "configured_provider_tool_fallback",
+                    True,
+                    f"applied configured task override provider={provider!r}, model={model!r}",
+                )
+                break
+    if not any(item["stage"] == "configured_provider_tool_fallback" for item in records):
+        record(
+            "configured_provider_tool_fallback",
+            False,
+            "no unused authorized provider/model fallback was configured",
+            "no_configured_fallback",
+        )
+
+    # An explicitly configured specialist is the final autonomous handoff.
+    if action is None:
+        specialist = _canonical_assignee(str(policy.get("specialist_profile") or ""))
+        key = f"specialist:{specialist}"
+        if specialist and key not in used:
+            try:
+                from hermes_cli.profiles import profile_exists
+                specialist_exists = profile_exists(specialist)
+            except Exception:
+                specialist_exists = False
+            if specialist_exists:
+                conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (specialist, task_id))
+                action = {
+                    "stage": "specialist_arbitration_review",
+                    "key": key,
+                    "from_assignee": owner,
+                    "to_assignee": specialist,
+                }
+                record(
+                    "specialist_arbitration_review",
+                    True,
+                    f"routed same task to configured specialist {specialist!r}",
+                )
+    if not any(item["stage"] == "specialist_arbitration_review" for item in records):
+        record(
+            "specialist_arbitration_review",
+            False,
+            "no unused configured specialist profile was available",
+            "no_specialist",
+        )
+
+    if action is not None:
+        action_evidence = next(
+            item["evidence"]
+            for item in records
+            if item["stage"] == action["stage"] and item["executed"]
+        )
+        history.append({
+            "key": action["key"],
+            "stage": action["stage"],
+            "attempt": attempts,
+            "at": int(time.time()),
+            "evidence": action_evidence,
+        })
+        task_metadata["recovery_history"] = history
+        cause_specific.update({
+            "next_action": f"Dispatcher will retry the same task after {action['stage']}.",
+            "clear_condition": "The next run completes successfully on the preserved task and artifact.",
+            "retry_at": int(time.time()),
+        })
+        record(
+            "safe_reversible_default",
+            True,
+            "requeued the same task with claims released; no task, branch, workspace, or PR was duplicated",
         )
     else:
-        capability_repair_evidence = (
-            f"Failure type '{classified_cause}' does not indicate a repairable capability issue. "
-            "No skill/config/auth repair applicable."
+        cause_specific.update({
+            "next_action": "Inspect the recorded evidence, repair the classified cause, then explicitly unblock the same task.",
+            "clear_condition": "The classified cause is verified resolved and an operator explicitly unblocks or reroutes the same task.",
+        })
+        record(
+            "safe_reversible_default",
+            False,
+            "no authorized autonomous action remained; caller must apply the typed blocked state",
+            "recovery_exhausted",
         )
 
-    record_stage(
-        "capability_preflight_repair",
-        executed=capability_repair_executed,
-        evidence=capability_repair_evidence,
-        skipped_reason=None if capability_repair_executed else "no_capability_issue_detected",
-    )
-
-    if capability_repair_executed and classified_cause == "provider_failure":
-        cause_specific["next_action"] = (
-            "Refresh provider credentials via 'hermes auth' or configure fallback provider chain in config.yaml"
-        )
-        cause_specific["clear_condition"] = "Provider authentication succeeds on next spawn attempt."
-    elif capability_repair_executed and classified_cause == "spawn_failure":
-        cause_specific["next_action"] = (
-            "Verify assignee profile exists and has required skills; check dispatcher preflight diagnostics"
-        )
-        cause_specific["clear_condition"] = "Dispatcher capability preflight passes for this task."
-
-    # Stage 4: qualified_profile_reassignment
-    # Check if task can be reassigned to a qualified alternative profile
-    profile_reassignment_executed = False
-    profile_reassignment_evidence = ""
-    if classified_cause in ("provider_failure", "spawn_failure", "worker_crash"):
-        # Could try another profile that has the same skills/capabilities
-        profile_reassignment_executed = True
-        profile_reassignment_evidence = (
-            f"Attempting profile reassignment for cause '{classified_cause}'. "
-            "Dispatcher will query available profiles with matching skills on next tick "
-            "if the current assignee profile is unavailable. Current assignee: {owner}."
-        )
-        cause_specific["next_action"] = (
-            cause_specific["next_action"] or ""
-        ) + " If current profile is unavailable, dispatcher will attempt qualified profile reassignment on next tick."
-    else:
-        profile_reassignment_evidence = f"Failure type '{classified_cause}' does not trigger profile reassignment."
-
-    record_stage(
-        "qualified_profile_reassignment",
-        executed=profile_reassignment_executed,
-        evidence=profile_reassignment_evidence,
-        skipped_reason=None if profile_reassignment_executed else "no_reassignment_applicable",
-    )
-
-    # Stage 5: configured_provider_tool_fallback
-    # Check if configured fallback providers/tools can be used
-    provider_fallback_executed = False
-    provider_fallback_evidence = ""
-    if classified_cause == "provider_failure":
-        provider_fallback_executed = True
-        provider_fallback_evidence = (
-            "Provider failure detected. Configured fallback provider chain (config.yaml "
-            "fallback_providers / fallback_model) will be attempted by the worker on next spawn. "
-            "Dispatcher does not directly invoke fallback — the worker's model resolution chain "
-            "handles it via agent/auxiliary_client.py::_resolve_auto."
-        )
-    elif classified_cause == "rate_limited":
-        provider_fallback_executed = True
-        provider_fallback_evidence = (
-            "Rate limited. Fallback provider chain will be attempted after cooldown elapses. "
-            "Current cooldown: " + str(_resolve_rate_limit_cooldown_seconds()) + " seconds."
-        )
-    else:
-        provider_fallback_evidence = f"Failure type '{classified_cause}' does not trigger provider/tool fallback."
-
-    record_stage(
-        "configured_provider_tool_fallback",
-        executed=provider_fallback_executed,
-        evidence=provider_fallback_evidence,
-        skipped_reason=None if provider_fallback_executed else "no_fallback_applicable",
-    )
-
-    if provider_fallback_executed and cause_specific["next_action"] is None:
-        cause_specific["next_action"] = "Worker will attempt configured fallback provider chain on next spawn."
-    elif provider_fallback_executed:
-        cause_specific["next_action"] = (cause_specific["next_action"] or "") + " Fallback provider chain configured."
-
-    # Stage 6: specialist_arbitration_review
-    # For complex failures, escalate to a specialist (human or automated)
-    specialist_review_executed = False
-    specialist_review_evidence = ""
-    if classified_cause in ("protocol_violation", "provider_failure") and attempts >= DEFAULT_FAILURE_LIMIT:
-        specialist_review_executed = True
-        specialist_review_evidence = (
-            f"Failure '{classified_cause}' has exhausted autonomous recovery budget ({attempts} attempts). "
-            "Escalating to specialist arbitration: operator or designated review profile must "
-            "inspect evidence and decide on remediation or rerouting. "
-            "Task is blocked with 'recovery_exhausted' for human/operator action."
-        )
-        if cause_specific["next_action"] is None:
-            cause_specific["next_action"] = (
-                "Specialist arbitration required. Operator must inspect recovery evidence, "
-                "repair root cause, then explicitly unblock or reroute the task."
-            )
-        if cause_specific["clear_condition"] is None:
-            cause_specific["clear_condition"] = (
-                "Operator verifies root cause resolved and explicitly unblocks/reroutes the task."
-            )
-    else:
-        specialist_review_evidence = (
-            f"Failure '{classified_cause}' at attempt {attempts} does not yet require specialist arbitration. "
-            f"Will escalate if autonomous recovery is exhausted."
-        )
-
-    record_stage(
-        "specialist_arbitration_review",
-        executed=specialist_review_executed,
-        evidence=specialist_review_evidence,
-        skipped_reason=None if specialist_review_executed else "below_escalation_threshold",
-    )
-
-    # Stage 7: safe_reversible_default
-    # Apply a safe reversible default if all else fails
-    safe_default_executed = False
-    safe_default_evidence = ""
-    if classified_cause == "rate_limited":
-        safe_default_executed = True
-        safe_default_evidence = (
-            "Rate limited: task requeued to 'ready' with quota-flavored last_failure_error. "
-            "Respawn guard will defer until cooldown elapses. This is a safe reversible default — "
-            "the task is not blocked, just deferred."
-        )
-        cause_specific["next_action"] = "Wait for quota cooldown; task will auto-respawn."
-        cause_specific["clear_condition"] = "Quota window resets; respawn guard allows retry."
-        cause_specific["retry_at"] = int(time.time()) + _resolve_rate_limit_cooldown_seconds()
-    elif classified_cause == "provider_failure":
-        safe_default_executed = True
-        safe_default_evidence = (
-            "Provider failure: task blocked with 'recovery_exhausted' to prevent infinite retries. "
-            "Safe reversible default — task identity, workspace, links, PR metadata preserved. "
-            "Operator can unblock after fixing credentials/config."
-        )
-        if cause_specific["next_action"] is None:
-            cause_specific["next_action"] = (
-                "Fix provider credentials or configure fallback chain, then explicitly unblock the task."
-            )
-        if cause_specific["clear_condition"] is None:
-            cause_specific["clear_condition"] = "Provider authentication succeeds; operator explicitly unblocks."
-    elif classified_cause == "protocol_violation":
-        safe_default_executed = True
-        safe_default_evidence = (
-            "Protocol violation: worker exited cleanly without terminal kanban call. "
-            "Bounded violation streak applies; task blocked after limit reached. "
-            "Safe reversible default — preserves task identity for retry after correction."
-        )
-        if cause_specific["next_action"] is None:
-            cause_specific["next_action"] = (
-                "Worker must call kanban_complete or kanban_block on next run. "
-                "Operator can unblock if violation was transient."
-            )
-        if cause_specific["clear_condition"] is None:
-            cause_specific["clear_condition"] = "Next worker run completes with proper terminal call; consecutive_failures resets."
-    elif classified_cause in ("worker_crash", "timeout", "spawn_failure"):
-        safe_default_executed = True
-        safe_default_evidence = (
-            f"Failure '{classified_cause}': task blocked with 'recovery_exhausted' after "
-            f"{attempts} attempts. Task identity, workspace, links, PR metadata, branch/worktree "
-            f"preserved. Operator can inspect and unblock after root cause fix."
-        )
-        if cause_specific["next_action"] is None:
-            cause_specific["next_action"] = (
-                "Inspect preserved evidence, repair root cause (code fix, config, environment), "
-                "then explicitly unblock the task for retry."
-            )
-        if cause_specific["clear_condition"] is None:
-            cause_specific["clear_condition"] = "Root cause verified fixed; operator explicitly unblocks task."
-    else:
-        safe_default_evidence = f"No safe reversible default defined for '{classified_cause}'."
-
-    record_stage(
-        "safe_reversible_default",
-        executed=safe_default_executed,
-        evidence=safe_default_evidence,
-        skipped_reason=None if safe_default_executed else "no_default_applicable",
-    )
-
-    # Ensure next_action and clear_condition are set
-    if cause_specific["next_action"] is None:
-        cause_specific["next_action"] = (
-            "Inspect the preserved evidence, repair or reroute the blocking "
-            "cause, then explicitly unblock the task."
-        )
-    if cause_specific["clear_condition"] is None:
-        cause_specific["clear_condition"] = (
-            "The blocking cause is verified resolved and an operator explicitly "
-            "unblocks or reroutes the task."
-        )
-
-    # Log the recovery attempt for audit
     _append_event(
         conn,
         task_id,
@@ -2755,12 +2683,12 @@ def _execute_autonomous_recovery_stages(
             "outcome": outcome,
             "error": error[:500] if error else None,
             "attempts": attempts,
-            "stages": stages_executed,
+            "stages": records,
             "cause_specific": cause_specific,
+            "selected_action": action,
         },
     )
-
-    return stages_executed, cause_specific
+    return records, cause_specific, action
 
 
 def _build_recovery_contract(
@@ -2800,29 +2728,45 @@ def _build_recovery_contract(
     return recovery
 
 
+def _verify_failed_status_migration(
+    conn: sqlite3.Connection, task_ids: list[str]
+) -> None:
+    """Raise unless every targeted selector and active-run pointer is canonical."""
+    if not task_ids:
+        return
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT id, status, block_kind, current_run_id, metadata "
+        f"FROM tasks WHERE id IN ({placeholders})",
+        task_ids,
+    ).fetchall()
+    if len(rows) != len(task_ids):
+        raise RuntimeError("legacy failed migration verification lost a task row")
+    for row in rows:
+        metadata = _decode_task_metadata(row["metadata"]) or {}
+        recovery = metadata.get("recovery") if isinstance(metadata, dict) else None
+        if (
+            row["status"] != "blocked"
+            or row["block_kind"] != "recovery_exhausted"
+            or row["current_run_id"] is not None
+            or not isinstance(recovery, dict)
+            or recovery.get("migrated_from_status") != "failed"
+        ):
+            raise RuntimeError(
+                f"legacy failed migration verification mismatch for {row['id']}"
+            )
+
+
 def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
-    """Convert the removed task-level ``failed`` state into typed blockers.
+    """Atomically migrate legacy selectors after a SQLite-consistent backup.
 
-    Run rows and events retain their historical failure labels. Only the live
-    task selector changes, in place, so links, comments, PR metadata, workspace,
-    and branch identity remain attached to the same task id.
-
-    This migration is idempotent and safe for repeat execution. It creates a
-    backup before mutation, verifies post-migration state, and logs evidence
-    for audit/rollback.
+    A backup failure aborts before the first live-row mutation. Verification
+    runs inside the same transaction, so any mismatch or interruption rolls the
+    live DB back automatically. The backup is intentionally retained as the
+    explicit operator rollback artifact; restoring it is safe only while the
+    gateway/dispatcher is stopped.
     """
-    import shutil
     from pathlib import Path
-
-    # Get DB path for backup
-    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
-    backup_path = None
-    try:
-        # Create backup before migration
-        backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
-        shutil.copy2(db_path, backup_path)
-    except Exception as e:
-        _log.warning(f"Failed to create pre-migration backup: {e}")
 
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     required = {
@@ -2832,14 +2776,6 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
         "current_run_id",
     }
     if not required.issubset(cols):
-        # Defensive compatibility for partial/synthetic schemas used by older
-        # integrations. Canonical boards receive these columns from SCHEMA_SQL
-        # plus the additive migration before this pass runs.
-        if backup_path and backup_path.exists():
-            try:
-                backup_path.unlink()
-            except Exception:
-                pass
         return
 
     rows = conn.execute(
@@ -2848,101 +2784,99 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
     ).fetchall()
 
     if not rows:
-        # No failed tasks to migrate
-        if backup_path and backup_path.exists():
-            try:
-                backup_path.unlink()
-            except Exception:
-                pass
         return
 
-    # Track migration results for verification
-    migrated_ids = []
-    for row in rows:
-        metadata = (
-            _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
-        ) or {}
-        recovery = _build_recovery_contract(
-            owner=row["assignee"],
-            attempts=row["consecutive_failures"],
-            error=row["last_failure_error"] or row["result"],
-            trigger_outcome="legacy_failed_status",
-            migrated_from_status="failed",
-            stages_executed=[],
-            cause_specific={
-                "classified_cause": "legacy_failed_status",
-                "next_action": "Inspect the preserved evidence, repair or reroute the blocking cause, then explicitly unblock the task.",
-                "clear_condition": "The blocking cause is verified resolved and an operator explicitly unblocks or reroutes the task.",
-                "retry_at": None,
-            },
-        )
-        metadata["recovery"] = recovery
-        conn.execute(
-            "UPDATE tasks SET status='blocked', block_kind='recovery_exhausted', "
-            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
-            "current_run_id=NULL, completed_at=NULL, metadata=? WHERE id=?",
-            (json.dumps(metadata, sort_keys=True), row["id"]),
-        )
-        _append_event(
-            conn,
-            row["id"],
-            "legacy_failed_migrated",
-            {
-                "from_status": "failed",
-                "to_status": "blocked",
-                "block_kind": "recovery_exhausted",
-                "previous_completed_at": row["completed_at"],
-                "recovery": recovery,
-            },
-        )
-        migrated_ids.append(row["id"])
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
+    backup_conn = sqlite3.connect(str(backup_path))
+    try:
+        conn.backup(backup_conn)
+        backup_conn.execute("PRAGMA synchronous=FULL")
+        backup_conn.commit()
+    except Exception as exc:
+        raise RuntimeError(
+            f"legacy failed migration aborted: backup could not be created at {backup_path}"
+        ) from exc
+    finally:
+        backup_conn.close()
 
-    # Post-migration verification: ensure all targeted tasks are now blocked+recovery_exhausted
-    if migrated_ids:
-        placeholders = ",".join("?" * len(migrated_ids))
-        verify_rows = conn.execute(
-            f"SELECT id, status, block_kind FROM tasks WHERE id IN ({placeholders})",
-            migrated_ids,
-        ).fetchall()
-        for vrow in verify_rows:
-            if vrow["status"] != "blocked" or vrow["block_kind"] != "recovery_exhausted":
-                # Migration verification failed - attempt rollback from backup
-                _log.error(
-                    f"Migration verification failed for task {vrow['id']}: "
-                    f"status={vrow['status']}, block_kind={vrow['block_kind']}"
+    migrated_ids = [str(row["id"]) for row in rows]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        now = int(time.time())
+        for row in rows:
+            metadata = (
+                _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+            ) or {}
+            recovery = _build_recovery_contract(
+                owner=row["assignee"],
+                attempts=row["consecutive_failures"],
+                error=row["last_failure_error"] or row["result"],
+                trigger_outcome="legacy_failed_status",
+                migrated_from_status="failed",
+                stages_executed=[],
+                cause_specific={
+                    "classified_cause": "legacy_failed_status",
+                    "next_action": "Inspect preserved evidence and explicitly unblock the same task after repair.",
+                    "clear_condition": "The classified cause is verified resolved and the same task is explicitly unblocked.",
+                    "retry_at": None,
+                },
+            )
+            metadata["recovery"] = recovery
+            current_run_id = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id=?", (row["id"],)
+            ).fetchone()[0]
+            if current_run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET status='recovery_exhausted', "
+                    "outcome='legacy_failed_migrated', ended_at=?, "
+                    "error=COALESCE(error, 'legacy failed selector migrated') "
+                    "WHERE id=? AND ended_at IS NULL",
+                    (now, current_run_id),
                 )
-                if backup_path and backup_path.exists():
-                    try:
-                        # Note: Full rollback would require replacing the DB file,
-                        # which is not safe in-process. Log the failure for operator.
-                        _log.error(
-                            f"Migration verification failed. Backup available at {backup_path}. "
-                            f"Manual rollback required: replace {db_path} with {backup_path}."
-                        )
-                    except Exception:
-                        pass
-                # Don't raise - migration is best-effort, operator must handle
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='recovery_exhausted', "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "current_run_id=NULL, completed_at=NULL, metadata=? WHERE id=?",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+            _append_event(
+                conn,
+                row["id"],
+                "legacy_failed_migrated",
+                {
+                    "from_status": "failed",
+                    "to_status": "blocked",
+                    "block_kind": "recovery_exhausted",
+                    "previous_completed_at": row["completed_at"],
+                    "closed_run_id": current_run_id,
+                    "recovery": recovery,
+                },
+            )
 
-    # On successful verification, remove backup
-    if backup_path and backup_path.exists():
-        try:
-            backup_path.unlink()
-        except Exception:
-            pass
-
-    # Emit summary event for audit
-    if migrated_ids:
+        _verify_failed_status_migration(conn, migrated_ids)
         _append_event(
             conn,
-            migrated_ids[0],  # Use first task as anchor
+            migrated_ids[0],
             "legacy_failed_migration_complete",
             {
                 "migrated_task_ids": migrated_ids,
                 "count": len(migrated_ids),
-                "backup_path": str(backup_path) if backup_path else None,
+                "backup_path": str(backup_path),
                 "verified": True,
+                "rollback": (
+                    "stop gateway/dispatcher, copy backup_path over the board DB, "
+                    "then restart and run PRAGMA integrity_check"
+                ),
             },
         )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
 
 
 def _install_task_status_guards(conn: sqlite3.Connection) -> None:
@@ -9540,25 +9474,35 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
-            # Trip the breaker into the canonical typed blocked state. Persist
-            # the recovery contract on the task so an operator can see what was
-            # attempted and the exact condition for resuming without scraping
-            # logs or losing branch/workspace identity.
-            
-            # Execute autonomous recovery stages to gather evidence and cause-specific fields
             task_metadata = (
                 _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
             ) or {}
-            stages_executed, cause_specific = _execute_autonomous_recovery_stages(
-                conn,
-                task_id,
-                outcome=outcome,
-                error=error,
-                attempts=failures,
-                owner=row["assignee"] or "unassigned",
-                task_metadata=task_metadata,
+            stages_executed, cause_specific, recovery_action = (
+                _execute_autonomous_recovery_stages(
+                    conn,
+                    task_id,
+                    outcome=outcome,
+                    error=error,
+                    attempts=failures,
+                    owner=row["assignee"] or "unassigned",
+                    task_metadata=task_metadata,
+                )
             )
-            
+            if recovery_action is None:
+                safe_default = next(
+                    stage
+                    for stage in stages_executed
+                    if stage["stage"] == "safe_reversible_default"
+                )
+                safe_default.update({
+                    "executed": True,
+                    "evidence": (
+                        "transitioned the same task to blocked/recovery_exhausted "
+                        "with claims released and artifact identity preserved"
+                    ),
+                    "skipped_reason": None,
+                })
+
             recovery = _build_recovery_contract(
                 owner=row["assignee"],
                 attempts=failures,
@@ -9567,10 +9511,61 @@ def _record_task_failure(
                 stages_executed=stages_executed,
                 cause_specific=cause_specific,
             )
+            if recovery_action is not None:
+                recovery.update({
+                    "action": recovery_action["stage"],
+                    **{
+                        key: value
+                        for key, value in recovery_action.items()
+                        if key not in {"stage", "key"}
+                    },
+                })
             task_metadata["recovery"] = recovery
             encoded_metadata = json.dumps(task_metadata, sort_keys=True)
+
+            if recovery_action is not None:
+                conn.execute(
+                    "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL, consecutive_failures=0, last_failure_error=?, "
+                    "block_kind=NULL, metadata=? WHERE id=? "
+                    "AND status IN ('running', 'ready', 'review')",
+                    (source_status, error[:500], encoded_metadata, task_id),
+                )
+                run_id = None
+                if end_run:
+                    run_id = _end_run(
+                        conn,
+                        task_id,
+                        outcome=outcome,
+                        status=outcome,
+                        error=error[:500],
+                        metadata={
+                            "failures": failures,
+                            "recovery_action": recovery_action,
+                        },
+                    )
+                payload = {
+                    "trigger_outcome": outcome,
+                    "classified_cause": cause_specific["classified_cause"],
+                    "action": recovery_action,
+                    "resulting_task_state": source_status,
+                    "same_task": True,
+                    "recovery": recovery,
+                }
+                if event_payload_extra:
+                    payload.update(event_payload_extra)
+                if source_status == "review":
+                    payload["source_status"] = "review"
+                _append_event(
+                    conn,
+                    task_id,
+                    "autonomous_recovery_requeued",
+                    payload,
+                    run_id=run_id,
+                )
+                return False
+
             if release_claim:
-                # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
@@ -9580,9 +9575,6 @@ def _record_task_failure(
                     (failures, error[:500], encoded_metadata, task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ?, "
