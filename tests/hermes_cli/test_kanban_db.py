@@ -45,9 +45,1175 @@ def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_task_status_constraint_rejects_noncanonical_failed_status(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="canonical status", assignee="dev")
+        with pytest.raises(sqlite3.IntegrityError, match="invalid kanban task status"):
+            conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
 
 
+def test_init_migrates_legacy_failed_task_in_place(kanban_home):
+    db_path = kb.kanban_db_path()
+    workspace = kanban_home / "preserved-worktree"
+    workspace.mkdir()
 
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="dev")
+        task_id = kb.create_task(
+            conn,
+            title="legacy failed selector",
+            body="preserve body",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+            branch_name="feature/existing-pr",
+            metadata={"pr_url": "https://example.invalid/pull/510", "head_sha": "a" * 40},
+        )
+        kb.link_tasks(conn, parent_id, task_id)
+        kb.add_comment(conn, task_id, author="chip", body="preserve audit comment")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute(
+            "UPDATE tasks SET status='failed', result=?, consecutive_failures=3, "
+            "last_failure_error=? WHERE id=?",
+            ("provider recovery exhausted", "provider unavailable", task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, error) "
+            "VALUES (?, 'chip', 'failed', 1, 2, 'gave_up', 'provider unavailable')",
+            (task_id,),
+        )
+        conn.commit()
+
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        assert task.body == "preserve body"
+        assert task.assignee == "dev"
+        assert task.workspace_path == str(workspace)
+        assert task.branch_name == "feature/existing-pr"
+        assert task.result == "provider recovery exhausted"
+        assert task.metadata["pr_url"].endswith("/510")
+        assert task.metadata["head_sha"] == "a" * 40
+        recovery = task.metadata["recovery"]
+        assert recovery["migrated_from_status"] == "failed"
+        assert recovery["owner"] == "dev"
+        assert recovery["attempts"] == 3
+        assert recovery["next_action"]
+        assert recovery["clear_condition"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (parent_id, task_id),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 1
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()
+        assert dict(run) == {"status": "failed", "outcome": "gave_up"}
+        events = kb.list_events(conn, task_id)
+        assert any(event.kind == "legacy_failed_migrated" for event in events)
+
+
+def test_exhausted_failure_records_typed_recovery_contract(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bounded recovery", assignee="dev")
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "provider chain exhausted after safe fallbacks",
+            outcome="provider_authentication",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"provider": "configured provider"},
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        recovery = task.metadata["recovery"]
+        assert recovery["attempts"] == 1
+        assert recovery["owner"] == "dev"
+        assert recovery["trigger_outcome"] == "provider_authentication"
+        assert recovery["evidence"]
+        assert recovery["next_action"]
+        assert recovery["clear_condition"]
+        assert recovery["retry_at"] is None
+        assert recovery["stages"] == list(kb.AUTONOMOUS_RECOVERY_STAGES)
+        assert "stages_executed" in recovery
+        assert isinstance(recovery["stages_executed"], list)
+        assert {
+            stage["stage"] for stage in recovery["stages_executed"]
+        } == set(kb.AUTONOMOUS_RECOVERY_STAGES)
+        assert recovery["classified_cause"] == "provider_failure"
+        gave_up = next(event for event in kb.list_events(conn, task_id) if event.kind == "gave_up")
+        assert gave_up.payload["resulting_task_state"] == "blocked"
+        assert gave_up.payload["recovery"] == recovery
+        # Verify autonomous_recovery_attempt event was emitted
+        recovery_attempt = next(event for event in kb.list_events(conn, task_id) if event.kind == "autonomous_recovery_attempt")
+        assert recovery_attempt.payload["outcome"] == "provider_authentication"
+        assert "stages" in recovery_attempt.payload
+        assert "cause_specific" in recovery_attempt.payload
+
+
+def test_exhausted_crash_records_only_actions_that_ran(kanban_home):
+    """An exhausted crash must not claim that another retry happened."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="crash recovery", assignee="dev")
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "pid 12345 not alive",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        recovery = task.metadata["recovery"]
+        assert recovery["classified_cause"] == "worker_crash"
+        assert recovery["stages_executed"] is not None
+        assert {
+            stage["stage"] for stage in recovery["stages_executed"]
+        } == set(kb.AUTONOMOUS_RECOVERY_STAGES)
+        # Verify classification ran.
+        classify = next(s for s in recovery["stages_executed"] if s["stage"] == "classify_evidence")
+        assert classify["executed"] is True
+        assert "worker_crash" in classify["evidence"]
+        # The bounded retries happened before the breaker; the breaker must not
+        # falsely claim that another retry ran.
+        retry = next(s for s in recovery["stages_executed"] if s["stage"] == "bounded_retry_backoff")
+        assert retry["executed"] is False
+        assert retry["skipped_reason"] == "retry_budget_exhausted"
+        assert recovery["retry_at"] is None
+        # Verify stage 7: safe_reversible_default executed
+        safe = next(s for s in recovery["stages_executed"] if s["stage"] == "safe_reversible_default")
+        assert safe["executed"] is True
+
+
+def test_exhausted_timeout_has_no_fictitious_retry_time(kanban_home):
+    """A blocked timeout has no retry_at until an operator unblocks it."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="timeout recovery", assignee="dev")
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "elapsed 3600s > limit 1800s",
+            outcome="timed_out",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        recovery = task.metadata["recovery"]
+        assert recovery["classified_cause"] == "timeout"
+        assert recovery["retry_at"] is None
+
+
+def test_unconfigured_provider_recovery_records_skipped_stages(kanban_home):
+    """No configured repair/fallback means those stages are skipped truthfully."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="provider failure recovery", assignee="dev")
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        # First failure - won't trip breaker yet (DEFAULT_FAILURE_LIMIT=2)
+        kb._record_task_failure(
+            conn,
+            task_id,
+            "provider authentication failed: invalid token",
+            outcome="provider_authentication",
+            failure_limit=2,
+            release_claim=True,
+            end_run=True,
+        )
+
+        # Second failure - should trip breaker
+        assert kb.claim_task(conn, task_id, claimer="host:worker2") is not None
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "provider authentication failed: invalid token",
+            outcome="provider_authentication",
+            failure_limit=2,
+            release_claim=True,
+            end_run=True,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        recovery = task.metadata["recovery"]
+        assert recovery["classified_cause"] == "provider_failure"
+        capability = next(s for s in recovery["stages_executed"] if s["stage"] == "capability_preflight_repair")
+        assert capability["executed"] is False
+        assert capability["skipped_reason"] == "no_authorized_repair"
+        fallback = next(s for s in recovery["stages_executed"] if s["stage"] == "configured_provider_tool_fallback")
+        assert fallback["executed"] is False
+        assert fallback["skipped_reason"] == "no_configured_fallback"
+        specialist = next(s for s in recovery["stages_executed"] if s["stage"] == "specialist_arbitration_review")
+        assert specialist["executed"] is False
+        assert specialist["skipped_reason"] == "no_specialist"
+        safe = next(s for s in recovery["stages_executed"] if s["stage"] == "safe_reversible_default")
+        assert safe["executed"] is True
+        assert "next_action" in recovery and recovery["next_action"]
+        assert "clear_condition" in recovery and recovery["clear_condition"]
+
+
+def test_forced_rate_limit_exhaustion_does_not_invent_cooldown_retry(kanban_home):
+    """The synthetic breaker path blocks without claiming a retry was queued."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="rate limited recovery", assignee="dev")
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        # Rate limited requeues without counting failure - use failure_limit=1 to force block for test
+        # But actually rate_limited is handled specially in detect_crashed_workers
+        # Let's test the _record_task_failure path with rate_limited
+        from hermes_cli.kanban_db import _record_task_failure
+        # This won't block with failure_limit=2 (default), but will with 1
+        result = _record_task_failure(
+            conn,
+            task_id,
+            "rate limit exceeded",
+            outcome="rate_limited",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        # Should block because we forced failure_limit=1
+        assert result is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        recovery = task.metadata["recovery"]
+        assert recovery["classified_cause"] == "rate_limited"
+        safe = next(s for s in recovery["stages_executed"] if s["stage"] == "safe_reversible_default")
+        assert safe["executed"] is True
+        assert recovery["retry_at"] is None
+        assert "unblock" in recovery["next_action"].lower()
+
+
+def test_dispatcher_applies_configured_profile_recovery_before_blocking(
+    kanban_home, monkeypatch
+):
+    """The real dispatch path reassigns only after required skills resolve."""
+    backup_skills = kanban_home / "profiles" / "backup" / "skills" / "qualified-skill"
+    backup_skills.mkdir(parents=True)
+    (backup_skills / "SKILL.md").write_text(
+        "---\nname: qualified-skill\ndescription: Test qualification.\n---\n",
+        encoding="utf-8",
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="same-card profile recovery",
+            assignee="dev",
+            skills=["qualified-skill"],
+            metadata={
+                "recovery_policy": {"qualified_profiles": ["backup"]},
+            },
+        )
+
+        def cannot_spawn(task, workspace):
+            raise RuntimeError("profile worker bootstrap crashed")
+
+        first = kb.dispatch_once(
+            conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
+        )
+
+        assert task_id not in first.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.assignee == "backup"
+        assert task.id == task_id
+        assert task.metadata["recovery"]["action"] == "qualified_profile_reassignment"
+        assert task.metadata["recovery"]["from_assignee"] == "dev"
+        assert task.metadata["recovery"]["to_assignee"] == "backup"
+        assert any(
+            event.kind == "autonomous_recovery_requeued"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_dispatcher_salvages_existing_worktree_before_blocking(
+    kanban_home, tmp_path, monkeypatch
+):
+    """A crash snapshots the existing artifact identity and retries the same card once."""
+    repo = tmp_path / "salvage-repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:acme/repo.git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="salvage existing artifact",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="main",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/42",
+                "head_sha": head_sha,
+            },
+        )
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        original_run = subprocess.run
+
+        def assert_no_writer_lock(*args, **kwargs):
+            assert conn.in_transaction is False
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(kb.subprocess, "run", assert_no_writer_lock)
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "worker crashed after producing the PR artifact",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.id == task_id
+        assert task.status == "ready"
+        assert task.workspace_path == str(repo)
+        assert task.branch_name == "main"
+        assert task.metadata["pr_url"].endswith("/42")
+        salvage = task.metadata["artifact_worktree_salvage"]
+        assert salvage["workspace_path"] == str(repo)
+        assert salvage["branch_name"] == "main"
+        assert salvage["git_head_sha"] == head_sha
+        assert salvage["repository_identity"] == "github.com/acme/repo"
+        assert salvage["pr_url"].endswith("/42")
+        stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "artifact_worktree_salvage"
+        )
+        assert stage["executed"] is True
+        assert task.metadata["recovery"]["action"] == "artifact_worktree_salvage"
+
+        # Salvage is one-shot per task workspace. Even a new commit must not
+        # mint an unlimited recovery key for every crashing worker run.
+        (repo / "README.md").write_text("hello\nnew head\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-am", "new artifact head"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        changed_head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert changed_head != head_sha
+        assert kb.claim_task(conn, task_id, claimer="host:worker-2") is not None
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "same worker artifact crashed again",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is True
+        exhausted = kb.get_task(conn, task_id)
+        assert exhausted is not None
+        assert exhausted.id == task_id
+        assert exhausted.status == "blocked"
+        assert exhausted.workspace_path == str(repo)
+        assert exhausted.branch_name == "main"
+        assert exhausted.metadata["artifact_worktree_salvage"] == salvage
+        second_stage = next(
+            item
+            for item in exhausted.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "artifact_worktree_salvage"
+        )
+        assert second_stage["executed"] is False
+        assert exhausted.metadata["recovery"].get("action") is None
+
+
+def test_dispatcher_rejects_mismatched_worktree_artifact_identity(kanban_home, tmp_path):
+    """A claimed branch or PR mismatch is not recorded as verified salvage."""
+    repo = tmp_path / "mismatched-repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:acme/other.git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reject mismatched artifact",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="claimed-branch",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/42",
+                "head_sha": head_sha,
+            },
+        )
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "worker crashed with mismatched artifact identity",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert "artifact_worktree_salvage" not in task.metadata
+        salvage_stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "artifact_worktree_salvage"
+        )
+        assert salvage_stage["executed"] is False
+
+
+def test_existing_profile_without_required_skill_is_not_reassigned(kanban_home, monkeypatch):
+    """An on-disk profile is not qualified when task skills cannot load there."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"dev", "backup"})
+    (kanban_home / "profiles" / "backup" / "skills").mkdir(parents=True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reject unqualified profile",
+            assignee="dev",
+            skills=["required-skill"],
+            metadata={
+                "recovery_policy": {"qualified_profiles": ["backup"]},
+                "canonical": True,
+                "lane": "dev",
+                "capability": "implementation",
+            },
+        )
+
+        def cannot_spawn(task, workspace):
+            raise RuntimeError("profile worker bootstrap crashed")
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
+        )
+
+        assert task_id in result.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.assignee == "dev"
+        stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "qualified_profile_reassignment"
+        )
+        assert stage["executed"] is False
+        assert "required-skill" in stage["evidence"]
+
+
+def test_skill_repair_requires_replacement_skills_to_resolve(kanban_home):
+    """Configured skill names are not an executed repair until they preflight."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reject missing skill repair",
+            assignee="default",
+            metadata={
+                "recovery_policy": {"skill_fallbacks": [["missing-skill"]]},
+            },
+        )
+
+        def cannot_spawn(task, workspace):
+            raise RuntimeError("unknown skill")
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
+        )
+
+        assert task_id in result.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.skills is None
+        stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "capability_preflight_repair"
+        )
+        assert stage["executed"] is False
+        assert "missing-skill" in stage["evidence"]
+
+
+def test_provider_failure_uses_configured_model_fallback_on_same_card(
+    kanban_home, monkeypatch
+):
+    """Provider failure detection must apply an authorized task override."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="provider fallback recovery",
+            assignee="dev",
+            metadata={
+                "recovery_policy": {
+                    "provider_fallbacks": [
+                        {"provider": "openrouter", "model": "fallback/model"}
+                    ]
+                }
+            },
+        )
+        claimed = kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:test")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 7654321)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_classify_worker_exit", lambda pid: ("provider_auth", 78))
+        monkeypatch.setattr(
+            kb,
+            "read_worker_provider_failure",
+            lambda task_id: {"provider": "primary", "error": "token rejected"},
+        )
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.model_override == "fallback/model"
+        assert task.provider_override == "openrouter"
+        assert task.metadata["recovery"]["action"] == "configured_provider_tool_fallback"
+        run = kb.list_runs(conn, task_id)[-1]
+        assert run.outcome == "provider_authentication"
+
+
+def test_failed_status_migration_rolls_back_on_verification_failure(
+    kanban_home, monkeypatch
+):
+    """A failed verifier must leave the live row untouched and keep backup proof."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="rollback migration", assignee="dev")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+
+    monkeypatch.setattr(
+        kb,
+        "_verify_failed_status_migration",
+        lambda conn, task_ids: (_ for _ in ()).throw(RuntimeError("forced mismatch")),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="forced mismatch"):
+        kb.init_db(db_path)
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        assert raw.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()[0] == "failed"
+    finally:
+        raw.close()
+    assert db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak").exists()
+
+
+def test_failed_status_migration_does_not_clobber_concurrent_canonical_transition(
+    kanban_home,
+):
+    """A status change that wins before the migration lock must be preserved."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="migration race", assignee="dev")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+        conn.commit()
+
+    raw = sqlite3.connect(str(db_path))
+    raw.row_factory = sqlite3.Row
+    raced = False
+
+    def transition_before_lock(statement):
+        nonlocal raced
+        if raced or statement.strip().upper() != "BEGIN IMMEDIATE":
+            return
+        raced = True
+        writer = sqlite3.connect(str(db_path))
+        try:
+            writer.execute(
+                "UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?",
+                (task_id,),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+
+    raw.set_trace_callback(transition_before_lock)
+    try:
+        kb._migrate_failed_task_statuses(raw)
+    finally:
+        raw.close()
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert not any(
+            event.kind == "legacy_failed_migrated"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_failed_status_migration_refuses_to_commit_callers_transaction(kanban_home):
+    """Migration owns its transaction instead of committing unrelated caller writes."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        legacy_id = kb.create_task(conn, title="legacy", assignee="dev")
+        canonical_id = kb.create_task(conn, title="before", assignee="dev")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (legacy_id,))
+        conn.commit()
+
+    raw = sqlite3.connect(str(db_path))
+    raw.row_factory = sqlite3.Row
+    try:
+        raw.execute("BEGIN")
+        raw.execute(
+            "UPDATE tasks SET title='canonical-transition' WHERE id=?",
+            (canonical_id,),
+        )
+
+        with pytest.raises(RuntimeError, match="requires transaction ownership"):
+            kb._migrate_failed_task_statuses(raw)
+
+        assert raw.in_transaction is True
+        assert raw.execute(
+            "SELECT title FROM tasks WHERE id=?", (canonical_id,)
+        ).fetchone()[0] == "canonical-transition"
+        raw.rollback()
+    finally:
+        raw.close()
+
+    backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
+    assert not backup_path.exists()
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, canonical_id).title == "before"
+
+
+def test_failed_status_migration_closes_referenced_active_run(kanban_home):
+    """Migration must not orphan a running task_runs row when clearing its pointer."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="active legacy run", assignee="dev")
+        claimed = kb.claim_task(conn, task_id, claimer="host:worker")
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert run["status"] == "recovery_exhausted"
+        assert run["outcome"] == "legacy_failed_migrated"
+        assert run["ended_at"] is not None
+
+
+def test_migration_backup_and_verification(kanban_home, tmp_path):
+    """Test that migration creates backup, verifies, and cleans up on success."""
+    import shutil
+    db_path = kb.kanban_db_path()
+    workspace = kanban_home / "migration-worktree"
+    workspace.mkdir()
+
+    # Create legacy DB with failed tasks
+    conn = sqlite3.connect(str(db_path))
+    # Use the existing schema but inject legacy failed status
+    # The init_db will run migration pass on connect
+    conn.close()
+
+    # Use the actual kanban_db to create proper schema then inject failed tasks
+    kb.init_db(db_path)
+
+    # Now drop guards and inject failed tasks
+    with kb.connect(db_path) as conn:
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        task_id = "legacy-failed-test"
+        metadata_json = json.dumps({"pr_url": "https://example.invalid/pull/510", "head_sha": "a" * 40})
+        conn.execute(
+            "INSERT INTO tasks (id, title, body, status, assignee, result, consecutive_failures, "
+            "last_failure_error, metadata, created_at, workspace_kind, workspace_path, branch_name) "
+            "VALUES (?, 'legacy failed', 'legacy failed', 'failed', 'dev', 'provider exhausted', 3, 'provider down', "
+            "?, 1, 'worktree', ?, 'feature/existing-pr')",
+            (task_id, metadata_json, str(workspace))
+        )
+        parent_id = "legacy-parent"
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, assignee, created_at) VALUES (?, 'parent', 'done', 'dev', 1)",
+            (parent_id,)
+        )
+        conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent_id, task_id))
+        conn.execute("INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, 'chip', 'audit comment', 1)", (task_id,))
+        conn.execute("INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, error) VALUES (?, 'chip', 'failed', 1, 2, 'gave_up', 'provider unavailable')", (task_id,))
+        conn.commit()
+
+    # Run migration via init_db
+    kb.init_db(db_path)
+
+    # The retained rollback artifact is the exact committed state protected by
+    # the migration's writer reservation, before the first selector mutation.
+    backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
+    backup = sqlite3.connect(str(backup_path))
+    try:
+        assert backup.execute(
+            "SELECT status FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0] == "failed"
+    finally:
+        backup.close()
+
+    # Verify migration
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        assert task.body == "legacy failed"
+        assert task.assignee == "dev"
+        assert task.workspace_path == str(workspace)
+        assert task.branch_name == "feature/existing-pr"
+        assert task.metadata["pr_url"].endswith("/510")
+        assert task.metadata["head_sha"] == "a" * 40
+        recovery = task.metadata["recovery"]
+        assert recovery["migrated_from_status"] == "failed"
+        assert recovery["owner"] == "dev"
+        assert recovery["attempts"] == 3
+        assert recovery["next_action"]
+        assert recovery["clear_condition"]
+        assert "stages_executed" in recovery
+        # Migration doesn't execute runtime stages - they're empty for legacy tasks
+        assert isinstance(recovery["stages_executed"], list)
+        assert recovery["classified_cause"] == "legacy_failed_status"
+        # Verify link preserved
+        link = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?", (parent_id, task_id)
+        ).fetchone()[0]
+        assert link == 1
+        # Verify comment preserved
+        comment_count = conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        assert comment_count == 1
+        # Verify run history preserved
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()
+        assert dict(run) == {"status": "failed", "outcome": "gave_up"}
+        # Verify legacy_failed_migrated event
+        events = kb.list_events(conn, task_id)
+        assert any(event.kind == "legacy_failed_migrated" for event in events)
+        # Verify migration complete event
+        assert any(event.kind == "legacy_failed_migration_complete" for event in events)
+
+
+def test_migration_idempotent_repeat_execution(kanban_home):
+    """Test that migration is idempotent and safe to run multiple times."""
+    db_path = kb.kanban_db_path()
+    workspace = kanban_home / "idempotent-worktree"
+    workspace.mkdir()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="idempotent migration",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+            branch_name="feature/test",
+            metadata={"pr_url": "https://example.invalid/pull/1", "head_sha": "b" * 40},
+        )
+        # Drop guards to inject legacy status
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute(
+            "UPDATE tasks SET status='failed', result=?, consecutive_failures=2, last_failure_error=? WHERE id=?",
+            ("test error", "test error detail", task_id),
+        )
+        conn.commit()
+
+    # First migration
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        first_recovery = task.metadata["recovery"].copy()
+
+    # Second migration (should be no-op)
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        # Recovery contract should be preserved (not recreated)
+        assert task.metadata["recovery"]["attempts"] == first_recovery["attempts"]
+        # Should have only one legacy_failed_migrated event per task
+        events = kb.list_events(conn, task_id)
+        migrated_events = [e for e in events if e.kind == "legacy_failed_migrated"]
+        assert len(migrated_events) == 1
+
+
+def test_no_runtime_path_writes_failed_status(kanban_home):
+    """Verify no code path can write status='failed' after migration."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="no failed", assignee="dev")
+        # Try direct SQL write - should be rejected by trigger
+        with pytest.raises(sqlite3.IntegrityError, match="invalid kanban task status"):
+            conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+        # Try insert with failed status
+        with pytest.raises(sqlite3.IntegrityError, match="invalid kanban task status"):
+            conn.execute(
+                "INSERT INTO tasks (id, title, status, assignee, created_at) VALUES (?, 'bad', 'failed', 'dev', 1)",
+                ("bad-task",),
+            )
+
+
+def test_dispatcher_recovery_paths_integration(kanban_home):
+    """A real dispatcher tick detects a dead worker and runs recovery."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="dispatcher recovery",
+            assignee="dev",
+            max_retries=1,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:worker") is not None
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        kb._set_worker_pid(conn, task_id, dead.pid)
+        conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (task_id,))
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - 9999 WHERE task_id=?",
+            (task_id,),
+        )
+        conn.commit()
+        kb._record_worker_exit(dead.pid, 1 << 8)
+
+        result = kb.dispatch_once(conn, dry_run=False, max_spawn=0)
+
+        assert task_id in result.crashed
+        assert task_id in result.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        recovery = task.metadata["recovery"]
+        assert recovery["classified_cause"] == "worker_crash"
+        assert recovery["attempts"] == 1
+        assert recovery["stages_executed"]
+        assert recovery["next_action"]
+        assert recovery["clear_condition"]
+
+
+def test_cli_list_rejects_failed_and_emits_only_canonical_status(kanban_home, capsys):
+    """The public CLI parser rejects failed and JSON list output stays canonical."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    kanban_cli.build_parser(subparsers)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "list", "--status", "failed"])
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="canonical CLI task", assignee="dev")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        conn.commit()
+    args = parser.parse_args(["kanban", "list", "--status", "ready", "--json"])
+    assert kanban_cli._cmd_list(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    selected = next(item for item in payload if item["id"] == task_id)
+    assert selected["status"] == "ready"
+    assert all(item["status"] in kb.VALID_STATUSES for item in payload)
+
+
+def test_dashboard_api_rejects_and_never_exposes_failed_status(kanban_home):
+    """The public REST contract rejects failed and omits a failed board column."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from plugins.kanban.dashboard.plugin_api import router
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api/plugins/kanban")
+    client = TestClient(app)
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "canonical API task", "assignee": "dev"},
+    )
+    assert created.status_code == 200
+    task_id = created.json()["task"]["id"]
+
+    rejected = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}", json={"status": "failed"}
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "unknown status: failed"
+
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200
+    columns = board.json()["columns"]
+    assert {column["name"] for column in columns} == kb.VALID_STATUSES - {"archived"}
+    assert all(
+        task["status"] in kb.VALID_STATUSES
+        for column in columns
+        for task in column["tasks"]
+    )
+
+
+def test_cli_watch_streams_canonical_blocked_transition(kanban_home, monkeypatch, capsys):
+    """The public watch loop streams the canonical blocked event after recovery."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="watch canonical transition", assignee="dev")
+
+    calls = 0
+
+    def advance_watch(_seconds):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with kb.connect() as conn:
+                assert kb.block_task(
+                    conn,
+                    task_id,
+                    reason="bounded recovery exhausted",
+                    kind="recovery_exhausted",
+                )
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(kanban_cli.time, "sleep", advance_watch)
+    args = argparse.Namespace(kinds="blocked", assignee=None, tenant=None, interval=0.1)
+    assert kanban_cli._cmd_watch(args) == 0
+    output = capsys.readouterr().out
+    assert task_id in output
+    assert "blocked" in output
+    assert "failed" not in output
+
+
+def test_optional_kanban_monitor_renders_blocked_as_terminal_task_state(capsys):
+    """The optional monitor consumes the canonical blocked state, not failed."""
+    import importlib.util
+
+    monitor_path = (
+        Path(__file__).resolve().parents[2]
+        / "optional-skills"
+        / "creative"
+        / "kanban-video-orchestrator"
+        / "scripts"
+        / "monitor.py"
+    )
+    spec = importlib.util.spec_from_file_location("kanban_video_monitor_test", monitor_path)
+    assert spec is not None and spec.loader is not None
+    monitor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(monitor)
+
+    monitor.print_snapshot(
+        [
+            {"id": "t_blocked", "assignee": "dev", "title": "needs recovery", "status": "blocked"},
+            {"id": "t_legacy", "assignee": "dev", "title": "legacy drift", "status": "failed"},
+        ],
+        [],
+    )
+    output = capsys.readouterr().out
+    assert "✗ t_blocked" in output
+    assert "? t_legacy" in output
+
+
+def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatch):
+    """A real notifier tick delivers a recovery-exhausted blocked event."""
+    import asyncio
+
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    class RecordingAdapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, text, metadata=None):
+            self.sent.append(
+                {"chat_id": chat_id, "text": text, "metadata": metadata or {}}
+            )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="notifier test", assignee="dev")
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="test-chat"
+        )
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+        kb._record_task_failure(
+            conn,
+            task_id,
+            "test failure",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+
+    adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._active_profile_name = lambda: "default"
+
+    real_sleep = asyncio.sleep
+
+    async def one_tick(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", one_tick)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "test-chat"
+    assert task_id in adapter.sent[0]["text"]
+    assert "gave up" in adapter.sent[0]["text"]
+    assert "test failure" in adapter.sent[0]["text"]
+
+    with kb.connect() as conn:
+        sub = kb.list_notify_subs(conn, task_id)[0]
+        assert sub["last_event_id"] > 0
+
+
+def test_native_review_after_recovery(kanban_home, monkeypatch):
+    """The production submit boundary accepts the same recovered task and PR."""
+    (kanban_home / "profiles" / "orion").mkdir(parents=True)
+    monkeypatch.setattr(kb, "_assert_worker_task_ownership", lambda task_id: None)
+    review_metadata = {
+        "pr_url": "https://github.com/owner/repo/pull/123",
+        "repo": "owner/repo",
+        "number": 123,
+        "head_sha": "c" * 40,
+        "verification_evidence": "focused tests passed",
+    }
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review after recovery",
+            assignee="dev",
+            metadata=review_metadata,
+        )
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        kb._record_task_failure(
+            conn, task_id, "test failure", outcome="crashed",
+            failure_limit=1, release_claim=True, end_run=True
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+
+        kb.unblock_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+
+        claimed = kb.claim_task(conn, task_id, claimer="host:worker2")
+        assert claimed is not None
+        assert kb.submit_for_review(
+            conn,
+            task_id,
+            summary="Fixed and verified",
+            reviewer="orion",
+            metadata=review_metadata,
+            expected_run_id=claimed.current_run_id,
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "orion"
+        assert task.idempotency_key == f"github-pr:owner/repo:123:{'c' * 40}"
+        event = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "review_submitted"
+        )
+        assert event.payload is not None
+        assert event.payload["metadata"]["head_sha"] == "c" * 40
+        assert kb.list_runs(conn, task_id)[-1].outcome == "submitted_for_review"
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):

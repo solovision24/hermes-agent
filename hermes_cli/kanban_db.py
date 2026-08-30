@@ -88,6 +88,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import urlparse
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -122,8 +123,24 @@ VALID_INITIAL_STATUSES = {"running", "blocked", "review", "triage"}
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
-# ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# ``recovery_exhausted`` is reserved for the dispatcher circuit breaker after
+# it has consumed the bounded autonomous recovery budget. It is a typed blocker,
+# not a terminal task status: task identity, workspace, links, comments, and run
+# history stay live until an operator explicitly unblocks or reroutes the card.
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "transient", "recovery_exhausted",
+}
+
+AUTONOMOUS_RECOVERY_STAGES = (
+    "classify_evidence",
+    "bounded_retry_backoff",
+    "capability_preflight_repair",
+    "qualified_profile_reassignment",
+    "configured_provider_tool_fallback",
+    "artifact_worktree_salvage",
+    "specialist_arbitration_review",
+    "safe_reversible_default",
+)
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -2429,11 +2446,775 @@ def init_db(
     return path
 
 
+def _profile_missing_required_skills(
+    profile: str,
+    required_skills: list[str],
+) -> list[str]:
+    """Return skills that the target profile cannot resolve from its own store.
+
+    Dispatcher recovery cannot use the active process' ``HERMES_HOME`` for
+    this check: the candidate worker may be a different named profile. Mirror
+    the explicit preload lookup strategies against that profile's skill tree
+    without mutating process-global environment state.
+    """
+    from agent.skill_utils import iter_skill_index_files
+    from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root
+    from tools.skills_tool import _parse_frontmatter
+
+    normalized_profile = _canonical_assignee(profile) or "default"
+    profile_home = (
+        _get_default_hermes_home()
+        if normalized_profile == "default"
+        else _get_profiles_root() / normalized_profile
+    )
+    skills_root = profile_home / "skills"
+    if not skills_root.is_dir():
+        return list(required_skills)
+
+    indexed: list[tuple[Path, str]] = []
+    for skill_md in iter_skill_index_files(skills_root, "SKILL.md"):
+        try:
+            frontmatter, _ = _parse_frontmatter(
+                skill_md.read_text(encoding="utf-8")
+            )
+        except Exception:
+            frontmatter = {}
+        indexed.append(
+            (skill_md, str(frontmatter.get("name") or skill_md.parent.name))
+        )
+
+    missing: list[str] = []
+    for raw_skill in required_skills:
+        identifier = str(raw_skill or "").strip()
+        if not identifier:
+            continue
+        relative_identifier = identifier.replace(":", "/", 1)
+        direct = skills_root / relative_identifier / "SKILL.md"
+        if direct.is_file():
+            continue
+        if any(
+            skill_md.parent.name == identifier or frontmatter_name == identifier
+            for skill_md, frontmatter_name in indexed
+        ):
+            continue
+        missing.append(identifier)
+    return missing
+
+
+def _repository_identity(raw_url: str, *, pull_request: bool = False) -> Optional[str]:
+    """Return a credential-free host/repository identity for git/PR URLs."""
+    value = str(raw_url or "").strip()
+    if not value:
+        return None
+    if "://" in value:
+        parsed = urlparse(value)
+        host = parsed.hostname or ""
+        path = parsed.path
+    else:
+        match = re.match(r"^(?:[^@]+@)?([^:]+):(.+)$", value)
+        if not match:
+            return None
+        host, path = match.group(1), match.group(2)
+    path = path.strip("/")
+    if pull_request:
+        path = re.split(r"/(?:pull|pulls|merge_requests)/\d+(?:/.*)?$", path)[0]
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not host or not path:
+        return None
+    return f"{host.lower()}/{path.lower()}"
+
+
+def _inspect_salvage_artifact(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict]:
+    """Inspect artifact identity without holding the Kanban writer lock."""
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, branch_name, metadata "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["workspace_path"]:
+        return None
+    workspace_kind = str(row["workspace_kind"] or "")
+    workspace = Path(str(row["workspace_path"])).expanduser()
+    if workspace_kind not in {"worktree", "dir"} or not workspace.is_dir():
+        return None
+    metadata = _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    declared_branch = str(row["branch_name"] or "") or None
+    pr_url = str(metadata.get("pr_url") or "") or None
+    pr_head_sha = str(metadata.get("head_sha") or "") or None
+
+    if workspace_kind == "dir":
+        # A plain artifact directory is salvageable only when the card makes
+        # no git/PR identity claims that this path cannot independently prove.
+        if declared_branch or pr_url or pr_head_sha:
+            return None
+        return {
+            "workspace_kind": workspace_kind,
+            "workspace_path": str(workspace),
+            "branch_name": declared_branch,
+            "_task_branch_name": declared_branch,
+            "git_head_sha": None,
+            "repository_identity": None,
+            "pr_url": pr_url,
+            "pr_head_sha": pr_head_sha,
+            "verified_at": int(time.time()),
+        }
+
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        git_head_sha = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        git_branch = subprocess.run(
+            ["git", "-C", str(workspace), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if Path(top_level).resolve(strict=False) != workspace.resolve(strict=False):
+        return None
+    if not git_branch or (declared_branch and declared_branch != git_branch):
+        return None
+    if pr_head_sha and pr_head_sha != git_head_sha:
+        return None
+
+    repository_identity: Optional[str] = None
+    try:
+        remote_url = subprocess.run(
+            ["git", "-C", str(workspace), "remote", "get-url", "origin"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        repository_identity = _repository_identity(remote_url)
+    except (OSError, subprocess.SubprocessError):
+        remote_url = ""
+    if pr_url:
+        pr_identity = _repository_identity(pr_url, pull_request=True)
+        if not repository_identity or not pr_identity or repository_identity != pr_identity:
+            return None
+
+    return {
+        "workspace_kind": workspace_kind,
+        "workspace_path": str(workspace),
+        "branch_name": git_branch,
+        "_task_branch_name": declared_branch,
+        "git_head_sha": git_head_sha,
+        "repository_identity": repository_identity,
+        "pr_url": pr_url,
+        "pr_head_sha": pr_head_sha,
+        "verified_at": int(time.time()),
+    }
+
+
+def _execute_autonomous_recovery_stages(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str,
+    error: str,
+    attempts: int,
+    owner: str,
+    task_metadata: dict,
+    salvage_candidate: Optional[dict] = None,
+) -> tuple[list[dict], dict, Optional[dict]]:
+    """Attempt one authorized recovery action and record truthful evidence.
+
+    Policy is opt-in under ``metadata.recovery_policy``.  The function never
+    invents an owner/model/skill repair: it executes only values explicitly
+    supplied on the card, once each, and returns the selected action so the
+    caller can requeue the same task atomically.  Inapplicable stages are
+    recorded as skipped, never as executed.
+    """
+    cause_map = {
+        "crashed": "worker_crash",
+        "timed_out": "timeout",
+        "spawn_failed": "spawn_failure",
+        "provider_authentication": "provider_failure",
+        "provider_billing": "provider_failure",
+        "protocol_violation": "protocol_violation",
+        "rate_limited": "rate_limited",
+    }
+    classified_cause = cause_map.get(outcome, outcome)
+    cause_specific = {
+        "classified_cause": classified_cause,
+        "next_action": None,
+        "clear_condition": None,
+        "retry_at": None,
+    }
+    records: list[dict] = []
+
+    def record(stage: str, executed: bool, evidence: str, skipped: Optional[str] = None) -> None:
+        records.append({
+            "stage": stage,
+            "executed": executed,
+            "evidence": (evidence or "")[:1000],
+            "skipped_reason": skipped,
+            "attempt_number": attempts,
+        })
+
+    record(
+        "classify_evidence",
+        True,
+        f"outcome={outcome}; classified_cause={classified_cause}; error={(error or 'none')[:500]}",
+    )
+    record(
+        "bounded_retry_backoff",
+        False,
+        f"failure counter reached its configured bound at attempt {attempts}",
+        "retry_budget_exhausted",
+    )
+
+    policy = task_metadata.get("recovery_policy")
+    if not isinstance(policy, dict):
+        policy = {}
+    history = task_metadata.get("recovery_history")
+    if not isinstance(history, list):
+        history = []
+    used = {
+        str(item.get("key"))
+        for item in history
+        if isinstance(item, dict) and item.get("key")
+    }
+    action: Optional[dict] = None
+
+    # Get the task's required skills from the database
+    task_skills_row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    task_skills = None
+    if task_skills_row and task_skills_row["skills"]:
+        try:
+            parsed = json.loads(task_skills_row["skills"])
+            if isinstance(parsed, list):
+                task_skills = [str(s).strip() for s in parsed if s]
+        except Exception:
+            task_skills = []
+
+    # Capability repair is limited to an explicitly configured replacement
+    # skill set.  Merely diagnosing a missing capability is not execution.
+    skill_fallbacks = policy.get("skill_fallbacks")
+    if classified_cause == "spawn_failure" and isinstance(skill_fallbacks, list):
+        for index, skills in enumerate(skill_fallbacks):
+            key = f"skills:{index}"
+            if key in used or not isinstance(skills, list):
+                continue
+            normalized = [str(skill).strip() for skill in skills if str(skill).strip()]
+            if not normalized:
+                continue
+            missing = _profile_missing_required_skills(owner, normalized)
+            if missing:
+                record(
+                    "capability_preflight_repair",
+                    False,
+                    f"profile {owner!r} cannot resolve configured replacement skills: {missing!r}",
+                    "replacement_skills_unresolved",
+                )
+                continue
+            conn.execute("UPDATE tasks SET skills=? WHERE id=?", (json.dumps(normalized), task_id))
+            action = {"stage": "capability_preflight_repair", "key": key, "skills": normalized}
+            record(
+                "capability_preflight_repair",
+                True,
+                f"verified and applied configured task skill set {normalized!r} for profile {owner!r}",
+            )
+            break
+    if not any(item["stage"] == "capability_preflight_repair" for item in records):
+        record(
+            "capability_preflight_repair",
+            False,
+            "no unused, explicitly authorized task skill repair was configured",
+            "no_authorized_repair",
+        )
+
+    # Reassign only to an explicitly listed, on-disk profile.
+    if action is None and classified_cause in {"worker_crash", "spawn_failure", "provider_failure"}:
+        candidates = policy.get("qualified_profiles")
+        if isinstance(candidates, list):
+            try:
+                from hermes_cli.profiles import profile_exists
+            except Exception:
+                profile_exists = lambda _name: False
+
+            for candidate_raw in candidates:
+                candidate = _canonical_assignee(str(candidate_raw))
+                key = f"profile:{candidate}"
+                if not candidate or candidate == owner or key in used or not profile_exists(candidate):
+                    continue
+
+                if task_skills:
+                    missing_skills = _profile_missing_required_skills(
+                        candidate, task_skills
+                    )
+                    if missing_skills:
+                        record(
+                            "qualified_profile_reassignment",
+                            False,
+                            f"profile {candidate!r} missing required skills: {missing_skills!r}",
+                            "missing_required_skills",
+                        )
+                        continue
+
+                conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (candidate, task_id))
+                action = {
+                    "stage": "qualified_profile_reassignment",
+                    "key": key,
+                    "from_assignee": owner,
+                    "to_assignee": candidate,
+                }
+                record(
+                    "qualified_profile_reassignment",
+                    True,
+                    f"reassigned same task from {owner!r} to verified profile {candidate!r}",
+                )
+                break
+    if not any(item["stage"] == "qualified_profile_reassignment" for item in records):
+        record(
+            "qualified_profile_reassignment",
+            False,
+            "no unused configured on-disk profile matched this cause",
+            "no_qualified_profile",
+        )
+
+    # Provider/model overrides are task-local and therefore reversible.  A
+    # fallback without both values is ignored rather than guessed.
+    if action is None and classified_cause in {"provider_failure", "rate_limited"}:
+        fallbacks = policy.get("provider_fallbacks")
+        if isinstance(fallbacks, list):
+            for index, fallback in enumerate(fallbacks):
+                key = f"provider:{index}"
+                if key in used or not isinstance(fallback, dict):
+                    continue
+                provider = str(fallback.get("provider") or "").strip()
+                model = str(fallback.get("model") or "").strip()
+                if not provider or not model:
+                    continue
+                conn.execute(
+                    "UPDATE tasks SET provider_override=?, model_override=? WHERE id=?",
+                    (provider, model, task_id),
+                )
+                action = {
+                    "stage": "configured_provider_tool_fallback",
+                    "key": key,
+                    "provider": provider,
+                    "model": model,
+                }
+                record(
+                    "configured_provider_tool_fallback",
+                    True,
+                    f"applied configured task override provider={provider!r}, model={model!r}",
+                )
+                break
+    if not any(item["stage"] == "configured_provider_tool_fallback" for item in records):
+        record(
+            "configured_provider_tool_fallback",
+            False,
+            "no unused authorized provider/model fallback was configured",
+            "no_configured_fallback",
+        )
+
+    # Preserve and audit an existing artifact/worktree identity before handing
+    # the task elsewhere or blocking it. This is deliberately bounded by a
+    # recovery-history key derived from the task workspace, so salvage is a
+    # one-shot action even if a crashing worker creates a new commit each run.
+    if action is None and classified_cause in {
+        "worker_crash", "timeout", "protocol_violation", "spawn_failure",
+    }:
+        workspace_row = conn.execute(
+            "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if workspace_row and salvage_candidate:
+            current_identity = (
+                str(workspace_row["workspace_kind"] or ""),
+                str(workspace_row["workspace_path"] or ""),
+                str(workspace_row["branch_name"] or "") or None,
+            )
+            inspected_identity = (
+                salvage_candidate.get("workspace_kind"),
+                salvage_candidate.get("workspace_path"),
+                salvage_candidate.get("_task_branch_name"),
+            )
+            metadata_identity = (
+                task_metadata.get("pr_url"), task_metadata.get("head_sha")
+            )
+            inspected_pr_identity = (
+                salvage_candidate.get("pr_url"), salvage_candidate.get("pr_head_sha")
+            )
+            if current_identity == inspected_identity and metadata_identity == inspected_pr_identity:
+                workspace = Path(str(workspace_row["workspace_path"])).expanduser()
+                key = f"artifact:{workspace.resolve(strict=False)}"
+                if key not in used:
+                    salvage = {
+                        key: value
+                        for key, value in salvage_candidate.items()
+                        if not key.startswith("_")
+                    }
+                    task_metadata["artifact_worktree_salvage"] = salvage
+                    action = {
+                        "stage": "artifact_worktree_salvage",
+                        "key": key,
+                        **salvage,
+                    }
+                    record(
+                        "artifact_worktree_salvage",
+                        True,
+                        (
+                            f"verified and durably recorded existing {salvage['workspace_kind']} "
+                            f"artifact at {workspace}; branch={salvage['branch_name']!r}; "
+                            f"git_head={salvage['git_head_sha']!r}; "
+                            f"repository={salvage['repository_identity']!r}; "
+                            f"pr_url_present={bool(salvage['pr_url'])}"
+                        ),
+                    )
+    if not any(item["stage"] == "artifact_worktree_salvage" for item in records):
+        record(
+            "artifact_worktree_salvage",
+            False,
+            "no unused existing worktree or artifact directory could be verified",
+            "no_salvageable_artifact",
+        )
+
+    # An explicitly configured specialist is the final autonomous handoff.
+    if action is None:
+        specialist = _canonical_assignee(str(policy.get("specialist_profile") or ""))
+        key = f"specialist:{specialist}"
+        if specialist and key not in used:
+            try:
+                from hermes_cli.profiles import profile_exists
+                specialist_exists = profile_exists(specialist)
+            except Exception:
+                specialist_exists = False
+            if specialist_exists:
+                missing_skills = (
+                    _profile_missing_required_skills(specialist, task_skills)
+                    if task_skills
+                    else []
+                )
+                if missing_skills:
+                    record(
+                        "specialist_arbitration_review",
+                        False,
+                        f"specialist {specialist!r} missing required skills: {missing_skills!r}",
+                        "missing_required_skills",
+                    )
+                else:
+                    conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (specialist, task_id))
+                    action = {
+                        "stage": "specialist_arbitration_review",
+                        "key": key,
+                        "from_assignee": owner,
+                        "to_assignee": specialist,
+                    }
+                    record(
+                        "specialist_arbitration_review",
+                        True,
+                        f"routed same task to qualified configured specialist {specialist!r}",
+                    )
+    if not any(item["stage"] == "specialist_arbitration_review" for item in records):
+        record(
+            "specialist_arbitration_review",
+            False,
+            "no unused configured specialist profile was available",
+            "no_specialist",
+        )
+
+    if action is not None:
+        action_evidence = next(
+            item["evidence"]
+            for item in records
+            if item["stage"] == action["stage"] and item["executed"]
+        )
+        history.append({
+            "key": action["key"],
+            "stage": action["stage"],
+            "attempt": attempts,
+            "at": int(time.time()),
+            "evidence": action_evidence,
+        })
+        task_metadata["recovery_history"] = history
+        cause_specific.update({
+            "next_action": f"Dispatcher will retry the same task after {action['stage']}.",
+            "clear_condition": "The next run completes successfully on the preserved task and artifact.",
+            "retry_at": int(time.time()),
+        })
+        record(
+            "safe_reversible_default",
+            True,
+            "requeued the same task with claims released; no task, branch, workspace, or PR was duplicated",
+        )
+    else:
+        cause_specific.update({
+            "next_action": "Inspect the recorded evidence, repair the classified cause, then explicitly unblock the same task.",
+            "clear_condition": "The classified cause is verified resolved and an operator explicitly unblocks or reroutes the same task.",
+        })
+        record(
+            "safe_reversible_default",
+            False,
+            "no authorized autonomous action remained; caller must apply the typed blocked state",
+            "recovery_exhausted",
+        )
+
+    _append_event(
+        conn,
+        task_id,
+        "autonomous_recovery_attempt",
+        {
+            "outcome": outcome,
+            "error": error[:500] if error else None,
+            "attempts": attempts,
+            "stages": records,
+            "cause_specific": cause_specific,
+            "selected_action": action,
+        },
+    )
+    return records, cause_specific, action
+
+
+def _build_recovery_contract(
+    *,
+    owner: Optional[str],
+    attempts: int,
+    error: Optional[str],
+    trigger_outcome: str,
+    migrated_from_status: Optional[str] = None,
+    stages_executed: Optional[list] = None,
+    cause_specific: Optional[dict] = None,
+) -> dict:
+    """Return the durable recovery record stored on an exhausted task."""
+    evidence = [error[:500]] if error else []
+    recovery = {
+        "attempts": max(int(attempts or 0), 1),
+        "evidence": evidence,
+        "owner": owner or "unassigned",
+        "next_action": (
+            cause_specific.get("next_action")
+            if cause_specific and cause_specific.get("next_action")
+            else "Inspect the preserved evidence, repair or reroute the blocking cause, then explicitly unblock the task."
+        ),
+        "retry_at": cause_specific.get("retry_at") if cause_specific else None,
+        "clear_condition": (
+            cause_specific.get("clear_condition")
+            if cause_specific and cause_specific.get("clear_condition")
+            else "The blocking cause is verified resolved and an operator explicitly unblocks or reroutes the task."
+        ),
+        "stages": list(AUTONOMOUS_RECOVERY_STAGES),
+        "stages_executed": stages_executed or [],
+        "trigger_outcome": trigger_outcome,
+        "classified_cause": cause_specific.get("classified_cause") if cause_specific else trigger_outcome,
+    }
+    if migrated_from_status is not None:
+        recovery["migrated_from_status"] = migrated_from_status
+    return recovery
+
+
+def _verify_failed_status_migration(
+    conn: sqlite3.Connection, task_ids: list[str]
+) -> None:
+    """Raise unless every targeted selector and active-run pointer is canonical."""
+    if not task_ids:
+        return
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT id, status, block_kind, current_run_id, metadata "
+        f"FROM tasks WHERE id IN ({placeholders})",
+        task_ids,
+    ).fetchall()
+    if len(rows) != len(task_ids):
+        raise RuntimeError("legacy failed migration verification lost a task row")
+    for row in rows:
+        metadata = _decode_task_metadata(row["metadata"]) or {}
+        recovery = metadata.get("recovery") if isinstance(metadata, dict) else None
+        if (
+            row["status"] != "blocked"
+            or row["block_kind"] != "recovery_exhausted"
+            or row["current_run_id"] is not None
+            or not isinstance(recovery, dict)
+            or recovery.get("migrated_from_status") != "failed"
+        ):
+            raise RuntimeError(
+                f"legacy failed migration verification mismatch for {row['id']}"
+            )
+
+
+def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
+    """Atomically migrate legacy selectors after a SQLite-consistent backup.
+
+    A backup failure aborts before the first live-row mutation. Verification
+    runs inside the same transaction, so any mismatch or interruption rolls the
+    live DB back automatically. The backup is intentionally retained as the
+    explicit operator rollback artifact; restoring it is safe only while the
+    gateway/dispatcher is stopped.
+    """
+    from pathlib import Path
+
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    required = {
+        "id", "assignee", "status", "result", "completed_at",
+        "consecutive_failures", "last_failure_error", "metadata",
+        "block_kind", "claim_lock", "claim_expires", "worker_pid",
+        "current_run_id",
+    }
+    if not required.issubset(cols):
+        return
+
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
+
+    # Serialize selection, rollback snapshot, and mutation under one writer
+    # reservation. The backup must not predate this lock: otherwise a
+    # canonical transition that commits between snapshot and lock would be
+    # absent from the retained rollback artifact.
+    if conn.in_transaction:
+        raise RuntimeError(
+            "legacy failed migration requires transaction ownership; "
+            "commit or roll back the caller transaction before retrying"
+        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            "SELECT id, assignee, result, completed_at, consecutive_failures, "
+            "last_failure_error, metadata FROM tasks WHERE status = 'failed'"
+        ).fetchall()
+        if not rows:
+            conn.execute("COMMIT")
+            return
+
+        # Use a separate read connection while this connection holds the
+        # RESERVED writer lock. No other writer can commit until migration
+        # finishes, and the source connection captures a consistent committed
+        # snapshot without trying to back up an active write transaction.
+        source_conn = sqlite3.connect(str(db_path))
+        backup_conn = sqlite3.connect(str(backup_path))
+        try:
+            source_conn.backup(backup_conn)
+            backup_conn.execute("PRAGMA synchronous=FULL")
+            backup_conn.commit()
+        except Exception as exc:
+            raise RuntimeError(
+                f"legacy failed migration aborted: backup could not be created at {backup_path}"
+            ) from exc
+        finally:
+            source_conn.close()
+            backup_conn.close()
+
+        # The UPDATE predicate remains a final fail-closed guard even though
+        # BEGIN IMMEDIATE already excludes concurrent writers.
+        migrated_ids = [str(row["id"]) for row in rows]
+        now = int(time.time())
+        for row in rows:
+            metadata = (
+                _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+            ) or {}
+            recovery = _build_recovery_contract(
+                owner=row["assignee"],
+                attempts=row["consecutive_failures"],
+                error=row["last_failure_error"] or row["result"],
+                trigger_outcome="legacy_failed_status",
+                migrated_from_status="failed",
+                stages_executed=[],
+                cause_specific={
+                    "classified_cause": "legacy_failed_status",
+                    "next_action": "Inspect preserved evidence and explicitly unblock the same task after repair.",
+                    "clear_condition": "The classified cause is verified resolved and the same task is explicitly unblocked.",
+                    "retry_at": None,
+                },
+            )
+            metadata["recovery"] = recovery
+            current_run_id = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id=?", (row["id"],)
+            ).fetchone()[0]
+            if current_run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET status='recovery_exhausted', "
+                    "outcome='legacy_failed_migrated', ended_at=?, "
+                    "error=COALESCE(error, 'legacy failed selector migrated') "
+                    "WHERE id=? AND ended_at IS NULL",
+                    (now, current_run_id),
+                )
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='recovery_exhausted', "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                "current_run_id=NULL, completed_at=NULL, metadata=? "
+                "WHERE id=? AND status='failed'",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+            _append_event(
+                conn,
+                row["id"],
+                "legacy_failed_migrated",
+                {
+                    "from_status": "failed",
+                    "to_status": "blocked",
+                    "block_kind": "recovery_exhausted",
+                    "previous_completed_at": row["completed_at"],
+                    "closed_run_id": current_run_id,
+                    "recovery": recovery,
+                },
+            )
+
+        _verify_failed_status_migration(conn, migrated_ids)
+        _append_event(
+            conn,
+            migrated_ids[0],
+            "legacy_failed_migration_complete",
+            {
+                "migrated_task_ids": migrated_ids,
+                "count": len(migrated_ids),
+                "backup_path": str(backup_path),
+                "verified": True,
+                "rollback": (
+                    "stop gateway/dispatcher, copy backup_path over the board DB, "
+                    "then restart and run PRAGMA integrity_check"
+                ),
+            },
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
+
+
+def _install_task_status_guards(conn: sqlite3.Connection) -> None:
+    """Enforce the canonical task status set for direct SQL writers too."""
+    canonical = ", ".join(f"'{status}'" for status in sorted(VALID_STATUSES))
+    conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+    conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+    conn.executescript(
+        f"""
+        CREATE TRIGGER tasks_status_insert_guard
+        BEFORE INSERT ON tasks
+        WHEN NEW.status NOT IN ({canonical})
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid kanban task status');
+        END;
+        CREATE TRIGGER tasks_status_update_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN NEW.status NOT IN ({canonical})
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid kanban task status');
+        END;
+        """
+    )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "kanban schema migration requires transaction ownership; "
+            "commit or roll back the caller transaction before retrying"
+        )
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -2705,6 +3486,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    # Task-level ``failed`` was a short-lived fork/runtime addition. Preserve
+    # attempt history but return every live selector to the canonical state
+    # machine before installing guards that reject future drift.
+    # Commit the schema pass that this function owns before the failed-status
+    # migration takes its own BEGIN IMMEDIATE and creates a backup. Therefore
+    # every schema/canonical write retained in the live DB is also present in
+    # that rollback artifact, while caller-owned transactions are never
+    # committed implicitly.
+    conn.commit()
+    _migrate_failed_task_statuses(conn)
+    _install_task_status_guards(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -6344,7 +7136,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _active_children = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived') "
             "LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -6408,7 +7200,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             active = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks t ON t.id = l.child_id "
-                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived') "
                 "LIMIT 1",
                 (parent_id,),
             ).fetchone()
@@ -8973,9 +9765,14 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    salvage_candidate = (
+        _inspect_salvage_artifact(conn, task_id)
+        if outcome in {"crashed", "timed_out", "protocol_violation", "spawn_failed"}
+        else None
+    )
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, assignee, metadata "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -8996,25 +9793,114 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
-            # Trip the breaker.
+            task_metadata = (
+                _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+            ) or {}
+            stages_executed, cause_specific, recovery_action = (
+                _execute_autonomous_recovery_stages(
+                    conn,
+                    task_id,
+                    outcome=outcome,
+                    error=error,
+                    attempts=failures,
+                    owner=row["assignee"] or "unassigned",
+                    task_metadata=task_metadata,
+                    salvage_candidate=salvage_candidate,
+                )
+            )
+            if recovery_action is None:
+                safe_default = next(
+                    stage
+                    for stage in stages_executed
+                    if stage["stage"] == "safe_reversible_default"
+                )
+                safe_default.update({
+                    "executed": True,
+                    "evidence": (
+                        "transitioned the same task to blocked/recovery_exhausted "
+                        "with claims released and artifact identity preserved"
+                    ),
+                    "skipped_reason": None,
+                })
+
+            recovery = _build_recovery_contract(
+                owner=row["assignee"],
+                attempts=failures,
+                error=error,
+                trigger_outcome=outcome,
+                stages_executed=stages_executed,
+                cause_specific=cause_specific,
+            )
+            if recovery_action is not None:
+                recovery.update({
+                    "action": recovery_action["stage"],
+                    **{
+                        key: value
+                        for key, value in recovery_action.items()
+                        if key not in {"stage", "key"}
+                    },
+                })
+            task_metadata["recovery"] = recovery
+            encoded_metadata = json.dumps(task_metadata, sort_keys=True)
+
+            if recovery_action is not None:
+                conn.execute(
+                    "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL, consecutive_failures=0, last_failure_error=?, "
+                    "block_kind=NULL, metadata=? WHERE id=? "
+                    "AND status IN ('running', 'ready', 'review')",
+                    (source_status, error[:500], encoded_metadata, task_id),
+                )
+                run_id = None
+                if end_run:
+                    run_id = _end_run(
+                        conn,
+                        task_id,
+                        outcome=outcome,
+                        status=outcome,
+                        error=error[:500],
+                        metadata={
+                            "failures": failures,
+                            "recovery_action": recovery_action,
+                        },
+                    )
+                payload = {
+                    "trigger_outcome": outcome,
+                    "classified_cause": cause_specific["classified_cause"],
+                    "action": recovery_action,
+                    "resulting_task_state": source_status,
+                    "same_task": True,
+                    "recovery": recovery,
+                }
+                if event_payload_extra:
+                    payload.update(event_payload_extra)
+                if source_status == "review":
+                    payload["source_status"] = "review"
+                _append_event(
+                    conn,
+                    task_id,
+                    "autonomous_recovery_requeued",
+                    payload,
+                    run_id=run_id,
+                )
+                return False
+
             if release_claim:
-                # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'recovery_exhausted', metadata = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], encoded_metadata, task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
-                # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'recovery_exhausted', metadata = ? "
                     "WHERE id = ? AND status IN ('ready', 'running', 'review')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], encoded_metadata, task_id),
                 )
             run_id = None
             if end_run:
@@ -9036,6 +9922,9 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "resulting_task_state": "blocked",
+                "block_kind": "recovery_exhausted",
+                "recovery": recovery,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)

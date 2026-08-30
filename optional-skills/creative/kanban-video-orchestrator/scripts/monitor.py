@@ -150,7 +150,7 @@ def print_snapshot(tasks: list[dict], issues: list[str]):
         bar = "✓" if str(t.get("status", "")).lower() == "done" else \
               "▶" if str(t.get("status", "")).lower() == "running" else \
               "·" if str(t.get("status", "")).lower() == "ready" else \
-              "✗" if str(t.get("status", "")).lower() == "failed" else "?"
+              "✗" if str(t.get("status", "")).lower() == "blocked" else "?"
         print(f"  {bar} {t.get('id', '?'):14} {t.get('assignee', '?'):20}  "
               f"{t.get('title', '')[:60]}")
 
