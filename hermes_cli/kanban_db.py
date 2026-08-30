@@ -122,8 +122,23 @@ VALID_INITIAL_STATUSES = {"running", "blocked", "review", "triage"}
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
-# ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+# ``recovery_exhausted`` is reserved for the dispatcher circuit breaker after
+# it has consumed the bounded autonomous recovery budget. It is a typed blocker,
+# not a terminal task status: task identity, workspace, links, comments, and run
+# history stay live until an operator explicitly unblocks or reroutes the card.
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "transient", "recovery_exhausted",
+}
+
+AUTONOMOUS_RECOVERY_STAGES = (
+    "classify_evidence",
+    "bounded_retry_backoff",
+    "capability_preflight_repair",
+    "qualified_profile_reassignment",
+    "configured_provider_tool_fallback",
+    "specialist_arbitration_review",
+    "safe_reversible_default",
+)
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -2429,6 +2444,115 @@ def init_db(
     return path
 
 
+def _build_recovery_contract(
+    *,
+    owner: Optional[str],
+    attempts: int,
+    error: Optional[str],
+    trigger_outcome: str,
+    migrated_from_status: Optional[str] = None,
+) -> dict:
+    """Return the durable recovery record stored on an exhausted task."""
+    evidence = [error[:500]] if error else []
+    recovery = {
+        "attempts": max(int(attempts or 0), 1),
+        "evidence": evidence,
+        "owner": owner or "unassigned",
+        "next_action": (
+            "Inspect the preserved evidence, repair or reroute the blocking "
+            "cause, then explicitly unblock the task."
+        ),
+        "retry_at": None,
+        "clear_condition": (
+            "The blocking cause is verified resolved and an operator explicitly "
+            "unblocks or reroutes the task."
+        ),
+        "stages": list(AUTONOMOUS_RECOVERY_STAGES),
+        "trigger_outcome": trigger_outcome,
+    }
+    if migrated_from_status is not None:
+        recovery["migrated_from_status"] = migrated_from_status
+    return recovery
+
+
+def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
+    """Convert the removed task-level ``failed`` state into typed blockers.
+
+    Run rows and events retain their historical failure labels. Only the live
+    task selector changes, in place, so links, comments, PR metadata, workspace,
+    and branch identity remain attached to the same task id.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    required = {
+        "id", "assignee", "status", "result", "completed_at",
+        "consecutive_failures", "last_failure_error", "metadata",
+        "block_kind", "claim_lock", "claim_expires", "worker_pid",
+        "current_run_id",
+    }
+    if not required.issubset(cols):
+        # Defensive compatibility for partial/synthetic schemas used by older
+        # integrations. Canonical boards receive these columns from SCHEMA_SQL
+        # plus the additive migration before this pass runs.
+        return
+    rows = conn.execute(
+        "SELECT id, assignee, result, completed_at, consecutive_failures, "
+        "last_failure_error, metadata FROM tasks WHERE status = 'failed'"
+    ).fetchall()
+    for row in rows:
+        metadata = (
+            _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+        ) or {}
+        recovery = _build_recovery_contract(
+            owner=row["assignee"],
+            attempts=row["consecutive_failures"],
+            error=row["last_failure_error"] or row["result"],
+            trigger_outcome="legacy_failed_status",
+            migrated_from_status="failed",
+        )
+        metadata["recovery"] = recovery
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='recovery_exhausted', "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "current_run_id=NULL, completed_at=NULL, metadata=? WHERE id=?",
+            (json.dumps(metadata, sort_keys=True), row["id"]),
+        )
+        _append_event(
+            conn,
+            row["id"],
+            "legacy_failed_migrated",
+            {
+                "from_status": "failed",
+                "to_status": "blocked",
+                "block_kind": "recovery_exhausted",
+                "previous_completed_at": row["completed_at"],
+                "recovery": recovery,
+            },
+        )
+
+
+def _install_task_status_guards(conn: sqlite3.Connection) -> None:
+    """Enforce the canonical task status set for direct SQL writers too."""
+    canonical = ", ".join(f"'{status}'" for status in sorted(VALID_STATUSES))
+    conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+    conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+    conn.executescript(
+        f"""
+        CREATE TRIGGER tasks_status_insert_guard
+        BEFORE INSERT ON tasks
+        WHEN NEW.status NOT IN ({canonical})
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid kanban task status');
+        END;
+        CREATE TRIGGER tasks_status_update_guard
+        BEFORE UPDATE OF status ON tasks
+        WHEN NEW.status NOT IN ({canonical})
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid kanban task status');
+        END;
+        """
+    )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
@@ -2705,6 +2829,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    # Task-level ``failed`` was a short-lived fork/runtime addition. Preserve
+    # attempt history but return every live selector to the canonical state
+    # machine before installing guards that reject future drift.
+    _migrate_failed_task_statuses(conn)
+    _install_task_status_guards(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -6344,7 +6473,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _active_children = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived') "
             "LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -6408,7 +6537,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             active = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks t ON t.id = l.child_id "
-                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived') "
                 "LIMIT 1",
                 (parent_id,),
             ).fetchone()
@@ -8975,7 +9104,7 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, assignee, metadata "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -8996,15 +9125,30 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
-            # Trip the breaker.
+            # Trip the breaker into the canonical typed blocked state. Persist
+            # the recovery contract on the task so an operator can see what was
+            # attempted and the exact condition for resuming without scraping
+            # logs or losing branch/workspace identity.
+            recovery = _build_recovery_contract(
+                owner=row["assignee"],
+                attempts=failures,
+                error=error,
+                trigger_outcome=outcome,
+            )
+            task_metadata = (
+                _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+            ) or {}
+            task_metadata["recovery"] = recovery
+            encoded_metadata = json.dumps(task_metadata, sort_keys=True)
             if release_claim:
                 # Spawn path: still running, also clear claim state.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'recovery_exhausted', metadata = ? "
                     "WHERE id = ? AND status IN ('running', 'ready', 'review')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], encoded_metadata, task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -9012,9 +9156,10 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'recovery_exhausted', metadata = ? "
                     "WHERE id = ? AND status IN ('ready', 'running', 'review')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500], encoded_metadata, task_id),
                 )
             run_id = None
             if end_run:
@@ -9036,6 +9181,9 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "resulting_task_state": "blocked",
+                "block_kind": "recovery_exhausted",
+                "recovery": recovery,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)

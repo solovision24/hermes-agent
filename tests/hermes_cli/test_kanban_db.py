@@ -45,9 +45,113 @@ def _init_git_repo(repo: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_task_status_constraint_rejects_noncanonical_failed_status(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="canonical status", assignee="dev")
+        with pytest.raises(sqlite3.IntegrityError, match="invalid kanban task status"):
+            conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
 
 
+def test_init_migrates_legacy_failed_task_in_place(kanban_home):
+    db_path = kb.kanban_db_path()
+    workspace = kanban_home / "preserved-worktree"
+    workspace.mkdir()
 
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="dev")
+        task_id = kb.create_task(
+            conn,
+            title="legacy failed selector",
+            body="preserve body",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+            branch_name="feature/existing-pr",
+            metadata={"pr_url": "https://example.invalid/pull/510", "head_sha": "a" * 40},
+        )
+        kb.link_tasks(conn, parent_id, task_id)
+        kb.add_comment(conn, task_id, author="chip", body="preserve audit comment")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute(
+            "UPDATE tasks SET status='failed', result=?, consecutive_failures=3, "
+            "last_failure_error=? WHERE id=?",
+            ("provider recovery exhausted", "provider unavailable", task_id),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, error) "
+            "VALUES (?, 'chip', 'failed', 1, 2, 'gave_up', 'provider unavailable')",
+            (task_id,),
+        )
+        conn.commit()
+
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        assert task.body == "preserve body"
+        assert task.assignee == "dev"
+        assert task.workspace_path == str(workspace)
+        assert task.branch_name == "feature/existing-pr"
+        assert task.result == "provider recovery exhausted"
+        assert task.metadata["pr_url"].endswith("/510")
+        assert task.metadata["head_sha"] == "a" * 40
+        recovery = task.metadata["recovery"]
+        assert recovery["migrated_from_status"] == "failed"
+        assert recovery["owner"] == "dev"
+        assert recovery["attempts"] == 3
+        assert recovery["next_action"]
+        assert recovery["clear_condition"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (parent_id, task_id),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == 1
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()
+        assert dict(run) == {"status": "failed", "outcome": "gave_up"}
+        events = kb.list_events(conn, task_id)
+        assert any(event.kind == "legacy_failed_migrated" for event in events)
+
+
+def test_exhausted_failure_records_typed_recovery_contract(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bounded recovery", assignee="dev")
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "provider chain exhausted after safe fallbacks",
+            outcome="provider_authentication",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"provider": "configured provider"},
+        ) is True
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "recovery_exhausted"
+        recovery = task.metadata["recovery"]
+        assert recovery["attempts"] == 1
+        assert recovery["owner"] == "dev"
+        assert recovery["trigger_outcome"] == "provider_authentication"
+        assert recovery["evidence"]
+        assert recovery["next_action"]
+        assert recovery["clear_condition"]
+        assert recovery["retry_at"] is None
+        assert recovery["stages"] == list(kb.AUTONOMOUS_RECOVERY_STAGES)
+        gave_up = next(event for event in kb.list_events(conn, task_id) if event.kind == "gave_up")
+        assert gave_up.payload["resulting_task_state"] == "blocked"
+        assert gave_up.payload["recovery"] == recovery
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):
