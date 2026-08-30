@@ -2444,6 +2444,61 @@ def init_db(
     return path
 
 
+def _profile_missing_required_skills(
+    profile: str,
+    required_skills: list[str],
+) -> list[str]:
+    """Return skills that the target profile cannot resolve from its own store.
+
+    Dispatcher recovery cannot use the active process' ``HERMES_HOME`` for
+    this check: the candidate worker may be a different named profile. Mirror
+    the explicit preload lookup strategies against that profile's skill tree
+    without mutating process-global environment state.
+    """
+    from agent.skill_utils import iter_skill_index_files
+    from hermes_cli.profiles import _get_default_hermes_home, _get_profiles_root
+    from tools.skills_tool import _parse_frontmatter
+
+    normalized_profile = _canonical_assignee(profile) or "default"
+    profile_home = (
+        _get_default_hermes_home()
+        if normalized_profile == "default"
+        else _get_profiles_root() / normalized_profile
+    )
+    skills_root = profile_home / "skills"
+    if not skills_root.is_dir():
+        return list(required_skills)
+
+    indexed: list[tuple[Path, str]] = []
+    for skill_md in iter_skill_index_files(skills_root, "SKILL.md"):
+        try:
+            frontmatter, _ = _parse_frontmatter(
+                skill_md.read_text(encoding="utf-8")
+            )
+        except Exception:
+            frontmatter = {}
+        indexed.append(
+            (skill_md, str(frontmatter.get("name") or skill_md.parent.name))
+        )
+
+    missing: list[str] = []
+    for raw_skill in required_skills:
+        identifier = str(raw_skill or "").strip()
+        if not identifier:
+            continue
+        relative_identifier = identifier.replace(":", "/", 1)
+        direct = skills_root / relative_identifier / "SKILL.md"
+        if direct.is_file():
+            continue
+        if any(
+            skill_md.parent.name == identifier or frontmatter_name == identifier
+            for skill_md, frontmatter_name in indexed
+        ):
+            continue
+        missing.append(identifier)
+    return missing
+
+
 def _execute_autonomous_recovery_stages(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2536,9 +2591,22 @@ def _execute_autonomous_recovery_stages(
             normalized = [str(skill).strip() for skill in skills if str(skill).strip()]
             if not normalized:
                 continue
+            missing = _profile_missing_required_skills(owner, normalized)
+            if missing:
+                record(
+                    "capability_preflight_repair",
+                    False,
+                    f"profile {owner!r} cannot resolve configured replacement skills: {missing!r}",
+                    "replacement_skills_unresolved",
+                )
+                continue
             conn.execute("UPDATE tasks SET skills=? WHERE id=?", (json.dumps(normalized), task_id))
             action = {"stage": "capability_preflight_repair", "key": key, "skills": normalized}
-            record("capability_preflight_repair", True, f"installed configured task skill set {normalized!r}")
+            record(
+                "capability_preflight_repair",
+                True,
+                f"verified and applied configured task skill set {normalized!r} for profile {owner!r}",
+            )
             break
     if not any(item["stage"] == "capability_preflight_repair" for item in records):
         record(
@@ -2563,51 +2631,16 @@ def _execute_autonomous_recovery_stages(
                 if not candidate or candidate == owner or key in used or not profile_exists(candidate):
                     continue
 
-                # Check if the target profile has all required skills
                 if task_skills:
-                    try:
-                        from tools.skills_tool import _skills_dir
-                        candidate_skills_dir = Path(_skills_dir().parent / "profiles" / candidate / "skills")
-                        available = True
-                        missing_skills = []
-                        for skill_name in task_skills:
-                            found = False
-                            # Check category subdirectories
-                            if candidate_skills_dir.exists():
-                                for cat_dir in candidate_skills_dir.iterdir():
-                                    if cat_dir.is_dir():
-                                        skill_path = cat_dir / skill_name
-                                        if skill_path.exists() and (skill_path / "SKILL.md").exists():
-                                            found = True
-                                            break
-                                        # Also check direct skill directory
-                                        skill_path2 = cat_dir / skill_name.replace("-", "_")
-                                        if skill_path2.exists() and (skill_path2 / "SKILL.md").exists():
-                                            found = True
-                                            break
-                            # Check top-level skills
-                            if not found:
-                                skill_path3 = candidate_skills_dir / skill_name
-                                if skill_path3.exists() and (skill_path3 / "SKILL.md").exists():
-                                    found = True
-                            if not found:
-                                available = False
-                                missing_skills.append(skill_name)
-                        if not available:
-                            record(
-                                "qualified_profile_reassignment",
-                                False,
-                                f"profile {candidate!r} missing required skills: {missing_skills!r}",
-                                "missing_required_skills",
-                            )
-                            continue
-
-                    except Exception as exc:
+                    missing_skills = _profile_missing_required_skills(
+                        candidate, task_skills
+                    )
+                    if missing_skills:
                         record(
                             "qualified_profile_reassignment",
                             False,
-                            f"skill preflight for {candidate!r} failed: {exc}",
-                            "skill_preflight_error",
+                            f"profile {candidate!r} missing required skills: {missing_skills!r}",
+                            "missing_required_skills",
                         )
                         continue
 
@@ -2680,18 +2713,31 @@ def _execute_autonomous_recovery_stages(
             except Exception:
                 specialist_exists = False
             if specialist_exists:
-                conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (specialist, task_id))
-                action = {
-                    "stage": "specialist_arbitration_review",
-                    "key": key,
-                    "from_assignee": owner,
-                    "to_assignee": specialist,
-                }
-                record(
-                    "specialist_arbitration_review",
-                    True,
-                    f"routed same task to configured specialist {specialist!r}",
+                missing_skills = (
+                    _profile_missing_required_skills(specialist, task_skills)
+                    if task_skills
+                    else []
                 )
+                if missing_skills:
+                    record(
+                        "specialist_arbitration_review",
+                        False,
+                        f"specialist {specialist!r} missing required skills: {missing_skills!r}",
+                        "missing_required_skills",
+                    )
+                else:
+                    conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (specialist, task_id))
+                    action = {
+                        "stage": "specialist_arbitration_review",
+                        "key": key,
+                        "from_assignee": owner,
+                        "to_assignee": specialist,
+                    }
+                    record(
+                        "specialist_arbitration_review",
+                        True,
+                        f"routed same task to qualified configured specialist {specialist!r}",
+                    )
     if not any(item["stage"] == "specialist_arbitration_review" for item in records):
         record(
             "specialist_arbitration_review",
@@ -2839,36 +2885,17 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
     if not required.issubset(cols):
         return
 
-    rows = conn.execute(
-        "SELECT id, assignee, result, completed_at, consecutive_failures, "
-        "last_failure_error, metadata FROM tasks WHERE status = 'failed'"
-    ).fetchall()
-
-    if not rows:
-        return
-
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
-    backup_conn = sqlite3.connect(str(backup_path))
-    try:
-        conn.backup(backup_conn)
-        backup_conn.execute("PRAGMA synchronous=FULL")
-        backup_conn.commit()
-    except Exception as exc:
-        raise RuntimeError(
-            f"legacy failed migration aborted: backup could not be created at {backup_path}"
-        ) from exc
-    finally:
-        backup_conn.close()
 
-    conn.execute("BEGIN IMMEDIATE")
+    # Serialize selection, rollback snapshot, and mutation under one writer
+    # reservation. The backup must not predate this lock: otherwise a
+    # canonical transition that commits between snapshot and lock would be
+    # absent from the retained rollback artifact.
+    in_tx = conn.in_transaction
+    if not in_tx:
+        conn.execute("BEGIN IMMEDIATE")
     try:
-        # Re-SELECT inside the transaction so we migrate only rows that
-        # are still 'failed' at lock time. A concurrent canonical
-        # transition (e.g. done->ready->blocked) that wins BEFORE our
-        # BEGIN IMMEDIATE is preserved: its row is no longer 'failed'
-        # and the UPDATE predicate below (``status='failed'``) ensures
-        # we never clobber it. See test_failed_status_migration_does_not_clobber_concurrent_canonical_transition.
         rows = conn.execute(
             "SELECT id, assignee, result, completed_at, consecutive_failures, "
             "last_failure_error, metadata FROM tasks WHERE status = 'failed'"
@@ -2876,6 +2903,27 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
         if not rows:
             conn.execute("COMMIT")
             return
+
+        # Use a separate read connection while this connection holds the
+        # RESERVED writer lock. No other writer can commit until migration
+        # finishes, and the source connection captures a consistent committed
+        # snapshot without trying to back up an active write transaction.
+        source_conn = sqlite3.connect(str(db_path))
+        backup_conn = sqlite3.connect(str(backup_path))
+        try:
+            source_conn.backup(backup_conn)
+            backup_conn.execute("PRAGMA synchronous=FULL")
+            backup_conn.commit()
+        except Exception as exc:
+            raise RuntimeError(
+                f"legacy failed migration aborted: backup could not be created at {backup_path}"
+            ) from exc
+        finally:
+            source_conn.close()
+            backup_conn.close()
+
+        # The UPDATE predicate remains a final fail-closed guard even though
+        # BEGIN IMMEDIATE already excludes concurrent writers.
         migrated_ids = [str(row["id"]) for row in rows]
         now = int(time.time())
         for row in rows:

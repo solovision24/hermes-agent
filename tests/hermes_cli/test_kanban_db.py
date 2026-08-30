@@ -377,7 +377,7 @@ def test_existing_profile_without_required_skill_is_not_reassigned(kanban_home, 
             conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
         )
 
-        assert task_id not in result.auto_blocked
+        assert task_id in result.auto_blocked
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "blocked"
@@ -608,6 +608,17 @@ def test_migration_backup_and_verification(kanban_home, tmp_path):
     # Run migration via init_db
     kb.init_db(db_path)
 
+    # The retained rollback artifact is the exact committed state protected by
+    # the migration's writer reservation, before the first selector mutation.
+    backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
+    backup = sqlite3.connect(str(backup_path))
+    try:
+        assert backup.execute(
+            "SELECT status FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()[0] == "failed"
+    finally:
+        backup.close()
+
     # Verify migration
     with kb.connect(db_path) as conn:
         task = kb.get_task(conn, task_id)
@@ -716,22 +727,33 @@ def test_no_runtime_path_writes_failed_status(kanban_home):
             )
 
 
-def test_dispatcher_recovery_paths_integration(kanban_home, monkeypatch):
-    """Integration test: dispatcher detects crash, runs recovery, blocks with contract."""
+def test_dispatcher_recovery_paths_integration(kanban_home):
+    """A real dispatcher tick detects a dead worker and runs recovery."""
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="dispatcher recovery", assignee="dev", max_runtime_seconds=1)
-        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
-        kb._set_worker_pid(conn, task_id, 999999)  # Non-existent PID
+        task_id = kb.create_task(
+            conn,
+            title="dispatcher recovery",
+            assignee="dev",
+            max_retries=1,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id().split(':', 1)[0]}:worker") is not None
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        kb._set_worker_pid(conn, task_id, dead.pid)
+        conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (task_id,))
+        conn.execute(
+            "UPDATE task_runs SET started_at = started_at - 9999 WHERE task_id=?",
+            (task_id,),
+        )
+        conn.commit()
+        kb._record_worker_exit(dead.pid, 1 << 8)
 
-        # Simulate crashed worker detection - directly call _record_task_failure to simulate the breaker
-        # This is simpler and tests the recovery contract directly
-        assert kb._record_task_failure(
-            conn, task_id, "worker crashed", outcome="crashed",
-            failure_limit=1, release_claim=True, end_run=True
-        ) is True
+        result = kb.dispatch_once(conn, dry_run=False, max_spawn=0)
 
-        # Should auto-block now (since failure_limit=1)
+        assert task_id in result.crashed
+        assert task_id in result.auto_blocked
         task = kb.get_task(conn, task_id)
+        assert task is not None
         assert task.status == "blocked"
         assert task.block_kind == "recovery_exhausted"
         recovery = task.metadata["recovery"]
@@ -771,27 +793,71 @@ def test_cli_list_watch_counts_respect_canonical_statuses(kanban_home):
             assert count >= 0  # At least the one we created
 
 
-def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home):
-    """Test that notifier delivers blocked+recovery_exhausted events."""
-    # This tests the notifier integration - the notifier should deliver
-    # blocked tasks with recovery_exhausted just like any other blocked task
+def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatch):
+    """A real notifier tick delivers a recovery-exhausted blocked event."""
+    import asyncio
+
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    class RecordingAdapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, text, metadata=None):
+            self.sent.append(
+                {"chat_id": chat_id, "text": text, "metadata": metadata or {}}
+            )
+
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="notifier test", assignee="dev")
-        # Subscribe to notifications
-        kb.add_notify_sub(conn, task_id=task_id, platform="telegram", chat_id="test-chat")
-        # Complete task (which is blocked after recovery)
-        # First trip the breaker
+        kb.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="test-chat"
+        )
         assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
         kb._record_task_failure(
-            conn, task_id, "test failure", outcome="crashed",
-            failure_limit=1, release_claim=True, end_run=True
+            conn,
+            task_id,
+            "test failure",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
         )
         task = kb.get_task(conn, task_id)
+        assert task is not None
         assert task.status == "blocked"
         assert task.block_kind == "recovery_exhausted"
-        # Notifier would pick this up on its next watch cycle
-        subs = kb.list_notify_subs(conn, task_id)
-        assert len(subs) == 1
+
+    adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._active_profile_name = lambda: "default"
+
+    real_sleep = asyncio.sleep
+
+    async def one_tick(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", one_tick)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "test-chat"
+    assert task_id in adapter.sent[0]["text"]
+    assert "gave up" in adapter.sent[0]["text"]
+    assert "test failure" in adapter.sent[0]["text"]
+
+    with kb.connect() as conn:
+        sub = kb.list_notify_subs(conn, task_id)[0]
+        assert sub["last_event_id"] > 0
 
 
 def test_native_review_after_recovery(kanban_home, monkeypatch):
