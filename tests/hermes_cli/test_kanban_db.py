@@ -312,17 +312,19 @@ def test_forced_rate_limit_exhaustion_does_not_invent_cooldown_retry(kanban_home
 def test_dispatcher_applies_configured_profile_recovery_before_blocking(
     kanban_home, monkeypatch
 ):
-    """The real dispatch path must reassign the same card before exhaustion."""
-    from hermes_cli import profiles
-
-    monkeypatch.setattr(
-        profiles, "profile_exists", lambda name: name in {"dev", "backup"}
+    """The real dispatch path reassigns only after required skills resolve."""
+    backup_skills = kanban_home / "profiles" / "backup" / "skills" / "qualified-skill"
+    backup_skills.mkdir(parents=True)
+    (backup_skills / "SKILL.md").write_text(
+        "---\nname: qualified-skill\ndescription: Test qualification.\n---\n",
+        encoding="utf-8",
     )
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="same-card profile recovery",
             assignee="dev",
+            skills=["qualified-skill"],
             metadata={
                 "recovery_policy": {"qualified_profiles": ["backup"]},
             },
@@ -347,6 +349,79 @@ def test_dispatcher_applies_configured_profile_recovery_before_blocking(
             event.kind == "autonomous_recovery_requeued"
             for event in kb.list_events(conn, task_id)
         )
+
+
+def test_existing_profile_without_required_skill_is_not_reassigned(kanban_home, monkeypatch):
+    """An on-disk profile is not qualified when task skills cannot load there."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"dev", "backup"})
+    (kanban_home / "profiles" / "backup" / "skills").mkdir(parents=True)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reject unqualified profile",
+            assignee="dev",
+            skills=["required-skill"],
+            metadata={
+                "recovery_policy": {"qualified_profiles": ["backup"]},
+                "canonical": True,
+                "lane": "dev",
+                "capability": "implementation",
+            },
+        )
+
+        def cannot_spawn(task, workspace):
+            raise RuntimeError("profile worker bootstrap crashed")
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
+        )
+
+        assert task_id not in result.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.assignee == "dev"
+        stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "qualified_profile_reassignment"
+        )
+        assert stage["executed"] is False
+        assert "required-skill" in stage["evidence"]
+
+
+def test_skill_repair_requires_replacement_skills_to_resolve(kanban_home):
+    """Configured skill names are not an executed repair until they preflight."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reject missing skill repair",
+            assignee="default",
+            metadata={
+                "recovery_policy": {"skill_fallbacks": [["missing-skill"]]},
+            },
+        )
+
+        def cannot_spawn(task, workspace):
+            raise RuntimeError("unknown skill")
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=cannot_spawn, failure_limit=1, max_spawn=1
+        )
+
+        assert task_id in result.auto_blocked
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.skills is None
+        stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "capability_preflight_repair"
+        )
+        assert stage["executed"] is False
+        assert "missing-skill" in stage["evidence"]
 
 
 def test_provider_failure_uses_configured_model_fallback_on_same_card(
@@ -416,6 +491,53 @@ def test_failed_status_migration_rolls_back_on_verification_failure(
     finally:
         raw.close()
     assert db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak").exists()
+
+
+def test_failed_status_migration_does_not_clobber_concurrent_canonical_transition(
+    kanban_home,
+):
+    """A status change that wins before the migration lock must be preserved."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="migration race", assignee="dev")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (task_id,))
+        conn.commit()
+
+    raw = sqlite3.connect(str(db_path))
+    raw.row_factory = sqlite3.Row
+    raced = False
+
+    def transition_before_lock(statement):
+        nonlocal raced
+        if raced or statement.strip().upper() != "BEGIN IMMEDIATE":
+            return
+        raced = True
+        writer = sqlite3.connect(str(db_path))
+        try:
+            writer.execute(
+                "UPDATE tasks SET status='ready', block_kind=NULL WHERE id=?",
+                (task_id,),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+
+    raw.set_trace_callback(transition_before_lock)
+    try:
+        kb._migrate_failed_task_statuses(raw)
+    finally:
+        raw.close()
+
+    with kb.connect(db_path) as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert not any(
+            event.kind == "legacy_failed_migrated"
+            for event in kb.list_events(conn, task_id)
+        )
 
 
 def test_failed_status_migration_closes_referenced_active_run(kanban_home):
@@ -672,49 +794,63 @@ def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home):
         assert len(subs) == 1
 
 
-def test_native_review_after_recovery(kanban_home):
-    """Test that a task can go through recovery and then enter native review."""
+def test_native_review_after_recovery(kanban_home, monkeypatch):
+    """The production submit boundary accepts the same recovered task and PR."""
+    (kanban_home / "profiles" / "orion").mkdir(parents=True)
+    monkeypatch.setattr(kb, "_assert_worker_task_ownership", lambda task_id: None)
+    review_metadata = {
+        "pr_url": "https://github.com/owner/repo/pull/123",
+        "repo": "owner/repo",
+        "number": 123,
+        "head_sha": "c" * 40,
+        "verification_evidence": "focused tests passed",
+    }
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
             title="review after recovery",
             assignee="dev",
-            metadata={"pr_url": "https://github.com/owner/repo/pull/123", "head_sha": "c" * 40},
+            metadata=review_metadata,
         )
         assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
 
-        # Worker completes but fails (simulated)
         kb._record_task_failure(
             conn, task_id, "test failure", outcome="crashed",
             failure_limit=1, release_claim=True, end_run=True
         )
         task = kb.get_task(conn, task_id)
+        assert task is not None
         assert task.status == "blocked"
         assert task.block_kind == "recovery_exhausted"
 
-        # Operator unblocks after fixing root cause
         kb.unblock_task(conn, task_id)
         task = kb.get_task(conn, task_id)
+        assert task is not None
         assert task.status == "ready"
 
-        # Re-claim and complete successfully
-        assert kb.claim_task(conn, task_id, claimer="host:worker2") is not None
-        kb.complete_task(
+        claimed = kb.claim_task(conn, task_id, claimer="host:worker2")
+        assert claimed is not None
+        assert kb.submit_for_review(
             conn,
             task_id,
             summary="Fixed and verified",
-            metadata={
-                "pr_url": "https://github.com/owner/repo/pull/123",
-                "head_sha": "c" * 40,
-                "changed_files": ["file1.py"],
-                "tests_run": 10,
-            },
-        )
+            reviewer="orion",
+            metadata=review_metadata,
+            expected_run_id=claimed.current_run_id,
+        ) is True
+
         task = kb.get_task(conn, task_id)
-        assert task.status == "done"
-        # The PR metadata is preserved through the cycle
-        assert task.metadata["pr_url"].endswith("/123")
-        assert task.metadata["head_sha"] == "c" * 40
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "orion"
+        assert task.idempotency_key == f"github-pr:owner/repo:123:{'c' * 40}"
+        event = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "review_submitted"
+        )
+        assert event.payload is not None
+        assert event.payload["metadata"]["head_sha"] == "c" * 40
+        assert kb.list_runs(conn, task_id)[-1].outcome == "submitted_for_review"
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):

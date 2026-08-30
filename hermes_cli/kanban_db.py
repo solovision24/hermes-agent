@@ -2514,6 +2514,17 @@ def _execute_autonomous_recovery_stages(
     }
     action: Optional[dict] = None
 
+    # Get the task's required skills from the database
+    task_skills_row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    task_skills = None
+    if task_skills_row and task_skills_row["skills"]:
+        try:
+            parsed = json.loads(task_skills_row["skills"])
+            if isinstance(parsed, list):
+                task_skills = [str(s).strip() for s in parsed if s]
+        except Exception:
+            task_skills = []
+
     # Capability repair is limited to an explicitly configured replacement
     # skill set.  Merely diagnosing a missing capability is not execution.
     skill_fallbacks = policy.get("skill_fallbacks")
@@ -2545,11 +2556,61 @@ def _execute_autonomous_recovery_stages(
                 from hermes_cli.profiles import profile_exists
             except Exception:
                 profile_exists = lambda _name: False
+
             for candidate_raw in candidates:
                 candidate = _canonical_assignee(str(candidate_raw))
                 key = f"profile:{candidate}"
                 if not candidate or candidate == owner or key in used or not profile_exists(candidate):
                     continue
+
+                # Check if the target profile has all required skills
+                if task_skills:
+                    try:
+                        from tools.skills_tool import _skills_dir
+                        candidate_skills_dir = Path(_skills_dir().parent / "profiles" / candidate / "skills")
+                        available = True
+                        missing_skills = []
+                        for skill_name in task_skills:
+                            found = False
+                            # Check category subdirectories
+                            if candidate_skills_dir.exists():
+                                for cat_dir in candidate_skills_dir.iterdir():
+                                    if cat_dir.is_dir():
+                                        skill_path = cat_dir / skill_name
+                                        if skill_path.exists() and (skill_path / "SKILL.md").exists():
+                                            found = True
+                                            break
+                                        # Also check direct skill directory
+                                        skill_path2 = cat_dir / skill_name.replace("-", "_")
+                                        if skill_path2.exists() and (skill_path2 / "SKILL.md").exists():
+                                            found = True
+                                            break
+                            # Check top-level skills
+                            if not found:
+                                skill_path3 = candidate_skills_dir / skill_name
+                                if skill_path3.exists() and (skill_path3 / "SKILL.md").exists():
+                                    found = True
+                            if not found:
+                                available = False
+                                missing_skills.append(skill_name)
+                        if not available:
+                            record(
+                                "qualified_profile_reassignment",
+                                False,
+                                f"profile {candidate!r} missing required skills: {missing_skills!r}",
+                                "missing_required_skills",
+                            )
+                            continue
+
+                    except Exception as exc:
+                        record(
+                            "qualified_profile_reassignment",
+                            False,
+                            f"skill preflight for {candidate!r} failed: {exc}",
+                            "skill_preflight_error",
+                        )
+                        continue
+
                 conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (candidate, task_id))
                 action = {
                     "stage": "qualified_profile_reassignment",
@@ -2800,9 +2861,22 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
     finally:
         backup_conn.close()
 
-    migrated_ids = [str(row["id"]) for row in rows]
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Re-SELECT inside the transaction so we migrate only rows that
+        # are still 'failed' at lock time. A concurrent canonical
+        # transition (e.g. done->ready->blocked) that wins BEFORE our
+        # BEGIN IMMEDIATE is preserved: its row is no longer 'failed'
+        # and the UPDATE predicate below (``status='failed'``) ensures
+        # we never clobber it. See test_failed_status_migration_does_not_clobber_concurrent_canonical_transition.
+        rows = conn.execute(
+            "SELECT id, assignee, result, completed_at, consecutive_failures, "
+            "last_failure_error, metadata FROM tasks WHERE status = 'failed'"
+        ).fetchall()
+        if not rows:
+            conn.execute("COMMIT")
+            return
+        migrated_ids = [str(row["id"]) for row in rows]
         now = int(time.time())
         for row in rows:
             metadata = (
@@ -2837,7 +2911,8 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE tasks SET status='blocked', block_kind='recovery_exhausted', "
                 "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
-                "current_run_id=NULL, completed_at=NULL, metadata=? WHERE id=?",
+                "current_run_id=NULL, completed_at=NULL, metadata=? "
+                "WHERE id=? AND status='failed'",
                 (json.dumps(metadata, sort_keys=True), row["id"]),
             )
             _append_event(
