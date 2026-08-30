@@ -88,6 +88,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import urlparse
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -136,6 +137,7 @@ AUTONOMOUS_RECOVERY_STAGES = (
     "capability_preflight_repair",
     "qualified_profile_reassignment",
     "configured_provider_tool_fallback",
+    "artifact_worktree_salvage",
     "specialist_arbitration_review",
     "safe_reversible_default",
 )
@@ -2499,6 +2501,118 @@ def _profile_missing_required_skills(
     return missing
 
 
+def _repository_identity(raw_url: str, *, pull_request: bool = False) -> Optional[str]:
+    """Return a credential-free host/repository identity for git/PR URLs."""
+    value = str(raw_url or "").strip()
+    if not value:
+        return None
+    if "://" in value:
+        parsed = urlparse(value)
+        host = parsed.hostname or ""
+        path = parsed.path
+    else:
+        match = re.match(r"^(?:[^@]+@)?([^:]+):(.+)$", value)
+        if not match:
+            return None
+        host, path = match.group(1), match.group(2)
+    path = path.strip("/")
+    if pull_request:
+        path = re.split(r"/(?:pull|pulls|merge_requests)/\d+(?:/.*)?$", path)[0]
+    if path.endswith(".git"):
+        path = path[:-4]
+    if not host or not path:
+        return None
+    return f"{host.lower()}/{path.lower()}"
+
+
+def _inspect_salvage_artifact(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict]:
+    """Inspect artifact identity without holding the Kanban writer lock."""
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, branch_name, metadata "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["workspace_path"]:
+        return None
+    workspace_kind = str(row["workspace_kind"] or "")
+    workspace = Path(str(row["workspace_path"])).expanduser()
+    if workspace_kind not in {"worktree", "dir"} or not workspace.is_dir():
+        return None
+    metadata = _decode_task_metadata(row["metadata"]) if row["metadata"] else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    declared_branch = str(row["branch_name"] or "") or None
+    pr_url = str(metadata.get("pr_url") or "") or None
+    pr_head_sha = str(metadata.get("head_sha") or "") or None
+
+    if workspace_kind == "dir":
+        # A plain artifact directory is salvageable only when the card makes
+        # no git/PR identity claims that this path cannot independently prove.
+        if declared_branch or pr_url or pr_head_sha:
+            return None
+        return {
+            "workspace_kind": workspace_kind,
+            "workspace_path": str(workspace),
+            "branch_name": declared_branch,
+            "_task_branch_name": declared_branch,
+            "git_head_sha": None,
+            "repository_identity": None,
+            "pr_url": pr_url,
+            "pr_head_sha": pr_head_sha,
+            "verified_at": int(time.time()),
+        }
+
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        git_head_sha = subprocess.run(
+            ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        git_branch = subprocess.run(
+            ["git", "-C", str(workspace), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if Path(top_level).resolve(strict=False) != workspace.resolve(strict=False):
+        return None
+    if not git_branch or (declared_branch and declared_branch != git_branch):
+        return None
+    if pr_head_sha and pr_head_sha != git_head_sha:
+        return None
+
+    repository_identity: Optional[str] = None
+    try:
+        remote_url = subprocess.run(
+            ["git", "-C", str(workspace), "remote", "get-url", "origin"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        repository_identity = _repository_identity(remote_url)
+    except (OSError, subprocess.SubprocessError):
+        remote_url = ""
+    if pr_url:
+        pr_identity = _repository_identity(pr_url, pull_request=True)
+        if not repository_identity or not pr_identity or repository_identity != pr_identity:
+            return None
+
+    return {
+        "workspace_kind": workspace_kind,
+        "workspace_path": str(workspace),
+        "branch_name": git_branch,
+        "_task_branch_name": declared_branch,
+        "git_head_sha": git_head_sha,
+        "repository_identity": repository_identity,
+        "pr_url": pr_url,
+        "pr_head_sha": pr_head_sha,
+        "verified_at": int(time.time()),
+    }
+
+
 def _execute_autonomous_recovery_stages(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2508,6 +2622,7 @@ def _execute_autonomous_recovery_stages(
     attempts: int,
     owner: str,
     task_metadata: dict,
+    salvage_candidate: Optional[dict] = None,
 ) -> tuple[list[dict], dict, Optional[dict]]:
     """Attempt one authorized recovery action and record truthful evidence.
 
@@ -2702,6 +2817,68 @@ def _execute_autonomous_recovery_stages(
             "no_configured_fallback",
         )
 
+    # Preserve and audit an existing artifact/worktree identity before handing
+    # the task elsewhere or blocking it. This is deliberately bounded by a
+    # recovery-history key derived from the task workspace, so salvage is a
+    # one-shot action even if a crashing worker creates a new commit each run.
+    if action is None and classified_cause in {
+        "worker_crash", "timeout", "protocol_violation", "spawn_failure",
+    }:
+        workspace_row = conn.execute(
+            "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if workspace_row and salvage_candidate:
+            current_identity = (
+                str(workspace_row["workspace_kind"] or ""),
+                str(workspace_row["workspace_path"] or ""),
+                str(workspace_row["branch_name"] or "") or None,
+            )
+            inspected_identity = (
+                salvage_candidate.get("workspace_kind"),
+                salvage_candidate.get("workspace_path"),
+                salvage_candidate.get("_task_branch_name"),
+            )
+            metadata_identity = (
+                task_metadata.get("pr_url"), task_metadata.get("head_sha")
+            )
+            inspected_pr_identity = (
+                salvage_candidate.get("pr_url"), salvage_candidate.get("pr_head_sha")
+            )
+            if current_identity == inspected_identity and metadata_identity == inspected_pr_identity:
+                workspace = Path(str(workspace_row["workspace_path"])).expanduser()
+                key = f"artifact:{workspace.resolve(strict=False)}"
+                if key not in used:
+                    salvage = {
+                        key: value
+                        for key, value in salvage_candidate.items()
+                        if not key.startswith("_")
+                    }
+                    task_metadata["artifact_worktree_salvage"] = salvage
+                    action = {
+                        "stage": "artifact_worktree_salvage",
+                        "key": key,
+                        **salvage,
+                    }
+                    record(
+                        "artifact_worktree_salvage",
+                        True,
+                        (
+                            f"verified and durably recorded existing {salvage['workspace_kind']} "
+                            f"artifact at {workspace}; branch={salvage['branch_name']!r}; "
+                            f"git_head={salvage['git_head_sha']!r}; "
+                            f"repository={salvage['repository_identity']!r}; "
+                            f"pr_url_present={bool(salvage['pr_url'])}"
+                        ),
+                    )
+    if not any(item["stage"] == "artifact_worktree_salvage" for item in records):
+        record(
+            "artifact_worktree_salvage",
+            False,
+            "no unused existing worktree or artifact directory could be verified",
+            "no_salvageable_artifact",
+        )
+
     # An explicitly configured specialist is the final autonomous handoff.
     if action is None:
         specialist = _canonical_assignee(str(policy.get("specialist_profile") or ""))
@@ -2892,9 +3069,12 @@ def _migrate_failed_task_statuses(conn: sqlite3.Connection) -> None:
     # reservation. The backup must not predate this lock: otherwise a
     # canonical transition that commits between snapshot and lock would be
     # absent from the retained rollback artifact.
-    in_tx = conn.in_transaction
-    if not in_tx:
-        conn.execute("BEGIN IMMEDIATE")
+    if conn.in_transaction:
+        raise RuntimeError(
+            "legacy failed migration requires transaction ownership; "
+            "commit or roll back the caller transaction before retrying"
+        )
+    conn.execute("BEGIN IMMEDIATE")
     try:
         rows = conn.execute(
             "SELECT id, assignee, result, completed_at, consecutive_failures, "
@@ -3030,6 +3210,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    if conn.in_transaction:
+        raise RuntimeError(
+            "kanban schema migration requires transaction ownership; "
+            "commit or roll back the caller transaction before retrying"
+        )
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -3304,6 +3489,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Task-level ``failed`` was a short-lived fork/runtime addition. Preserve
     # attempt history but return every live selector to the canonical state
     # machine before installing guards that reject future drift.
+    # Commit the schema pass that this function owns before the failed-status
+    # migration takes its own BEGIN IMMEDIATE and creates a backup. Therefore
+    # every schema/canonical write retained in the live DB is also present in
+    # that rollback artifact, while caller-owned transactions are never
+    # committed implicitly.
+    conn.commit()
     _migrate_failed_task_statuses(conn)
     _install_task_status_guards(conn)
 
@@ -9574,6 +9765,11 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    salvage_candidate = (
+        _inspect_salvage_artifact(conn, task_id)
+        if outcome in {"crashed", "timed_out", "protocol_violation", "spawn_failed"}
+        else None
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, assignee, metadata "
@@ -9609,6 +9805,7 @@ def _record_task_failure(
                     attempts=failures,
                     owner=row["assignee"] or "unassigned",
                     task_metadata=task_metadata,
+                    salvage_candidate=salvage_candidate,
                 )
             )
             if recovery_action is None:

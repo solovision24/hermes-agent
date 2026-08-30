@@ -151,7 +151,9 @@ def test_exhausted_failure_records_typed_recovery_contract(kanban_home):
         assert recovery["stages"] == list(kb.AUTONOMOUS_RECOVERY_STAGES)
         assert "stages_executed" in recovery
         assert isinstance(recovery["stages_executed"], list)
-        assert len(recovery["stages_executed"]) == 7
+        assert {
+            stage["stage"] for stage in recovery["stages_executed"]
+        } == set(kb.AUTONOMOUS_RECOVERY_STAGES)
         assert recovery["classified_cause"] == "provider_failure"
         gave_up = next(event for event in kb.list_events(conn, task_id) if event.kind == "gave_up")
         assert gave_up.payload["resulting_task_state"] == "blocked"
@@ -186,8 +188,10 @@ def test_exhausted_crash_records_only_actions_that_ran(kanban_home):
         recovery = task.metadata["recovery"]
         assert recovery["classified_cause"] == "worker_crash"
         assert recovery["stages_executed"] is not None
-        assert len(recovery["stages_executed"]) == 7
-        # Verify stage 1: classify_evidence executed
+        assert {
+            stage["stage"] for stage in recovery["stages_executed"]
+        } == set(kb.AUTONOMOUS_RECOVERY_STAGES)
+        # Verify classification ran.
         classify = next(s for s in recovery["stages_executed"] if s["stage"] == "classify_evidence")
         assert classify["executed"] is True
         assert "worker_crash" in classify["evidence"]
@@ -349,6 +353,173 @@ def test_dispatcher_applies_configured_profile_recovery_before_blocking(
             event.kind == "autonomous_recovery_requeued"
             for event in kb.list_events(conn, task_id)
         )
+
+
+def test_dispatcher_salvages_existing_worktree_before_blocking(
+    kanban_home, tmp_path, monkeypatch
+):
+    """A crash snapshots the existing artifact identity and retries the same card once."""
+    repo = tmp_path / "salvage-repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:acme/repo.git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="salvage existing artifact",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="main",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/42",
+                "head_sha": head_sha,
+            },
+        )
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+
+        original_run = subprocess.run
+
+        def assert_no_writer_lock(*args, **kwargs):
+            assert conn.in_transaction is False
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(kb.subprocess, "run", assert_no_writer_lock)
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "worker crashed after producing the PR artifact",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.id == task_id
+        assert task.status == "ready"
+        assert task.workspace_path == str(repo)
+        assert task.branch_name == "main"
+        assert task.metadata["pr_url"].endswith("/42")
+        salvage = task.metadata["artifact_worktree_salvage"]
+        assert salvage["workspace_path"] == str(repo)
+        assert salvage["branch_name"] == "main"
+        assert salvage["git_head_sha"] == head_sha
+        assert salvage["repository_identity"] == "github.com/acme/repo"
+        assert salvage["pr_url"].endswith("/42")
+        stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "artifact_worktree_salvage"
+        )
+        assert stage["executed"] is True
+        assert task.metadata["recovery"]["action"] == "artifact_worktree_salvage"
+
+        # Salvage is one-shot per task workspace. Even a new commit must not
+        # mint an unlimited recovery key for every crashing worker run.
+        (repo / "README.md").write_text("hello\nnew head\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-am", "new artifact head"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        changed_head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert changed_head != head_sha
+        assert kb.claim_task(conn, task_id, claimer="host:worker-2") is not None
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "same worker artifact crashed again",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is True
+        exhausted = kb.get_task(conn, task_id)
+        assert exhausted is not None
+        assert exhausted.id == task_id
+        assert exhausted.status == "blocked"
+        assert exhausted.workspace_path == str(repo)
+        assert exhausted.branch_name == "main"
+        assert exhausted.metadata["artifact_worktree_salvage"] == salvage
+        second_stage = next(
+            item
+            for item in exhausted.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "artifact_worktree_salvage"
+        )
+        assert second_stage["executed"] is False
+        assert exhausted.metadata["recovery"].get("action") is None
+
+
+def test_dispatcher_rejects_mismatched_worktree_artifact_identity(kanban_home, tmp_path):
+    """A claimed branch or PR mismatch is not recorded as verified salvage."""
+    repo = tmp_path / "mismatched-repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:acme/other.git"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reject mismatched artifact",
+            assignee="dev",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="claimed-branch",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/42",
+                "head_sha": head_sha,
+            },
+        )
+        assert kb.claim_task(conn, task_id, claimer="host:worker") is not None
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "worker crashed with mismatched artifact identity",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert "artifact_worktree_salvage" not in task.metadata
+        salvage_stage = next(
+            item
+            for item in task.metadata["recovery"]["stages_executed"]
+            if item["stage"] == "artifact_worktree_salvage"
+        )
+        assert salvage_stage["executed"] is False
 
 
 def test_existing_profile_without_required_skill_is_not_reassigned(kanban_home, monkeypatch):
@@ -538,6 +709,43 @@ def test_failed_status_migration_does_not_clobber_concurrent_canonical_transitio
             event.kind == "legacy_failed_migrated"
             for event in kb.list_events(conn, task_id)
         )
+
+
+def test_failed_status_migration_refuses_to_commit_callers_transaction(kanban_home):
+    """Migration owns its transaction instead of committing unrelated caller writes."""
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        legacy_id = kb.create_task(conn, title="legacy", assignee="dev")
+        canonical_id = kb.create_task(conn, title="before", assignee="dev")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS tasks_status_update_guard")
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?", (legacy_id,))
+        conn.commit()
+
+    raw = sqlite3.connect(str(db_path))
+    raw.row_factory = sqlite3.Row
+    try:
+        raw.execute("BEGIN")
+        raw.execute(
+            "UPDATE tasks SET title='canonical-transition' WHERE id=?",
+            (canonical_id,),
+        )
+
+        with pytest.raises(RuntimeError, match="requires transaction ownership"):
+            kb._migrate_failed_task_statuses(raw)
+
+        assert raw.in_transaction is True
+        assert raw.execute(
+            "SELECT title FROM tasks WHERE id=?", (canonical_id,)
+        ).fetchone()[0] == "canonical-transition"
+        raw.rollback()
+    finally:
+        raw.close()
+
+    backup_path = db_path.with_suffix(db_path.suffix + ".pre_failed_migration.bak")
+    assert not backup_path.exists()
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, canonical_id).title == "before"
 
 
 def test_failed_status_migration_closes_referenced_active_run(kanban_home):
@@ -764,33 +972,122 @@ def test_dispatcher_recovery_paths_integration(kanban_home):
         assert recovery["clear_condition"]
 
 
-def test_cli_list_watch_counts_respect_canonical_statuses(kanban_home):
-    """Test that CLI list/watch/count functions only see canonical statuses."""
+def test_cli_list_rejects_failed_and_emits_only_canonical_status(kanban_home, capsys):
+    """The public CLI parser rejects failed and JSON list output stays canonical."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    kanban_cli.build_parser(subparsers)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["kanban", "list", "--status", "failed"])
+
     with kb.connect() as conn:
-        # Create tasks in all canonical statuses
-        statuses = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"]
-        task_ids = []
-        for s in statuses:
-            t = kb.create_task(conn, title=f"task {s}", assignee="dev")
-            if s != "triage":  # triage is initial
-                conn.execute("UPDATE tasks SET status=? WHERE id=?", (s, t))
-                conn.commit()
-            task_ids.append(t)
+        task_id = kb.create_task(conn, title="canonical CLI task", assignee="dev")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        conn.commit()
+    args = parser.parse_args(["kanban", "list", "--status", "ready", "--json"])
+    assert kanban_cli._cmd_list(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    selected = next(item for item in payload if item["id"] == task_id)
+    assert selected["status"] == "ready"
+    assert all(item["status"] in kb.VALID_STATUSES for item in payload)
 
-        # Test list_tasks filters
-        ready_tasks = kb.list_tasks(conn, status="ready")
-        # There might be more than 1 due to other tests, just verify our task is there
-        assert len(ready_tasks) >= 1
-        assert any(t.title == "task ready" for t in ready_tasks)
 
-        blocked_tasks = kb.list_tasks(conn, status="blocked")
-        assert len(blocked_tasks) >= 1
-        assert any(t.title == "task blocked" for t in blocked_tasks)
+def test_dashboard_api_rejects_and_never_exposes_failed_status(kanban_home):
+    """The public REST contract rejects failed and omits a failed board column."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from plugins.kanban.dashboard.plugin_api import router
 
-        # Test count by status using list_tasks
-        for s in statuses:
-            count = len(kb.list_tasks(conn, status=s))
-            assert count >= 0  # At least the one we created
+    app = FastAPI()
+    app.include_router(router, prefix="/api/plugins/kanban")
+    client = TestClient(app)
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "canonical API task", "assignee": "dev"},
+    )
+    assert created.status_code == 200
+    task_id = created.json()["task"]["id"]
+
+    rejected = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}", json={"status": "failed"}
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "unknown status: failed"
+
+    board = client.get("/api/plugins/kanban/board")
+    assert board.status_code == 200
+    columns = board.json()["columns"]
+    assert {column["name"] for column in columns} == kb.VALID_STATUSES - {"archived"}
+    assert all(
+        task["status"] in kb.VALID_STATUSES
+        for column in columns
+        for task in column["tasks"]
+    )
+
+
+def test_cli_watch_streams_canonical_blocked_transition(kanban_home, monkeypatch, capsys):
+    """The public watch loop streams the canonical blocked event after recovery."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="watch canonical transition", assignee="dev")
+
+    calls = 0
+
+    def advance_watch(_seconds):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with kb.connect() as conn:
+                assert kb.block_task(
+                    conn,
+                    task_id,
+                    reason="bounded recovery exhausted",
+                    kind="recovery_exhausted",
+                )
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(kanban_cli.time, "sleep", advance_watch)
+    args = argparse.Namespace(kinds="blocked", assignee=None, tenant=None, interval=0.1)
+    assert kanban_cli._cmd_watch(args) == 0
+    output = capsys.readouterr().out
+    assert task_id in output
+    assert "blocked" in output
+    assert "failed" not in output
+
+
+def test_optional_kanban_monitor_renders_blocked_as_terminal_task_state(capsys):
+    """The optional monitor consumes the canonical blocked state, not failed."""
+    import importlib.util
+
+    monitor_path = (
+        Path(__file__).resolve().parents[2]
+        / "optional-skills"
+        / "creative"
+        / "kanban-video-orchestrator"
+        / "scripts"
+        / "monitor.py"
+    )
+    spec = importlib.util.spec_from_file_location("kanban_video_monitor_test", monitor_path)
+    assert spec is not None and spec.loader is not None
+    monitor = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(monitor)
+
+    monitor.print_snapshot(
+        [
+            {"id": "t_blocked", "assignee": "dev", "title": "needs recovery", "status": "blocked"},
+            {"id": "t_legacy", "assignee": "dev", "title": "legacy drift", "status": "failed"},
+        ],
+        [],
+    )
+    output = capsys.readouterr().out
+    assert "✗ t_blocked" in output
+    assert "? t_legacy" in output
 
 
 def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatch):
