@@ -6,6 +6,47 @@ import threading
 import pytest
 
 
+def test_new_streamable_http_sdk_marks_http_transport_available():
+    from tools import mcp_tool
+
+    if mcp_tool._MCP_NEW_HTTP:
+        assert mcp_tool._MCP_HTTP_AVAILABLE
+
+
+def test_new_streamable_http_uses_the_sdks_httpx_generation():
+    from tools import mcp_tool
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS
+
+    if mcp_tool._MCP_NEW_HTTP:
+        assert issubclass(
+            _HERMES_PROVIDER_CLS,
+            mcp_tool._MCP_HTTPX_CLIENT_MODULE.Auth,
+        )
+
+
+def test_dashboard_oauth_provider_supports_current_sdk_constructor(tmp_path, monkeypatch):
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+    from tools.mcp_oauth import build_oauth_auth, force_interactive_oauth
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    flow = DashboardOAuthFlow(
+        flow_id="flow-sdk",
+        server_name="linear",
+        profile="phaseboauth",
+        hermes_home=str(tmp_path),
+        redirect_uri="https://mc.example/api/mcp/oauth/callback",
+    )
+    with force_interactive_oauth(), dashboard_oauth_flow(flow):
+        provider = build_oauth_auth("linear", "https://mcp.linear.app/mcp")
+        managed_provider = MCPOAuthManager().get_or_build_provider(
+            "linear", "https://mcp.linear.app/mcp", None
+        )
+
+    assert provider is not None
+    assert managed_provider is not None
+
+
 def test_dashboard_flow_exposes_authorization_url_and_accepts_callback():
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 

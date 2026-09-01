@@ -149,6 +149,12 @@ async def mission_control_start_mcp_oauth(
         authorization_url = await flow.wait_for_authorization_url(timeout=30)
     except Exception as exc:
         flow.mark_error(str(exc))
+        _log.warning(
+            "Mission Control MCP OAuth start failed for profile=%s server=%s: %s",
+            body.profile,
+            body.server,
+            exc,
+        )
         raise HTTPException(status_code=502, detail="MCP OAuth could not start") from exc
     return {"flow_id": flow_id, "authorization_url": authorization_url}
 
