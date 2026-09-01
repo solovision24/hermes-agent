@@ -36,6 +36,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -1220,6 +1221,26 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
     return OAuthClientMetadata.model_validate(metadata_kwargs)
 
 
+def _provider_accepts_timeout(provider_cls: type) -> bool:
+    """Return whether an MCP SDK provider constructor accepts ``timeout``."""
+    try:
+        for cls in provider_cls.__mro__:
+            initializer = cls.__dict__.get("__init__")
+            if initializer is None:
+                continue
+            parameters = inspect.signature(initializer).parameters
+            if "timeout" in parameters:
+                return True
+            if not any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                return False
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
 def _maybe_preregister_client(
     storage: "HermesTokenStorage",
     cfg: dict,
@@ -1359,11 +1380,15 @@ def build_oauth_auth(
     )
     callback_handler = _make_callback_waiter(resolved_port)
 
+    provider_kwargs = {
+        "server_url": server_url,
+        "client_metadata": client_metadata,
+        "storage": storage,
+        "redirect_handler": redirect_handler,
+        "callback_handler": callback_handler,
+    }
+    if _provider_accepts_timeout(OAuthClientProvider):
+        provider_kwargs["timeout"] = float(cfg.get("timeout", 300))
     return OAuthClientProvider(
-        server_url=server_url,
-        client_metadata=client_metadata,
-        storage=storage,
-        redirect_handler=redirect_handler,
-        callback_handler=callback_handler,
-        timeout=float(cfg.get("timeout", 300)),
+        **provider_kwargs,
     )

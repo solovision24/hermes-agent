@@ -203,6 +203,7 @@ def _write_stderr_log_header(server_name: str) -> None:
 
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
+_MCP_HTTPX_CLIENT_MODULE = None
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_ELICITATION_TYPES = False
@@ -225,6 +226,18 @@ try:
     try:
         from mcp.client.streamable_http import streamable_http_client
         _MCP_NEW_HTTP = True
+        _MCP_HTTP_AVAILABLE = True
+        # The current MCP SDK intentionally vendors its HTTPX generation as
+        # ``httpx2`` while Hermes also depends on the legacy ``httpx`` module.
+        # An OAuth provider inherits the SDK generation's Auth class, so the
+        # explicit client supplied to streamable_http_client must come from
+        # that same module or HTTPX rejects it as an invalid auth object.
+        _streamable_http_module = sys.modules.get(streamable_http_client.__module__)
+        _MCP_HTTPX_CLIENT_MODULE = getattr(
+            _streamable_http_module, "httpx2", None
+        )
+        if _MCP_HTTPX_CLIENT_MODULE is None:
+            import httpx as _MCP_HTTPX_CLIENT_MODULE
     except ImportError:
         _MCP_NEW_HTTP = False
     try:
@@ -2891,7 +2904,7 @@ class MCPServerTask:
         if _MCP_NEW_HTTP:
             # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
             # matching the SDK's own create_mcp_http_client defaults.
-            import httpx
+            httpx = _MCP_HTTPX_CLIENT_MODULE
 
             _original_url = httpx.URL(url)
 
@@ -2922,9 +2935,14 @@ class MCPServerTask:
             # http_client is provided, so we wrap in async-with.
             try:
                 async with httpx.AsyncClient(**client_kwargs) as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream, _get_session_id,
-                    ):
+                    async with streamable_http_client(
+                        url, http_client=http_client
+                    ) as transport_streams:
+                        # Current SDKs return (read, write); the first version
+                        # of this API returned a third session-id callback.
+                        # Hermes does not need that callback, so accept both
+                        # contracts and keep the transport upgrade-compatible.
+                        read_stream, write_stream = transport_streams[:2]
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
                             self.initialize_result = await asyncio.wait_for(
