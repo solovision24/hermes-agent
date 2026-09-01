@@ -4412,6 +4412,47 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    async def send_notification(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send operational notices through the dedicated SoLo Hermes bot."""
+        try:
+            from agent.secret_scope import get_secret
+
+            token = (get_secret("SOLO_HERMES_BOT_TOKEN", "") or "").strip()
+        except Exception:
+            token = ""
+        if not token:
+            return await super().send_notification(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
+        from tools.send_message_tool import _send_telegram
+
+        result = await _send_telegram(
+            token,
+            chat_id,
+            content,
+            thread_id=None,
+            disable_link_previews=self._disable_link_previews,
+        )
+        return SendResult(
+            success=bool(result.get("success")),
+            message_id=(
+                str(result.get("message_id"))
+                if result.get("message_id") is not None
+                else None
+            ),
+            error=result.get("error"),
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -9945,13 +9986,33 @@ async def _standalone_send(
     parse-mode fallback). Implements the standalone_sender_fn contract so
     deliver=telegram cron jobs succeed when cron runs separately from the
     gateway."""
-    token = getattr(pconfig, "token", None)
-    if not token:
-        # Profile-scoped read: honor the secret scope's verdict rather than
-        # borrowing another profile's env-bridged token under multiplex.
+    # Cron and other out-of-process operational delivery uses the dedicated
+    # notification bot. Regular gateway conversations remain on the adapter's
+    # configured TELEGRAM_BOT_TOKEN identity.
+    try:
         from agent.secret_scope import get_secret
 
-        token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
+        token = (get_secret("SOLO_HERMES_BOT_TOKEN", "") or "").strip()
+    except Exception:
+        token = ""
+    dedicated_token = bool(token)
+    if not token:
+        token = getattr(pconfig, "token", None)
+    if not token:
+        try:
+            from agent.secret_scope import get_secret
+
+            token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
+        except Exception:
+            token = ""
+    if not token:
+        return {
+            "success": False,
+            "error": (
+                "No Telegram bot token configured. Set SOLO_HERMES_BOT_TOKEN "
+                "for operational/cron notifications."
+            ),
+        }
     disable_link_previews = bool(
         getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")
     )
@@ -9961,7 +10022,7 @@ async def _standalone_send(
         chat_id,
         message,
         media_files=media_files,
-        thread_id=thread_id,
+        thread_id=None if dedicated_token else thread_id,
         disable_link_previews=disable_link_previews,
         force_document=force_document,
     )
