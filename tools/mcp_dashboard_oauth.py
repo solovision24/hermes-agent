@@ -52,8 +52,13 @@ class DashboardOAuthFlow:
             self._authorization_ready.set()
 
     async def wait_for_authorization_url(self, timeout: float = 30.0) -> str:
-        ready = await asyncio.to_thread(self._authorization_ready.wait, timeout)
-        if not ready:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not self._authorization_ready.is_set():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.05, remaining))
+        if not self._authorization_ready.is_set():
             raise TimeoutError("Timed out waiting for MCP authorization URL")
         if not self.authorization_url:
             raise RuntimeError(self.error or "MCP OAuth flow ended before authorization")
@@ -84,8 +89,13 @@ class DashboardOAuthFlow:
             self._callback_ready.set()
 
     async def wait_for_callback(self, timeout: float = 300.0) -> tuple[str, str | None]:
-        ready = await asyncio.to_thread(self._callback_ready.wait, timeout)
-        if not ready:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not self._callback_ready.is_set():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.05, remaining))
+        if not self._callback_ready.is_set():
             raise TimeoutError("Timed out waiting for MCP OAuth callback")
         if self._callback_error:
             raise RuntimeError(f"OAuth authorization failed: {self._callback_error}")

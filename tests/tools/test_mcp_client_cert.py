@@ -99,7 +99,9 @@ class TestHTTPClientCert:
 
         class DummyTransportCtx:
             async def __aenter__(self):
-                return MagicMock(), MagicMock(), (lambda: None)
+                # Current streamable_http_client exposes only read/write;
+                # older SDK releases also returned a session-id callback.
+                return MagicMock(), MagicMock()
 
             async def __aexit__(self, *a):
                 return False
@@ -123,7 +125,7 @@ class TestHTTPClientCert:
         async def _drive():
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
                  patch("tools.mcp_tool._MCP_NEW_HTTP", True), \
-                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 patch("tools.mcp_tool._MCP_HTTPX_CLIENT_MODULE.AsyncClient", DummyAsyncClient), \
                  patch("tools.mcp_tool.streamable_http_client",
                        return_value=DummyTransportCtx()), \
                  patch("tools.mcp_tool.ClientSession", DummySession), \
