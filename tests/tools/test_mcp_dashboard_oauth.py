@@ -20,7 +20,7 @@ def test_new_streamable_http_uses_the_sdks_httpx_generation():
     if mcp_tool._MCP_NEW_HTTP:
         assert issubclass(
             _HERMES_PROVIDER_CLS,
-            mcp_tool._MCP_HTTPX_CLIENT_MODULE.Auth,
+            mcp_tool.sdk_httpx().Auth,
         )
 
 
