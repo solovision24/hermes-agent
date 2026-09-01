@@ -80,6 +80,17 @@ def test_worker_session_none_without_workers(home):
     assert row["last_session"]["id"] == "chat1"
 
 
+def test_cron_session_is_hidden_without_becoming_worker_activity(home):
+    db = _db(home)
+    _add_session(db, "chat1", source="cli", title="Chat", ts=1000, text="hello")
+    _add_session(db, "cron1", source="cron", title="Scheduled", ts=5000, text="report")
+    db.close()
+
+    row = _row(_profiles({}), "default")
+    assert row["last_session"]["id"] == "chat1"
+    assert row["worker_session"] is None
+
+
 def test_worker_session_tool_source_counts(home):
     db = _db(home)
     _add_session(db, "sub1", source="tool", title="Subagent", ts=5000, text="delegated run")

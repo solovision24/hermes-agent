@@ -173,11 +173,11 @@ def _(rid, params: dict) -> dict:
             # ones not enumerated here), ACP adapter clients, webhook sessions,
             # custom `HERMES_SESSION_SOURCE` values, and older installs with
             # different source labels. We deny-list only the noisy internal
-            # sources (``tool`` sub-agent runs and ``kanban`` dispatcher
-            # workers) rather than allow-listing a fixed set of platform names
+            # sources (``tool`` sub-agent runs, ``kanban`` dispatcher workers,
+            # and ``cron`` automation runs) rather than allow-listing platform names
             # that goes stale whenever a new platform is added or a user names
             # their own source.
-            deny = frozenset({"kanban", "tool"})
+            deny = frozenset({"cron", "kanban", "tool"})
 
             # ``title``: EXACT-title registry lookup, not a listing. The core
             # UNIQUE title index means at most one session per db carries a
@@ -306,7 +306,7 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _ok(rid, {"session_id": None})
         try:
-            deny = frozenset({"kanban", "tool"})
+            deny = frozenset({"cron", "kanban", "tool"})
             # Over-fetch by a generous bounded amount so heavy sub-agent
             # users (lots of recent ``tool`` rows) don't get a false
             # "no eligible session" answer.  ``session.list`` uses a

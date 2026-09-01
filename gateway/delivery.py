@@ -88,6 +88,27 @@ class DeliveryTransport:
             )
         return await self.adapter.send(chat_id, content, metadata=metadata)
 
+    async def send_notification(
+        self,
+        logical_platform: Platform,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Send an operational notice without changing Relay semantics."""
+        if self.is_relay:
+            return await self.adapter.send_for_platform(
+                logical_platform,
+                chat_id,
+                content,
+                metadata=metadata,
+            )
+        return await self.adapter.send_notification(
+            chat_id,
+            content,
+            metadata=metadata,
+        )
+
 
 def resolve_delivery_transport(
     platform: Platform,

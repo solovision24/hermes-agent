@@ -4202,6 +4202,22 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def send_notification(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an operational notice using the adapter's default transport.
+
+        Platforms with a dedicated notification identity may override this;
+        all other adapters preserve their existing ``send`` behavior.
+        """
+        if reply_to is None:
+            return await self.send(chat_id, content, metadata=metadata)
+        return await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close

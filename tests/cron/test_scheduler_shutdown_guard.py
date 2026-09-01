@@ -105,6 +105,39 @@ class TestStandaloneDeliverySkipsDuringShutdown:
         send_mock.assert_called_once()
         assert result is None
 
+    def test_dedicated_telegram_cron_is_flat_and_not_mirrored(self):
+        """The ops bot lane must not inherit an origin topic or session mirror."""
+        from cron.scheduler import _deliver_result
+
+        job = {
+            "id": "ops-job",
+            "name": "ops-report",
+            "deliver": "telegram:8148316720",
+            "attach_to_session": True,
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "8148316720",
+                "thread_id": "inherited-topic",
+            },
+        }
+        send_mock = AsyncMock(return_value={"success": True})
+        mirror_mock = MagicMock()
+        with patch("gateway.config.load_gateway_config", return_value=self._telegram_cfg()), \
+             patch("cron.scheduler.load_config", return_value={
+                 "cron": {"wrap_response": False, "mirror_delivery": True}
+             }), \
+             patch("agent.secret_scope.get_secret", return_value="notification-token"), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler._maybe_mirror_cron_delivery", new=mirror_mock), \
+             patch("sys.is_finalizing", return_value=False):
+            result = _deliver_result(job, "daily report body")
+
+        assert result is None
+        send_mock.assert_awaited_once()
+        assert send_mock.await_args.kwargs["thread_id"] is None
+        assert send_mock.await_args.kwargs["operational"] is True
+        assert mirror_mock.call_args.kwargs["enabled"] is False
+
 
 class TestSourceGuardrail:
     @pytest.fixture

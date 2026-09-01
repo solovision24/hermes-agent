@@ -3320,6 +3320,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and loop is not None
             and getattr(loop, "is_running", lambda: False)()
         )
+        dedicated_telegram_notification = False
+        if platform == Platform.TELEGRAM:
+            try:
+                from agent.secret_scope import get_secret
+
+                dedicated_telegram_notification = bool(
+                    (get_secret("SOLO_HERMES_BOT_TOKEN", "") or "").strip()
+                )
+            except Exception:
+                dedicated_telegram_notification = False
+        if dedicated_telegram_notification:
+            # The dedicated operations bot owns a flat main-DM notification
+            # lane. Never inherit an origin/session topic or mirror these
+            # one-way cron receipts into a conversational session.
+            live_adapter_ready = False
+            thread_id = None
+            mirror_this_target = False
+            inchannel_continuable = False
         delivered = False
         target_errors = []
 
@@ -3826,7 +3844,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                operational=True,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3855,7 +3881,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                operational=True,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)

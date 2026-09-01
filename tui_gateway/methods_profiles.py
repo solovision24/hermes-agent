@@ -201,9 +201,9 @@ def _(rid, params: dict) -> dict:
     def _latest_profile_session_rows(db):
         """(newest human-facing session, newest worker session) for a profile.
 
-        First element mirrors session.list's deny-list (drops ``tool``
-        sub-agent rows and ``kanban`` dispatcher workers). Second element is
-        the newest DENIED row — the freshest kanban/tool worker — so roster
+        First element mirrors session.list's deny-list (drops ``cron``
+        automation, ``tool`` sub-agent rows, and ``kanban`` dispatcher
+        workers). Second element is the freshest kanban/tool worker, so roster
         UIs can show that a profile is actively working even though worker
         sessions never surface in conversation lists (hermes-agent#90268).
         Workers heartbeat ``last_activity_at`` every ≤60s while running
@@ -215,7 +215,8 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return None, None
         try:
-            deny = frozenset({"kanban", "tool"})
+            deny = frozenset({"cron", "kanban", "tool"})
+            worker_sources = frozenset({"kanban", "tool"})
             human = None
             worker = None
             for s in db.list_sessions_rich(
@@ -223,7 +224,7 @@ def _(rid, params: dict) -> dict:
             ):
                 src = (s.get("source") or "").strip().lower()
                 if src in deny:
-                    if worker is None:
+                    if src in worker_sources and worker is None:
                         worker = {
                             "id": s["id"],
                             "source": src,

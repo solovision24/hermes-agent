@@ -16272,11 +16272,12 @@ def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
 
 
 def test_session_most_recent_returns_first_non_denied(monkeypatch):
-    """Drops `tool` rows like session.list does, returns the first hit."""
+    """Drops automation/tool rows like session.list does, returns the first hit."""
 
     class _DB:
         def list_sessions_rich(self, *, source=None, limit=200, order_by_last_active=False, compact_rows=False):
             return [
+                {"id": "cron-1", "source": "cron", "title": "automation", "started_at": 101},
                 {"id": "tool-1", "source": "tool", "title": "noise", "started_at": 100},
                 {"id": "tui-1", "source": "tui", "title": "real", "started_at": 99},
             ]
