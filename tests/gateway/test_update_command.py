@@ -286,6 +286,7 @@ class TestSendUpdateNotification:
             result = await runner._send_update_notification()
 
         assert result is False
+        mock_adapter.send_notification.assert_not_called()
         mock_adapter.send.assert_not_called()
         assert pending_path.exists()
 
@@ -310,7 +311,8 @@ class TestSendUpdateNotification:
             result = await runner._send_update_notification()
 
         assert result is True
-        mock_adapter.send.assert_called_once()
+        mock_adapter.send_notification.assert_awaited_once()
+        mock_adapter.send.assert_not_called()
         assert not claimed_path.exists()
 
     @pytest.mark.asyncio
@@ -335,14 +337,14 @@ class TestSendUpdateNotification:
 
         # Mock the adapter
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock()
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
             await runner._send_update_notification()
 
-        mock_adapter.send.assert_called_once()
-        call_args = mock_adapter.send.call_args
+        mock_adapter.send_notification.assert_awaited_once()
+        mock_adapter.send.assert_not_called()
+        call_args = mock_adapter.send_notification.call_args
         assert call_args[0][0] == "67890"  # chat_id
         assert "Update complete" in call_args[0][1] or "update finished" in call_args[0][1].lower()
 
@@ -363,9 +365,9 @@ class TestSendUpdateNotification:
         output_path.write_text("✓ Done")
         exit_code_path.write_text("0")
 
-        # Adapter send raises
+        # Adapter notification send raises
         mock_adapter = AsyncMock()
-        mock_adapter.send.side_effect = RuntimeError("network error")
+        mock_adapter.send_notification.side_effect = RuntimeError("network error")
         runner.adapters = {Platform.TELEGRAM: mock_adapter}
 
         with patch("gateway.run._hermes_home", hermes_home):
@@ -407,6 +409,7 @@ class TestSendUpdateNotification:
 
         # No send (wrong platform offline) and the result is deferred.
         assert result is False
+        mock_adapter.send_notification.assert_not_called()
         mock_adapter.send.assert_not_called()
         # Markers are preserved for a later retry — NOT cleaned up.
         assert pending_path.exists()
