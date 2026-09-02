@@ -1477,6 +1477,31 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Durable identity and closeout state for external coding workers.  The
+-- board database, rather than a worker process, owns this record so retries
+-- and gateway restarts observe one task workspace and one remote operation.
+CREATE TABLE IF NOT EXISTS coding_worker_lifecycle (
+    task_id             TEXT PRIMARY KEY,
+    workspace_path      TEXT NOT NULL,
+    lease_token         TEXT,
+    lease_expires       INTEGER,
+    phase               TEXT NOT NULL DEFAULT 'allocated',
+    pr_url              TEXT,
+    head_sha            TEXT,
+    review_submitted_at INTEGER,
+    wait_kind           TEXT,
+    operation_key       TEXT,
+    wait_started_at     INTEGER,
+    wait_deadline       INTEGER,
+    silent_checks       INTEGER NOT NULL DEFAULT 0,
+    operation_receipt   TEXT,
+    last_error          TEXT,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_worker_pr_url
+    ON coding_worker_lifecycle(pr_url) WHERE pr_url IS NOT NULL;
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -4355,36 +4380,49 @@ def _end_run(
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    if not row or not row["current_run_id"]:
-        return None
-    run_id = int(row["current_run_id"])
+    run_id: Optional[int] = None
+    if row and row["current_run_id"]:
+        run_id = int(row["current_run_id"])
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND ended_at IS NULL
+            """,
+            (
+                status or outcome,
+                outcome,
+                summary,
+                error,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                now,
+                run_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        )
+    lifecycle_phase = {
+        "completed": "complete",
+        "review_requested": "review",
+    }.get(outcome, outcome)
+    # The task run and its auxiliary coding-worker lease are one ownership
+    # unit. Keeping this in the same transaction prevents a crash/reclaim
+    # from leaving a live lease that blocks the replacement worker.
     conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (
-            status or outcome,
-            outcome,
-            summary,
-            error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
-            now,
-            run_id,
-        ),
-    )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE coding_worker_lifecycle SET phase=?, lease_token=NULL, "
+        "lease_expires=NULL, last_error=COALESCE(?, last_error), updated_at=? "
+        "WHERE task_id=?",
+        (lifecycle_phase, error, now, task_id),
     )
     return run_id
 
@@ -5996,33 +6034,9 @@ def _cleanup_worktree_workspace(
                 task_id, wp,
             )
             return
-        # No --force: the dirty/unpushed checks above run before removal, so
-        # git's own dirty guard re-verifies at removal time. If the tree
-        # became dirty between our check and the removal (TOCTOU), removal
-        # fails safe and the worktree is preserved.
-        result = subprocess.run(
-            ["git", "-C", str(repo_root), "worktree", "remove", str(wp)],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=60,
-            check=False,
+        _remove_task_worktree_under_lifecycle_lock(
+            task_id, wp, repo_root, common, branch_name
         )
-        if result.returncode != 0:
-            _log.warning(
-                "git worktree remove failed for task %s at %s: %s",
-                task_id, wp, (result.stderr or result.stdout or "").strip(),
-            )
-            return
-        _log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            subprocess.run(
-                ["git", "-C", str(repo_root), "branch", "-D", branch],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=30,
-                check=False,
-            )
     except Exception:
         pass  # best-effort — never block completion
 
@@ -6534,6 +6548,29 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    review_pr_url: Optional[str] = None
+    review_head_sha: Optional[str] = None
+    if isinstance(metadata, dict) and (
+        metadata.get("pr_url") is not None or metadata.get("head_sha") is not None
+    ):
+        if not metadata.get("pr_url") or not metadata.get("head_sha"):
+            return _ret(
+                False,
+                "PR handoff requires both metadata.pr_url and metadata.head_sha",
+            )
+        try:
+            from hermes_cli.coding_worker_lifecycle import (
+                canonical_head_sha,
+                canonical_pr_url,
+            )
+
+            review_pr_url = canonical_pr_url(str(metadata["pr_url"]))
+            review_head_sha = canonical_head_sha(str(metadata["head_sha"]))
+        except ValueError as exc:
+            return _ret(False, str(exc))
+        metadata = dict(metadata)
+        metadata["pr_url"] = review_pr_url
+        metadata["head_sha"] = review_head_sha
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -6543,6 +6580,40 @@ def request_review(
         ).fetchone()
         if trow is None:
             return _ret(False, "task not found")
+        from hermes_cli.coding_worker_lifecycle import get_state
+
+        lifecycle = get_state(conn, task_id)
+        if lifecycle is not None and (
+            review_pr_url is None or review_head_sha is None
+        ):
+            return _ret(
+                False,
+                "coding-worker Review requires both metadata.pr_url and "
+                "metadata.head_sha",
+            )
+        if review_pr_url is not None and review_head_sha is not None:
+            if lifecycle is None:
+                return _ret(False, "PR handoff has no durable workspace allocation")
+            if lifecycle.pr_url not in (None, review_pr_url):
+                return _ret(False, f"task is already bound to {lifecycle.pr_url}")
+            if lifecycle.head_sha not in (None, review_head_sha):
+                return _ret(False, f"review head is immutable ({lifecycle.head_sha})")
+            duplicate = conn.execute(
+                "SELECT task_id FROM coding_worker_lifecycle "
+                "WHERE task_id<>? AND pr_url=? LIMIT 1",
+                (task_id, review_pr_url),
+            ).fetchone()
+            if duplicate is not None:
+                return _ret(False, "pull request is already bound to another task")
+            if (
+                lifecycle.phase == "review"
+                and lifecycle.pr_url == review_pr_url
+                and lifecycle.head_sha == review_head_sha
+                and trow["status"] == "review"
+            ):
+                return _ret(True)
+            if lifecycle.lease_token != trow["claim_lock"]:
+                return _ret(False, "coding-worker lease ownership changed")
         # Refuse to clear a live worker's claim without proof of ownership
         # (expected_run_id) or an explicit human override (force=True).
         if (
@@ -6628,6 +6699,16 @@ def request_review(
                 "task is not in running/ready (or expected_run_id did not "
                 "match the current run)",
             )
+        if review_pr_url is not None and review_head_sha is not None:
+            handoff_now = int(time.time())
+            conn.execute(
+                "UPDATE coding_worker_lifecycle SET pr_url=?, head_sha=?, "
+                "review_submitted_at=COALESCE(review_submitted_at, ?), "
+                "wait_kind=NULL, operation_key=NULL, wait_started_at=NULL, "
+                "wait_deadline=NULL, silent_checks=0, updated_at=? "
+                "WHERE task_id=?",
+                (review_pr_url, review_head_sha, handoff_now, handoff_now, task_id),
+            )
         run_id = _end_run(
             conn,
             task_id,
@@ -6646,15 +6727,20 @@ def request_review(
             )
         lines = (summary or "").strip().splitlines()
         event_summary = lines[0][:400] if lines else ""
+        event_payload = {
+            "summary": event_summary or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        if review_pr_url is not None and review_head_sha is not None:
+            event_payload.update(
+                {"pr_url": review_pr_url, "head_sha": review_head_sha}
+            )
         _append_event(
             conn,
             task_id,
             "review_requested",
-            {
-                "summary": event_summary or None,
-                "implementer": implementer,
-                "reviewer": reviewer,
-            },
+            event_payload,
             run_id=run_id,
         )
     return _ret(True)
@@ -6763,6 +6849,17 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+        )
+        # The reviewed SHA is immutable until native Review explicitly asks
+        # for changes. At that boundary the canonical PR remains task-bound,
+        # while the next implementation run may reserve a new immutable head
+        # for the next review revision.
+        conn.execute(
+            "UPDATE coding_worker_lifecycle SET head_sha=NULL, "
+            "review_submitted_at=NULL, wait_kind=NULL, operation_key=NULL, "
+            "wait_started_at=NULL, wait_deadline=NULL, silent_checks=0, "
+            "updated_at=? WHERE task_id=?",
+            (int(time.time()), task_id),
         )
         _append_event(
             conn,
@@ -7721,34 +7818,188 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _worktree_lock_reason(
+    repo_root: Path, worktree: Path,
+) -> tuple[bool, Optional[str]]:
+    """Return whether Git's worktree lock state was readable and its reason."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    target = worktree.resolve(strict=False)
+    current: Optional[Path] = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):]).resolve(strict=False)
+        elif current == target and (line == "locked" or line.startswith("locked ")):
+            return True, line[len("locked"):].strip()
+    return True, None
+
+
+def _task_worktree_lock_reason(branch_name: str) -> str:
+    return f"active Hermes Kanban task {branch_name}"
+
+
+def _lock_task_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+    """Idempotently lease an existing checkout to one active Kanban task."""
+    from .active_sessions import _FileLock
+
+    common = _git_common_dir(repo_root)
+    if common is None:
+        raise RuntimeError(f"cannot resolve git common dir for {repo_root}")
+    expected = _task_worktree_lock_reason(branch_name)
+    with _FileLock(common / "hermes-worktree-lifecycle.lock"):
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "worktree", "lock", "--reason",
+                expected, str(target),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        known, reason = _worktree_lock_reason(repo_root, target)
+        if not known or reason != expected:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"git worktree lock failed for {target}: {detail}")
+
+
+def _remove_task_worktree_under_lifecycle_lock(
+    task_id: str,
+    worktree: Path,
+    repo_root: Path,
+    common_dir: Path,
+    branch_name: Optional[str],
+) -> None:
+    """Release only this task's lock, then remove its provably safe tree."""
+    from .active_sessions import _FileLock
+
+    branch = (branch_name or "").strip() or f"wt/{task_id}"
+    expected = _task_worktree_lock_reason(branch)
+    with _FileLock(common_dir / "hermes-worktree-lifecycle.lock"):
+        known, reason = _worktree_lock_reason(repo_root, worktree)
+        if not known:
+            _log.warning(
+                "Preserving worktree for task %s: unable to verify lock at %s",
+                task_id, worktree,
+            )
+            return
+        if reason and reason != expected:
+            _log.info(
+                "Preserving worktree for task %s: foreign lock at %s (%s)",
+                task_id, worktree, reason,
+            )
+            return
+        if reason:
+            unlock = subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "unlock", str(worktree)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+            if unlock.returncode != 0:
+                _log.warning(
+                    "git worktree unlock failed for task %s at %s: %s",
+                    task_id, worktree,
+                    (unlock.stderr or unlock.stdout or "").strip(),
+                )
+                return
+        # No --force: Git rechecks dirtiness and any lock acquired after our
+        # owned unlock, so races always fail toward preserving user work.
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", str(worktree)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            _log.warning(
+                "git worktree remove failed for task %s at %s: %s",
+                task_id, worktree,
+                (result.stderr or result.stdout or "").strip(),
+            )
+            return
+        _log.debug("Removed worktree workspace: %s", worktree)
+        if branch.startswith("wt/"):
+            subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "-D", branch],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize and lifecycle-lock a task worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            _lock_task_worktree(repo_root, target, branch_name)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
-        cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
-    else:
-        cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
-        ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=60,
-        check=False,
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+    from .active_sessions import _FileLock
+
+    if repo_common is None:
+        raise RuntimeError(f"cannot resolve git common dir for {repo_root}")
+    reason = _task_worktree_lock_reason(branch_name)
+    with _FileLock(repo_common / "hermes-worktree-lifecycle.lock"):
+        # Recheck inside the cross-process lock: two dispatcher processes may
+        # have observed the path missing before either materialized it.
+        if target.exists() and _git_common_dir(target) == repo_common:
+            known, locked_reason = _worktree_lock_reason(repo_root, target)
+            if known and locked_reason == reason:
+                return
+            raise RuntimeError(f"worktree {target} is owned by another lifecycle")
+        if _git_branch_exists(repo_root, branch_name):
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add", "--lock",
+                "--reason", reason, str(target), branch_name,
+            ]
+        else:
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add", "--lock",
+                "--reason", reason, "-b", branch_name, str(target), "HEAD",
+            ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
         )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+            )
 
 
 def _resolve_worktree_workspace(
@@ -7805,6 +8056,9 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            _lock_task_worktree(
+                _git_common_dir(requested).parent, requested, branch_name
+            )
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -10259,6 +10513,25 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        try:
+            from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+            allocate_workspace(
+                conn,
+                claimed.id,
+                workspace,
+                lease_token=claimed.claim_lock or f"run:{claimed.current_run_id}",
+                now=int(time.time()),
+                ttl_seconds=_resolve_claim_ttl_seconds(ttl_seconds),
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace allocation: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10386,6 +10659,25 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        try:
+            from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+            allocate_workspace(
+                conn,
+                claimed.id,
+                workspace,
+                lease_token=claimed.claim_lock or f"run:{claimed.current_run_id}",
+                now=int(time.time()),
+                ttl_seconds=_resolve_claim_ttl_seconds(ttl_seconds),
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace allocation: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory

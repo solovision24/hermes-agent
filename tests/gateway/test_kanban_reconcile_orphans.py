@@ -149,6 +149,25 @@ class TestReconcileOrphanedRunning:
         conn.commit()
         assert kb.reconcile_orphaned_running(conn) == []
 
+    def test_reconciliation_closes_durable_worker_lease(self, conn, tmp_path):
+        from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+        tid = kb.create_task(conn, title="leased orphan", assignee="w")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        allocate_workspace(
+            conn, tid, tmp_path / "workspace", lease_token=claimed.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+        _orphan_running(conn, tid, claim_lock=None, claim_expires=None)
+
+        assert kb.reconcile_orphaned_running(conn) == [tid]
+        state = conn.execute(
+            "SELECT phase, lease_token, lease_expires "
+            "FROM coding_worker_lifecycle WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert tuple(state) == ("reclaimed", None, None)
+
 
 class TestDispatchOnceReconciles:
     def test_dispatch_once_reconciles_orphans(self, conn):
@@ -176,3 +195,116 @@ class TestDispatchOnceReconciles:
         assert conn.execute(
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "running"
+
+
+def test_provider_connection_failure_and_gateway_restart_resume_one_wait(
+    conn, tmp_path,
+):
+    """A fresh connection retains the operation key and original deadline."""
+    from hermes_cli.coding_worker_lifecycle import (
+        allocate_workspace,
+        begin_wait,
+        observe_wait,
+    )
+
+    tid = kb.create_task(conn, title="merge closeout", assignee="worker")
+    allocate_workspace(
+        conn, tid, tmp_path / "workspace", lease_token="lease-1",
+        now=10, ttl_seconds=60,
+    )
+    initial, started = begin_wait(
+        conn, tid, kind="merge", operation_key="merge:abc",
+        now=20, timeout_seconds=30,
+    )
+    assert started is True
+    assert initial.wait_deadline == 50
+    failed = observe_wait(
+        conn, tid, operation_key="merge:abc", observation="connection_error",
+        now=25, error="connection refused",
+    )
+    assert failed.phase == "merge_wait"
+
+    with kb.connect_closing() as restarted:
+        resumed, started_again = begin_wait(
+            restarted, tid, kind="merge", operation_key="merge:abc",
+            now=40, timeout_seconds=300,
+        )
+        assert started_again is False
+        assert resumed.wait_deadline == 50
+        assert resumed.last_error == "connection refused"
+        observe_wait(
+            restarted, tid, operation_key="merge:abc", observation="complete",
+            now=45, receipt={"merge_sha": "b" * 40},
+        )
+        _done, duplicate = begin_wait(
+            restarted, tid, kind="merge", operation_key="merge:abc",
+            now=46, timeout_seconds=30,
+        )
+        assert duplicate is False
+
+
+def test_deploy_wait_is_fail_closed_while_any_chat_is_active(conn, tmp_path):
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace, begin_wait
+
+    tid = kb.create_task(conn, title="deploy closeout", assignee="worker")
+    allocate_workspace(
+        conn, tid, tmp_path / "workspace", lease_token="lease-1",
+        now=10, ttl_seconds=60,
+    )
+
+    blocked, started = begin_wait(
+        conn, tid, kind="deploy", operation_key="deploy:abc",
+        now=20, timeout_seconds=60, active_chat_count=1,
+    )
+    assert started is False
+    assert blocked.wait_kind is None
+    assert "active chat" in (blocked.last_error or "")
+
+    active, started = begin_wait(
+        conn, tid, kind="deploy", operation_key="deploy:abc",
+        now=30, timeout_seconds=60, active_chat_count=0,
+    )
+    retry, started_again = begin_wait(
+        conn, tid, kind="deploy", operation_key="deploy:abc",
+        now=40, timeout_seconds=600, active_chat_count=0,
+    )
+    assert started is True and started_again is False
+    assert active.wait_deadline == retry.wait_deadline == 90
+
+
+def test_timeout_requires_two_consecutive_silent_watchdog_checks(conn, tmp_path):
+    from hermes_cli.coding_worker_lifecycle import (
+        allocate_workspace,
+        begin_wait,
+        observe_wait,
+    )
+
+    tid = kb.create_task(conn, title="silent deploy", assignee="worker")
+    allocate_workspace(
+        conn, tid, tmp_path / "workspace", lease_token="lease-1",
+        now=10, ttl_seconds=60,
+    )
+    begin_wait(
+        conn, tid, kind="deploy", operation_key="deploy:quiet",
+        now=20, timeout_seconds=10, active_chat_count=0,
+    )
+    first = observe_wait(
+        conn, tid, operation_key="deploy:quiet", observation="silent", now=31,
+    )
+    # Any provider response breaks the silence streak without moving the
+    # original deadline; two new silent observations are then required.
+    pending = observe_wait(
+        conn, tid, operation_key="deploy:quiet", observation="pending", now=32,
+    )
+    second_first = observe_wait(
+        conn, tid, operation_key="deploy:quiet", observation="silent", now=33,
+    )
+    second = observe_wait(
+        conn, tid, operation_key="deploy:quiet", observation="silent", now=34,
+    )
+
+    assert first.phase == "deploy_wait" and first.silent_checks == 1
+    assert pending.silent_checks == 0
+    assert second_first.phase == "deploy_wait" and second_first.silent_checks == 1
+    assert second.phase == "timed_out" and second.silent_checks == 2
+    assert second.wait_deadline == 30

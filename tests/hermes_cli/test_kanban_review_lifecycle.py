@@ -708,3 +708,232 @@ def test_reviewer_reassigns_for_autonomous_dispatch(kanban_home: Path) -> None:
         ev = _events(conn, tid, kind="review_requested")[0][1]
         assert ev["reviewer"] == "lead-reviewer"
         assert ev["implementer"] == "worker"
+
+
+def test_pr_handoff_binds_canonical_url_and_immutable_head_atomically(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """A response-loss retry reuses one native Review handoff and identity."""
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="PR handoff", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        allocate_workspace(
+            conn, tid, tmp_path / "workspace", lease_token=claimed.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+        metadata = {
+            "pr_url": "https://github.com/acme/widgets/pull/12/?from=worker",
+            "head_sha": "D" * 40,
+        }
+
+        first = kb.request_review(
+            conn, tid, summary="ready", metadata=metadata,
+            expected_run_id=claimed.current_run_id, with_reason=True,
+        )
+        retry = kb.request_review(
+            conn, tid, summary="ready", metadata=metadata,
+            expected_run_id=claimed.current_run_id, with_reason=True,
+        )
+
+        assert first == retry == (True, None)
+        lifecycle = conn.execute(
+            "SELECT phase, pr_url, head_sha, lease_token "
+            "FROM coding_worker_lifecycle WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert tuple(lifecycle) == (
+            "review", "https://github.com/acme/widgets/pull/12", "d" * 40, None,
+        )
+        events = _events(conn, tid, kind="review_requested")
+        assert len(events) == 1
+        assert events[0][1]["pr_url"] == "https://github.com/acme/widgets/pull/12"
+        assert events[0][1]["head_sha"] == "d" * 40
+
+        ok, reason = kb.request_review(
+            conn, tid, metadata={
+                "pr_url": "https://github.com/acme/widgets/pull/12",
+                "head_sha": "e" * 40,
+            }, force=True, with_reason=True,
+        )
+        assert ok is False
+        assert "immutable" in (reason or "")
+
+
+def test_lifecycle_managed_review_rejects_missing_pr_identity(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """A coding worker cannot report success through an identity-free Review."""
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="missing PR identity", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        allocate_workspace(
+            conn, tid, tmp_path / "workspace", lease_token=claimed.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+
+        ok, reason = kb.request_review(
+            conn, tid, summary="implemented",
+            expected_run_id=claimed.current_run_id, with_reason=True,
+        )
+
+        assert ok is False
+        assert "pr_url" in (reason or "") and "head_sha" in (reason or "")
+        assert kb.get_task(conn, tid).status == "running"
+        assert _events(conn, tid, kind="review_requested") == []
+
+
+def test_review_gap_resumes_reserved_pr_head_without_second_creation(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """A crash after PR creation leaves one operation for the retry to reconcile."""
+    from hermes_cli.coding_worker_lifecycle import (
+        allocate_workspace,
+        begin_pr_handoff,
+    )
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="review gap", assignee="worker")
+        first_run = kb.claim_task(conn, tid)
+        assert first_run is not None
+        workspace = tmp_path / "workspace"
+        allocate_workspace(
+            conn, tid, workspace, lease_token=first_run.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+        reserved, should_create = begin_pr_handoff(
+            conn, tid, lease_token=first_run.claim_lock,
+            operation_key=f"pr:{tid}", head_sha="c" * 40, now=20,
+        )
+        assert should_create is True
+        assert reserved.head_sha == "c" * 40
+
+        # The provider created the PR, then the worker died before the URL was
+        # committed. Normal crash reconciliation closes only the lease; it
+        # deliberately retains the PR operation/head for provider lookup.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?", (tid,),
+            )
+            kb._end_run(conn, tid, outcome="crashed", status="crashed")
+
+        retry_run = kb.claim_task(conn, tid)
+        assert retry_run is not None
+        allocate_workspace(
+            conn, tid, workspace, lease_token=retry_run.claim_lock,
+            now=21, ttl_seconds=60,
+        )
+        resumed, should_create_again = begin_pr_handoff(
+            conn, tid, lease_token=retry_run.claim_lock,
+            operation_key=f"pr:{tid}", head_sha="c" * 40, now=22,
+        )
+        assert should_create_again is False
+        assert resumed.workspace_path == str(workspace.resolve())
+
+        assert kb.request_review(
+            conn, tid, summary="reconciled existing PR",
+            metadata={
+                "pr_url": "https://github.com/acme/widgets/pull/19",
+                "head_sha": "c" * 40,
+            }, expected_run_id=retry_run.current_run_id,
+        )
+        final = conn.execute(
+            "SELECT phase, pr_url, head_sha, wait_kind, operation_key "
+            "FROM coding_worker_lifecycle WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert tuple(final) == (
+            "review", "https://github.com/acme/widgets/pull/19", "c" * 40,
+            None, None,
+        )
+
+
+def test_review_closeout_reconciles_lifecycle_without_an_active_run(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="approve PR", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        allocate_workspace(
+            conn, tid, tmp_path / "workspace", lease_token=claimed.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+        assert kb.request_review(
+            conn, tid, summary="ready",
+            metadata={
+                "pr_url": "https://github.com/acme/widgets/pull/21",
+                "head_sha": "f" * 40,
+            }, expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, tid).current_run_id is None
+
+        assert kb.complete_task(conn, tid, summary="approved", result="approved")
+        state = conn.execute(
+            "SELECT phase FROM coding_worker_lifecycle WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert state["phase"] == "complete"
+
+
+def test_changes_requested_allows_new_immutable_head_on_same_pr(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """Native Review unlocks only the head binding, never the canonical PR."""
+    from hermes_cli.coding_worker_lifecycle import (
+        allocate_workspace,
+        begin_pr_handoff,
+    )
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="revise PR", assignee="worker")
+        workspace = tmp_path / "workspace"
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        allocate_workspace(
+            conn, tid, workspace, lease_token=implementation.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+        pr_url = "https://github.com/acme/widgets/pull/31"
+        assert kb.request_review(
+            conn, tid, summary="first revision",
+            metadata={"pr_url": pr_url, "head_sha": "a" * 40},
+            expected_run_id=implementation.current_run_id,
+        )
+
+        review = kb.claim_review_task(conn, tid, claimer="reviewer")
+        assert review is not None
+        allocate_workspace(
+            conn, tid, workspace, lease_token=review.claim_lock,
+            now=20, ttl_seconds=60,
+        )
+        assert kb.request_changes(
+            conn, tid, reason="please revise",
+            expected_run_id=review.current_run_id,
+        )[0]
+
+        revision = kb.claim_task(conn, tid, claimer="worker-2")
+        assert revision is not None
+        allocate_workspace(
+            conn, tid, workspace, lease_token=revision.claim_lock,
+            now=30, ttl_seconds=60,
+        )
+        reserved, should_create = begin_pr_handoff(
+            conn, tid, lease_token=revision.claim_lock,
+            operation_key=f"pr:{tid}:revision-2", head_sha="b" * 40, now=31,
+        )
+        assert should_create is False
+        assert reserved.pr_url == pr_url
+        assert reserved.head_sha == "b" * 40
+
+        assert kb.request_review(
+            conn, tid, summary="second revision",
+            metadata={"pr_url": pr_url, "head_sha": "b" * 40},
+            expected_run_id=revision.current_run_id,
+        )
+        assert len(_events(conn, tid, kind="review_requested")) == 2

@@ -1958,7 +1958,9 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Optional structured handoff facts for the reviewer, such "
-                    "as changed_files, tests_run, commit, or decisions."
+                    "as changed_files, tests_run, commit, or decisions. "
+                    "Lifecycle-managed coding workers must include canonical "
+                    "pr_url and the full immutable head_sha."
                 ),
                 "additionalProperties": True,
             },

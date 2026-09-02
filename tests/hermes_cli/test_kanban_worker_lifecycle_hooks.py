@@ -208,3 +208,89 @@ def test_no_subscriber_short_circuits_worker_hooks(
     assert "on_kanban_worker_spawned" not in invoked
     # The shipped claimed hook has no short-circuit and still fires.
     assert "kanban_task_claimed" in invoked
+
+
+def test_coding_worker_workspace_allocation_is_idempotent_across_retry(
+    kanban_home, tmp_path,
+):
+    """A replacement worker renews one task allocation instead of retargeting it."""
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="durable worker", assignee="worker")
+        workspace = tmp_path / "workspace"
+        first = allocate_workspace(
+            conn, task_id, workspace, lease_token="lease-1", now=10,
+            ttl_seconds=30,
+        )
+        retry = allocate_workspace(
+            conn, task_id, workspace, lease_token="lease-1", now=20,
+            ttl_seconds=30,
+        )
+
+        assert retry.workspace_path == first.workspace_path == str(workspace.resolve())
+        assert retry.lease_expires == 50
+        count = conn.execute(
+            "SELECT COUNT(*) FROM coding_worker_lifecycle WHERE task_id=?",
+            (task_id,),
+        ).fetchone()[0]
+        assert count == 1
+    finally:
+        conn.close()
+
+
+def test_crash_reclaim_atomically_releases_coding_worker_lease(
+    kanban_home, tmp_path, monkeypatch,
+):
+    """Crash recovery closes the run and its durable workspace lease together."""
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="crashing worker", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        allocate_workspace(
+            conn, task_id, tmp_path / "workspace",
+            lease_token=claimed.claim_lock, now=10, ttl_seconds=60,
+        )
+        kb._set_worker_pid(conn, task_id, 98765)
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        state = conn.execute(
+            "SELECT phase, lease_token, lease_expires "
+            "FROM coding_worker_lifecycle WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        assert tuple(state) == ("crashed", None, None)
+    finally:
+        conn.close()
+
+
+def test_dispatch_persists_workspace_allocation_before_spawn(
+    kanban_home, all_assignees_spawnable,
+):
+    """The real dispatcher path durably allocates before invoking the worker."""
+    observed: list[tuple[str, str]] = []
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="dispatch allocation", assignee="alice")
+
+        def spawn(task, workspace, *_args):
+            row = conn.execute(
+                "SELECT workspace_path, lease_token "
+                "FROM coding_worker_lifecycle WHERE task_id=?", (task.id,),
+            ).fetchone()
+            assert row is not None
+            observed.append((row["workspace_path"], row["lease_token"]))
+            return 4242
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert any(row[0] == tid for row in result.spawned)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert observed == [(task.workspace_path, task.claim_lock)]
+    finally:
+        conn.close()

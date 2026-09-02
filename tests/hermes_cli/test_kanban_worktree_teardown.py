@@ -75,9 +75,56 @@ def _branch_exists(repo: Path, branch: str) -> bool:
     return bool(out.strip())
 
 
+def _worktree_is_locked(repo: Path, worktree: Path) -> bool:
+    listing = _git("-C", str(repo), "worktree", "list", "--porcelain")
+    target = f"worktree {worktree.resolve()}"
+    return any(
+        block.splitlines()[0] == target
+        and any(line.startswith("locked") for line in block.splitlines()[1:])
+        for block in listing.strip().split("\n\n")
+        if block
+    )
+
+
 # ---------------------------------------------------------------------------
 # _cleanup_worktree_workspace unit behavior
 # ---------------------------------------------------------------------------
+
+
+def test_materialized_task_worktree_is_lifecycle_locked(repo: Path) -> None:
+    import cli
+
+    wt = _make_worktree(repo, "t_aabbccdd")
+    assert _worktree_is_locked(repo, wt)
+    assert cli._worktree_lock_is_live(str(repo), str(wt)) == "live"
+    attempted = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "remove", str(wt)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert attempted.returncode != 0
+    assert wt.is_dir()
+
+
+def test_retry_adopts_matching_unlocked_worktree_under_lifecycle_lock(
+    kanban_home: Path, repo: Path,
+) -> None:
+    target = repo / ".worktrees" / "legacy-task"
+    branch = "wt/legacy-task"
+    _git("-C", str(repo), "worktree", "add", "-b", branch, str(target), "HEAD")
+    assert not _worktree_is_locked(repo, target)
+
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(
+            conn, title="adopt legacy workspace", workspace_kind="worktree",
+            workspace_path=str(target), branch_name=branch,
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert kb.resolve_workspace(task) == target.resolve()
+
+    assert _worktree_is_locked(repo, target)
 
 
 def test_clean_pushed_worktree_removed(repo: Path) -> None:
@@ -96,6 +143,20 @@ def test_dirty_worktree_preserved(repo: Path) -> None:
     kb._cleanup_worktree_workspace("t_bbbb2222", str(wt))
     assert wt.is_dir()
     assert (wt / "wip.txt").exists()
+
+
+def test_foreign_locked_worktree_preserved(repo: Path) -> None:
+    wt = _make_worktree(repo, "t_abcd2222")
+    _git("-C", str(repo), "worktree", "unlock", str(wt))
+    _git(
+        "-C", str(repo), "worktree", "lock", "--reason",
+        "owned by another lifecycle", str(wt),
+    )
+
+    kb._cleanup_worktree_workspace("t_abcd2222", str(wt))
+
+    assert wt.is_dir()
+    assert _branch_exists(repo, "wt/t_abcd2222")
 
 
 def test_unpushed_commits_preserved(repo: Path) -> None:
@@ -174,6 +235,33 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.complete_task(conn, tid, summary="done")
+    assert not wt.exists()
+    assert not _branch_exists(repo, f"wt/{tid}")
+
+
+def test_complete_reconciles_lease_before_clean_worktree_removal(
+    kanban_home: Path, repo: Path,
+) -> None:
+    from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+    with kb.connect_closing() as conn:
+        tid, wt = _worktree_task(conn, repo)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        claimed = kb.claim_task(conn, tid, claimer="worker")
+        assert claimed is not None
+        allocate_workspace(
+            conn, tid, wt, lease_token=claimed.claim_lock,
+            now=10, ttl_seconds=60,
+        )
+
+        assert kb.complete_task(conn, tid, summary="done")
+        lifecycle = conn.execute(
+            "SELECT phase, lease_token, lease_expires "
+            "FROM coding_worker_lifecycle WHERE task_id=?", (tid,),
+        ).fetchone()
+        assert tuple(lifecycle) == ("complete", None, None)
+
     assert not wt.exists()
     assert not _branch_exists(repo, f"wt/{tid}")
 
