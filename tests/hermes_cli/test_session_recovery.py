@@ -594,6 +594,48 @@ def test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf(
     }
 
 
+def test_partial_salvage_skips_singleton_that_violates_destination_constraint(
+    tmp_path: Path,
+) -> None:
+    source = sqlite3.connect(tmp_path / "source.db")
+    destination = sqlite3.connect(tmp_path / "destination.db")
+    try:
+        source.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT)")
+        source.executemany(
+            "INSERT INTO messages (id, role) VALUES (?, ?)",
+            [(1, "user"), (2, None), (3, "assistant")],
+        )
+        source.commit()
+        destination.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT NOT NULL)"
+        )
+
+        result = session_recovery._copy_table_salvage(
+            source,
+            destination,
+            "messages",
+            chunk_size=8,
+            progress_cb=None,
+            source_rows=3,
+        )
+
+        assert result["status"] == "partial"
+        assert result["copied_rows"] == 2
+        assert result["skipped_rowid_ranges"] == [
+            {
+                "low": 2,
+                "high": 2,
+                "error": "NOT NULL constraint failed: messages.role",
+            }
+        ]
+        assert destination.execute(
+            "SELECT id, role FROM messages ORDER BY id"
+        ).fetchall() == [(1, "user"), (3, "assistant")]
+    finally:
+        source.close()
+        destination.close()
+
+
 def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
     tmp_path: Path,
 ) -> None:

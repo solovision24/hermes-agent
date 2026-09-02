@@ -733,6 +733,14 @@ def _copy_table_salvage(
         try:
             destination.execute(insert_sql, value)
             destination.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            # A torn source record can still be returned by an exact rowid
+            # lookup while carrying NULL (or otherwise invalid) values for a
+            # destination constraint.  In partial-salvage mode that singleton
+            # is data loss to record, not a reason to discard the otherwise
+            # verified recovery candidate.
+            destination.execute("ROLLBACK")
+            return False
         except BaseException:
             destination.execute("ROLLBACK")
             raise
