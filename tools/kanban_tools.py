@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -648,6 +649,146 @@ def _handle_submit_review(args: dict, **kw) -> str:
             conn.close()
     except Exception as e:
         return tool_error(f"kanban_submit_review: {e}")
+
+
+def _handle_closeout(args: dict, **kw) -> str:
+    """Reserve or observe one durable provider merge/deploy operation."""
+    delegated_err = _reject_delegated_child_mutation("kanban_closeout")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    action = args.get("action")
+    if action not in {"begin", "observe"}:
+        return tool_error("kanban_closeout action must be 'begin' or 'observe'")
+    kind = str(args.get("kind") or "")
+    operation_key = str(args.get("operation_key") or "").strip()
+    if len(operation_key) > 500:
+        return tool_error("kanban_closeout operation_key must be at most 500 characters")
+    receipt_arg = args.get("receipt")
+    if receipt_arg is not None:
+        if not isinstance(receipt_arg, dict):
+            return tool_error("kanban_closeout receipt must be an object/dict")
+        receipt_arg = json.loads(
+            redact_sensitive_text(json.dumps(receipt_arg), force=True)
+        )
+    error_arg = (
+        redact_sensitive_text(str(args["error"]), force=True)
+        if args.get("error") else None
+    )
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            from hermes_cli.coding_worker_lifecycle import (
+                begin_wait,
+                completed_operation_receipt,
+                get_state,
+                observe_wait,
+            )
+
+            duplicate = False
+            receipt = None
+            if action == "begin":
+                state, started = begin_wait(
+                    conn,
+                    tid,
+                    kind=kind,
+                    operation_key=operation_key,
+                    now=int(time.time()),
+                    timeout_seconds=int(args.get("timeout_seconds", 300)),
+                    max_attempts=int(args.get("max_attempts", 3)),
+                )
+                if (
+                    not started
+                    and state.wait_kind is None
+                    and state.last_error
+                    and kind == "deploy"
+                ):
+                    return tool_error(f"kanban_closeout: {state.last_error}")
+            else:
+                observation = str(args.get("observation") or "")
+                current = get_state(conn, tid)
+                if current is None:
+                    raise ValueError(f"task {tid} has no durable workspace allocation")
+                if current.wait_kind is not None and current.wait_kind != kind:
+                    raise ValueError(
+                        f"operation kind is {current.wait_kind}, not {kind}"
+                    )
+                receipt = completed_operation_receipt(
+                    current, kind, operation_key,
+                )
+                duplicate = observation == "complete" and receipt is not None
+                timed_out_replay = (
+                    current.phase == "timed_out"
+                    and current.wait_kind == kind
+                    and current.operation_key == operation_key
+                )
+                if timed_out_replay and observation == "complete":
+                    return tool_error(
+                        "kanban_closeout: remote operation wait already timed out"
+                    )
+                if duplicate or timed_out_replay:
+                    duplicate = True
+                    state = current
+                else:
+                    state = observe_wait(
+                        conn,
+                        tid,
+                        operation_key=operation_key,
+                        observation=observation,
+                        now=int(time.time()),
+                        receipt=receipt_arg,
+                        error=error_arg,
+                    )
+                    if observation == "complete":
+                        receipt = completed_operation_receipt(
+                            state, kind, operation_key,
+                        )
+                if observation == "complete":
+                    summary = redact_sensitive_text(
+                        str(args.get("summary") or ""), force=True
+                    ).strip()
+                    if not summary:
+                        raise ValueError("summary is required for a completed closeout")
+                    task = kb.get_task(conn, tid)
+                    if task is not None and task.status != "done":
+                        ok = kb.complete_task(
+                            conn,
+                            tid,
+                            summary=summary,
+                            metadata={
+                                "closeout": {
+                                    "kind": kind,
+                                    "operation_key": operation_key,
+                                    "receipt": receipt or {},
+                                },
+                            },
+                            expected_run_id=_worker_run_id(tid),
+                        )
+                        if not ok:
+                            raise ValueError("provider completed but task closeout is not actionable")
+                        state = get_state(conn, tid) or state
+                started = False
+            return json.dumps({
+                "ok": True,
+                "task_id": tid,
+                "started": started,
+                "phase": state.phase,
+                "wait_deadline": state.wait_deadline,
+                "attempts": state.wait_attempts,
+                "max_attempts": state.wait_max_attempts,
+                "last_error": state.last_error,
+                "duplicate": duplicate,
+                "receipt": receipt,
+            })
+        finally:
+            conn.close()
+    except Exception as exc:
+        return tool_error(f"kanban_closeout: {exc}")
 
 
 def _handle_review_changes(args: dict, **kw) -> str:
@@ -2276,6 +2417,55 @@ KANBAN_SUBMIT_REVIEW_SCHEMA = {
     }, "required": ["summary", "metadata"]},
 }
 
+KANBAN_CLOSEOUT_SCHEMA = {
+    "name": "kanban_closeout",
+    "description": (
+        "Durably coordinate a merge or deploy provider operation for the current "
+        "Kanban task. Call action=begin before the remote side effect. Only issue "
+        "that side effect when started=true; started=false means reconcile the "
+        "provider using the same operation_key. Then report pending, silent, "
+        "connection_error, or complete with action=observe. Completed receipts "
+        "and timeouts are replay-safe. Deploy begin fails while any chat is active."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "action": {"type": "string", "enum": ["begin", "observe"]},
+            "kind": {"type": "string", "enum": ["merge", "deploy"]},
+            "operation_key": {
+                "type": "string",
+                "description": "Stable provider idempotency/reconciliation key.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Durable deadline set only by the first begin.",
+            },
+            "max_attempts": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Durable observation limit set only by the first begin.",
+            },
+            "observation": {
+                "type": "string",
+                "enum": ["pending", "silent", "connection_error", "complete"],
+            },
+            "receipt": {
+                "type": "object",
+                "description": "Provider completion evidence; used with observation=complete.",
+            },
+            "error": {"type": "string"},
+            "summary": {
+                "type": "string",
+                "description": "Required with observation=complete to close the Kanban run.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["action", "kind", "operation_key"],
+    },
+}
+
 KANBAN_REVIEW_CHANGES_SCHEMA = {
     "name": "kanban_review_changes",
     "description": "Request implementation changes on the currently claimed review card.",
@@ -2317,6 +2507,15 @@ registry.register(
     handler=_handle_submit_review,
     check_fn=_check_kanban_mode,
     emoji="🔎",
+)
+
+registry.register(
+    name="kanban_closeout",
+    toolset="kanban",
+    schema=KANBAN_CLOSEOUT_SCHEMA,
+    handler=_handle_closeout,
+    check_fn=_check_kanban_mode,
+    emoji="🚦",
 )
 
 registry.register(
