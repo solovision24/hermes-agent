@@ -18,6 +18,8 @@ class LifecycleConflict(RuntimeError):
 
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
+MAX_WAIT_ATTEMPTS = 10
+MAX_WAIT_TIMEOUT_SECONDS = 3600
 
 
 def canonical_pr_url(value: str) -> str:
@@ -55,6 +57,8 @@ class CodingWorkerState:
     operation_key: Optional[str]
     wait_started_at: Optional[int]
     wait_deadline: Optional[int]
+    wait_attempts: int
+    wait_max_attempts: int
     silent_checks: int
     operation_receipt: Optional[str]
     last_error: Optional[str]
@@ -128,6 +132,19 @@ def _operation_receipts(state: CodingWorkerState) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def completed_operation_receipt(
+    state: CodingWorkerState, kind: str, operation_key: str,
+) -> Optional[dict]:
+    """Return a matching completed provider receipt, if one is durable."""
+    completed = _operation_receipts(state).get(kind)
+    if not isinstance(completed, dict):
+        return None
+    if completed.get("operation_key") != operation_key:
+        return None
+    receipt = completed.get("receipt")
+    return receipt if isinstance(receipt, dict) else {}
+
+
 def begin_pr_handoff(
     conn: sqlite3.Connection,
     task_id: str,
@@ -195,6 +212,7 @@ def begin_wait(
     operation_key: str,
     now: int,
     timeout_seconds: int,
+    max_attempts: int = 3,
     active_chat_count: Optional[int] = None,
 ) -> tuple[CodingWorkerState, bool]:
     """Persist a bounded merge/deploy operation before its remote side effect.
@@ -208,6 +226,10 @@ def begin_wait(
     operation_key = str(operation_key).strip()
     if not operation_key:
         raise ValueError("operation_key is required")
+    max_attempts = min(MAX_WAIT_ATTEMPTS, max(1, int(max_attempts)))
+    timeout_seconds = min(
+        MAX_WAIT_TIMEOUT_SECONDS, max(1, int(timeout_seconds))
+    )
     coordination_error: Optional[str] = None
     if kind == "deploy" and active_chat_count is None:
         try:
@@ -229,6 +251,40 @@ def begin_wait(
         if state.wait_kind is not None:
             if state.wait_kind != kind or state.operation_key != operation_key:
                 raise LifecycleConflict("a different remote operation is already durable")
+            if (
+                state.phase != "timed_out"
+                and state.wait_deadline is not None
+                and int(now) >= state.wait_deadline
+            ):
+                conn.execute(
+                    "UPDATE coding_worker_lifecycle SET phase='timed_out', "
+                    "last_error=?, updated_at=? WHERE task_id=?",
+                    (
+                        f"{kind} wait exceeded its durable deadline",
+                        int(now), task_id,
+                    ),
+                )
+                state = get_state(conn, task_id)
+                assert state is not None
+            elif state.phase != "timed_out":
+                if state.wait_attempts >= state.wait_max_attempts:
+                    conn.execute(
+                        "UPDATE coding_worker_lifecycle SET phase='timed_out', "
+                        "last_error=?, updated_at=? WHERE task_id=?",
+                        (
+                            f"{kind} wait exceeded its durable attempt limit",
+                            int(now), task_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE coding_worker_lifecycle SET wait_attempts="
+                        "wait_attempts+1, last_error=NULL, updated_at=? "
+                        "WHERE task_id=?",
+                        (int(now), task_id),
+                    )
+                state = get_state(conn, task_id)
+                assert state is not None
             return state, False
         if kind == "deploy" and int(active_chat_count or 0) != 0:
             conn.execute(
@@ -242,14 +298,15 @@ def begin_wait(
             blocked = get_state(conn, task_id)
             assert blocked is not None
             return blocked, False
-        deadline = int(now) + max(1, int(timeout_seconds))
+        deadline = int(now) + timeout_seconds
         conn.execute(
             "UPDATE coding_worker_lifecycle SET phase=?, wait_kind=?, "
             "operation_key=?, wait_started_at=?, wait_deadline=?, silent_checks=0, "
-            "last_error=NULL, updated_at=? WHERE task_id=?",
+            "wait_attempts=1, wait_max_attempts=?, last_error=NULL, updated_at=? "
+            "WHERE task_id=?",
             (
                 f"{kind}_wait", kind, operation_key, int(now), deadline,
-                int(now), task_id,
+                max_attempts, int(now), task_id,
             ),
         )
         state = get_state(conn, task_id)
@@ -276,7 +333,10 @@ def observe_wait(
             raise LifecycleConflict("remote operation ownership changed")
         if state.wait_kind not in {"merge", "deploy"}:
             raise LifecycleConflict("task has no active merge/deploy wait")
+        if state.phase == "timed_out":
+            raise LifecycleConflict("remote operation wait already timed out")
         silent_checks = state.silent_checks + 1 if observation == "silent" else 0
+        attempts = state.wait_attempts
         phase = state.phase
         wait_kind = state.wait_kind
         active_key: Optional[str] = state.operation_key
@@ -293,20 +353,18 @@ def observe_wait(
             wait_kind = None
             active_key = None
             silent_checks = 0
-        elif (
-            observation == "silent"
-            and silent_checks >= 2
-            and state.wait_deadline is not None
-            and int(now) >= state.wait_deadline
-        ):
+        elif state.wait_deadline is not None and int(now) >= state.wait_deadline:
             phase = "timed_out"
             last_error = f"{state.wait_kind} wait exceeded its durable deadline"
+        elif attempts >= state.wait_max_attempts:
+            phase = "timed_out"
+            last_error = f"{state.wait_kind} wait exceeded its durable attempt limit"
         conn.execute(
             "UPDATE coding_worker_lifecycle SET phase=?, wait_kind=?, operation_key=?, "
-            "silent_checks=?, operation_receipt=?, last_error=?, updated_at=? "
+            "wait_attempts=?, silent_checks=?, operation_receipt=?, last_error=?, updated_at=? "
             "WHERE task_id=?",
             (
-                phase, wait_kind, active_key, silent_checks, encoded_receipt,
+                phase, wait_kind, active_key, attempts, silent_checks, encoded_receipt,
                 last_error, int(now), task_id,
             ),
         )

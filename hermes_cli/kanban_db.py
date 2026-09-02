@@ -1468,6 +1468,8 @@ CREATE TABLE IF NOT EXISTS coding_worker_lifecycle (
     operation_key       TEXT,
     wait_started_at     INTEGER,
     wait_deadline       INTEGER,
+    wait_attempts       INTEGER NOT NULL DEFAULT 0,
+    wait_max_attempts   INTEGER NOT NULL DEFAULT 3,
     silent_checks       INTEGER NOT NULL DEFAULT 0,
     operation_receipt   TEXT,
     last_error          TEXT,
@@ -3438,6 +3440,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         if "delivery_metadata" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
+            )
+
+    lifecycle_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name='coding_worker_lifecycle'"
+    ).fetchone() is not None
+    if lifecycle_table_exists:
+        lifecycle_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(coding_worker_lifecycle)")
+        }
+        if "wait_attempts" not in lifecycle_cols:
+            _add_column_if_missing(
+                conn, "coding_worker_lifecycle", "wait_attempts",
+                "wait_attempts INTEGER NOT NULL DEFAULT 0",
+            )
+        if "wait_max_attempts" not in lifecycle_cols:
+            _add_column_if_missing(
+                conn, "coding_worker_lifecycle", "wait_max_attempts",
+                "wait_max_attempts INTEGER NOT NULL DEFAULT 3",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -5914,6 +5936,26 @@ def submit_for_review(
         if original_assignee and reviewer == original_assignee:
             raise ValueError("reviewer must be different from the implementer")
 
+        from hermes_cli.coding_worker_lifecycle import get_state
+
+        lifecycle = get_state(conn, task_id)
+        if lifecycle is not None:
+            pr_url = str(review_metadata["pr_url"])
+            head_sha = str(review_metadata["head_sha"])
+            if lifecycle.pr_url not in (None, pr_url):
+                raise ValueError(f"task is already bound to {lifecycle.pr_url}")
+            if lifecycle.head_sha not in (None, head_sha):
+                raise ValueError(f"review head is immutable ({lifecycle.head_sha})")
+            if lifecycle.lease_token != row["claim_lock"]:
+                raise ValueError("coding-worker lease ownership changed")
+            duplicate_lifecycle = conn.execute(
+                "SELECT task_id FROM coding_worker_lifecycle "
+                "WHERE task_id<>? AND pr_url=? LIMIT 1",
+                (task_id, pr_url),
+            ).fetchone()
+            if duplicate_lifecycle is not None:
+                raise ValueError("pull request is already bound to another task")
+
         # The webhook and native paths can observe the same PR in either order.
         # Resolve the immutable PR identity while holding the same write lock,
         # then fold any webhook observation into this native implementation
@@ -5964,6 +6006,19 @@ def submit_for_review(
             conn, task_id, outcome="submitted_for_review", status="review",
             summary=summary.strip(), metadata=handoff,
         )
+        if lifecycle is not None:
+            handoff_now = int(time.time())
+            conn.execute(
+                "UPDATE coding_worker_lifecycle SET phase='review', pr_url=?, "
+                "head_sha=?, review_submitted_at=COALESCE(review_submitted_at, ?), "
+                "wait_kind=NULL, operation_key=NULL, wait_started_at=NULL, "
+                "wait_deadline=NULL, silent_checks=0, last_error=NULL, updated_at=? "
+                "WHERE task_id=?",
+                (
+                    review_metadata["pr_url"], review_metadata["head_sha"],
+                    handoff_now, handoff_now, task_id,
+                ),
+            )
         _append_event(
             conn, task_id, "review_submitted",
             {"reviewer": reviewer, "original_assignee": original_assignee,

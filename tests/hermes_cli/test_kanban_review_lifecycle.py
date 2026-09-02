@@ -1,6 +1,7 @@
 """Behavioral tests for the upstream-aligned native review lifecycle."""
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,40 @@ def test_implementation_handoff_is_claimable_by_reviewer(board):
         assert review is not None
         assert review.status == "running"
         assert review.assignee == "reviewer"
+
+
+def test_review_handoff_rolls_back_task_if_lifecycle_binding_fails(board, tmp_path):
+    from hermes_cli import coding_worker_lifecycle as lifecycle
+
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None and implementation.claim_lock
+        lifecycle.allocate_workspace(
+            conn, task_id, tmp_path / "checkout",
+            lease_token=implementation.claim_lock, now=100, ttl_seconds=300,
+        )
+        conn.execute(
+            "CREATE TRIGGER reject_review_identity BEFORE UPDATE OF pr_url "
+            "ON coding_worker_lifecycle WHEN NEW.pr_url IS NOT NULL "
+            "BEGIN SELECT RAISE(ABORT, 'injected lifecycle failure'); END"
+        )
+        conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected lifecycle failure"):
+            kb.submit_for_review(
+                conn, task_id, reviewer="reviewer", summary="ready",
+                metadata=REVIEW_METADATA,
+                expected_run_id=implementation.current_run_id,
+            )
+
+        task = kb.get_task(conn, task_id)
+        state = lifecycle.get_state(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == implementation.current_run_id
+        assert run is not None and run.ended_at is None
+        assert state is not None and state.pr_url is None and state.head_sha is None
 
 
 def test_review_changes_returns_same_card_to_implementer(board):

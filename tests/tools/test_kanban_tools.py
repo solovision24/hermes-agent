@@ -91,6 +91,57 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_submit_review_persists_canonical_worker_pr_identity(
+    worker_env, monkeypatch, tmp_path,
+):
+    """The model-facing worker path binds its reviewed PR transactionally."""
+    from hermes_cli import coding_worker_lifecycle as lifecycle
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None and task.claim_lock
+        lifecycle.allocate_workspace(
+            conn,
+            worker_env,
+            tmp_path / "worker-checkout",
+            lease_token=task.claim_lock,
+            now=100,
+            ttl_seconds=300,
+        )
+    finally:
+        conn.close()
+
+    result = json.loads(kt._handle_submit_review({
+        "summary": "focused tests pass",
+        "reviewer": "reviewer",
+        "metadata": {
+            "pr_url": "https://www.github.com/Acme/Repo/pull/17/",
+            "repo": "acme/repo",
+            "number": 17,
+            "head_sha": "A" * 40,
+            "verification_evidence": {"tests_passed": 4},
+        },
+    }))
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        state = lifecycle.get_state(conn, worker_env)
+        assert state is not None
+        assert state.pr_url == "https://github.com/acme/repo/pull/17"
+        assert state.head_sha == "a" * 40
+        assert state.review_submitted_at is not None
+        assert state.phase == "review"
+        assert kb.get_task(conn, worker_env).status == "review"
+    finally:
+        conn.close()
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
