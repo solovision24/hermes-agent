@@ -2067,6 +2067,10 @@ def _worktree_lock_is_live(repo_root: str, worktree_path: str, timeout: int = 10
             if current != target:
                 continue
             reason = line[len("locked"):].strip()
+            if reason.startswith("active Hermes Kanban task"):
+                # Task leases survive worker/gateway processes; only the
+                # Kanban terminal cleanup path may release them.
+                return "live"
             m = re.search(r"hermes pid=(\d+)", reason)
             if not m:
                 # Locked by something we don't recognize as a hermes session

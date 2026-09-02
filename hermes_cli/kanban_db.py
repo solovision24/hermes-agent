@@ -1452,6 +1452,31 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Durable identity and closeout state for external coding workers.  The
+-- board database, rather than a worker process, owns this record so retries
+-- and gateway restarts observe one task workspace and one remote operation.
+CREATE TABLE IF NOT EXISTS coding_worker_lifecycle (
+    task_id             TEXT PRIMARY KEY,
+    workspace_path      TEXT NOT NULL,
+    lease_token         TEXT,
+    lease_expires       INTEGER,
+    phase               TEXT NOT NULL DEFAULT 'allocated',
+    pr_url              TEXT,
+    head_sha            TEXT,
+    review_submitted_at INTEGER,
+    wait_kind           TEXT,
+    operation_key       TEXT,
+    wait_started_at     INTEGER,
+    wait_deadline       INTEGER,
+    silent_checks       INTEGER NOT NULL DEFAULT 0,
+    operation_receipt   TEXT,
+    last_error          TEXT,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_worker_pr_url
+    ON coding_worker_lifecycle(pr_url) WHERE pr_url IS NOT NULL;
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -4939,36 +4964,49 @@ def _end_run(
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
-    if not row or not row["current_run_id"]:
-        return None
-    run_id = int(row["current_run_id"])
+    run_id: Optional[int] = None
+    if row and row["current_run_id"]:
+        run_id = int(row["current_run_id"])
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND ended_at IS NULL
+            """,
+            (
+                status or outcome,
+                outcome,
+                summary,
+                error,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                now,
+                run_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        )
+    lifecycle_phase = {
+        "completed": "complete",
+        "review_requested": "review",
+    }.get(outcome, outcome)
+    # The task run and its auxiliary coding-worker lease are one ownership
+    # unit. Keeping this in the same transaction prevents a crash/reclaim
+    # from leaving a live lease that blocks the replacement worker.
     conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (
-            status or outcome,
-            outcome,
-            summary,
-            error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
-            now,
-            run_id,
-        ),
-    )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE coding_worker_lifecycle SET phase=?, lease_token=NULL, "
+        "lease_expires=NULL, last_error=COALESCE(?, last_error), updated_at=? "
+        "WHERE task_id=?",
+        (lifecycle_phase, error, now, task_id),
     )
     return run_id
 
@@ -5933,6 +5971,372 @@ def submit_for_review(
             run_id=run_id,
         )
     return True
+
+
+def request_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewer: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    force: bool = False,
+    with_reason: bool = False,
+):
+    """Transition implementation work into the first-class review phase.
+
+    Unlike :func:`block_task`, this transition never touches block recurrence
+    accounting.  The current implementer and resolved reviewer are recorded on
+    the event so an autonomous reviewer can route requested changes back to the
+    right profile.  Supplying ``reviewer`` reassigns the task before it is
+    exposed to the review dispatcher.  On re-review, omitting it reuses the
+    reviewer provenance persisted by the latest ``changes_requested`` event.
+
+    When the task is ``running`` under a live claim, a caller that supplies no
+    ``expected_run_id`` must pass ``force=True`` (explicit human/CLI override)
+    — otherwise the request is refused instead of silently clearing the live
+    worker's ``claim_lock``/``worker_pid``. Workers prove ownership by passing
+    their own run id as ``expected_run_id`` (unchanged).
+
+    Returns ``bool`` by default. With ``with_reason=True`` returns
+    ``(ok, reason)`` mirroring :func:`request_changes` — ``reason`` is a
+    diagnostic string on failure, ``None`` on success.
+    """
+
+    def _ret(ok: bool, reason: Optional[str] = None):
+        return (ok, reason) if with_reason else ok
+
+    summary = redact_review_value(summary)
+    metadata = redact_review_value(metadata)
+    review_pr_url: Optional[str] = None
+    review_head_sha: Optional[str] = None
+    if isinstance(metadata, dict) and (
+        metadata.get("pr_url") is not None or metadata.get("head_sha") is not None
+    ):
+        if not metadata.get("pr_url") or not metadata.get("head_sha"):
+            return _ret(
+                False,
+                "PR handoff requires both metadata.pr_url and metadata.head_sha",
+            )
+        try:
+            from hermes_cli.coding_worker_lifecycle import (
+                canonical_head_sha,
+                canonical_pr_url,
+            )
+
+            review_pr_url = canonical_pr_url(str(metadata["pr_url"]))
+            review_head_sha = canonical_head_sha(str(metadata["head_sha"]))
+        except ValueError as exc:
+            return _ret(False, str(exc))
+        metadata = dict(metadata)
+        metadata["pr_url"] = review_pr_url
+        metadata["head_sha"] = review_head_sha
+    with write_txn(conn):
+        if not _parents_satisfied(conn, task_id):
+            return _ret(False, "parent dependencies are not satisfied")
+        trow = conn.execute(
+            "SELECT assignee, status, claim_lock, current_run_id "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if trow is None:
+            return _ret(False, "task not found")
+        from hermes_cli.coding_worker_lifecycle import get_state
+
+        lifecycle = get_state(conn, task_id)
+        if lifecycle is not None and (
+            review_pr_url is None or review_head_sha is None
+        ):
+            return _ret(
+                False,
+                "coding-worker Review requires both metadata.pr_url and "
+                "metadata.head_sha",
+            )
+        if review_pr_url is not None and review_head_sha is not None:
+            if lifecycle is None:
+                return _ret(False, "PR handoff has no durable workspace allocation")
+            if lifecycle.pr_url not in (None, review_pr_url):
+                return _ret(False, f"task is already bound to {lifecycle.pr_url}")
+            if lifecycle.head_sha not in (None, review_head_sha):
+                return _ret(False, f"review head is immutable ({lifecycle.head_sha})")
+            duplicate = conn.execute(
+                "SELECT task_id FROM coding_worker_lifecycle "
+                "WHERE task_id<>? AND pr_url=? LIMIT 1",
+                (task_id, review_pr_url),
+            ).fetchone()
+            if duplicate is not None:
+                return _ret(False, "pull request is already bound to another task")
+            if (
+                lifecycle.phase == "review"
+                and lifecycle.pr_url == review_pr_url
+                and lifecycle.head_sha == review_head_sha
+                and trow["status"] == "review"
+            ):
+                return _ret(True)
+            if lifecycle.lease_token != trow["claim_lock"]:
+                return _ret(False, "coding-worker lease ownership changed")
+        # Refuse to clear a live worker's claim without proof of ownership
+        # (expected_run_id) or an explicit human override (force=True).
+        if (
+            expected_run_id is None
+            and not force
+            and trow["status"] == "running"
+            and trow["claim_lock"] is not None
+        ):
+            return _ret(
+                False,
+                "task is running under a live claim; pass expected_run_id "
+                "(worker ownership) or force=True (explicit operator "
+                "override) instead of clearing the live run's claim",
+            )
+        implementer = trow["assignee"]
+        if reviewer is None:
+            changes_run = conn.execute(
+                "SELECT id FROM task_runs "
+                "WHERE task_id = ? AND outcome = 'changes_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            changes_event = None
+            if changes_run is not None:
+                changes_event = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND run_id = ? "
+                    "AND kind = 'changes_requested' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, int(changes_run["id"])),
+                ).fetchone()
+            try:
+                changes_payload = (
+                    json.loads(changes_event["payload"])
+                    if changes_event and changes_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                changes_payload = {}
+            prior_reviewer = (
+                changes_payload.get("reviewer")
+                if isinstance(changes_payload, dict)
+                else None
+            )
+            if changes_run is not None:
+                if not isinstance(prior_reviewer, str) or not prior_reviewer.strip():
+                    return _ret(
+                        False,
+                        "re-review has no durable reviewer provenance (the "
+                        "latest changes_requested event is missing or "
+                        "malformed); pass reviewer= explicitly",
+                    )
+                reviewer = prior_reviewer
+        reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        params: tuple[Any, ...]
+        if expected_run_id is None:
+            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            run_guard = ""
+        else:
+            params = (
+                (reviewer, task_id, int(expected_run_id))
+                if reviewer is not None
+                else (task_id, int(expected_run_id))
+            )
+            run_guard = " AND current_run_id = ?"
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'review',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+            """ + assignee_sql + """
+             WHERE id = ?
+               AND status IN ('running', 'ready')
+            """ + run_guard,
+            params,
+        )
+        if cur.rowcount != 1:
+            return _ret(
+                False,
+                "task is not in running/ready (or expected_run_id did not "
+                "match the current run)",
+            )
+        if review_pr_url is not None and review_head_sha is not None:
+            handoff_now = int(time.time())
+            conn.execute(
+                "UPDATE coding_worker_lifecycle SET pr_url=?, head_sha=?, "
+                "review_submitted_at=COALESCE(review_submitted_at, ?), "
+                "wait_kind=NULL, operation_key=NULL, wait_started_at=NULL, "
+                "wait_deadline=NULL, silent_checks=0, updated_at=? "
+                "WHERE task_id=?",
+                (review_pr_url, review_head_sha, handoff_now, handoff_now, task_id),
+            )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="review_requested",
+            status="review",
+            summary=summary,
+            metadata=metadata,
+        )
+        if run_id is None and (summary or metadata):
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="review_requested",
+                summary=summary,
+                metadata=metadata,
+            )
+        lines = (summary or "").strip().splitlines()
+        event_summary = lines[0][:400] if lines else ""
+        event_payload = {
+            "summary": event_summary or None,
+            "implementer": implementer,
+            "reviewer": reviewer,
+        }
+        if review_pr_url is not None and review_head_sha is not None:
+            event_payload.update(
+                {"pr_url": review_pr_url, "head_sha": review_head_sha}
+            )
+        _append_event(
+            conn,
+            task_id,
+            "review_requested",
+            event_payload,
+            run_id=run_id,
+        )
+    return _ret(True)
+
+
+def request_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int] = None,
+) -> tuple[bool, Optional[str]]:
+    """Finish an active review run and route the task back for rework.
+
+    The transition is valid only for a run claimed from ``review``.  It closes
+    that reviewer run, restores the implementer recorded by the latest
+    ``review_requested`` event, reapplies parent gating, and emits an auditable
+    ``changes_requested`` event.  The second tuple item is the implementer on
+    success or a diagnostic reason on failure.
+    """
+    reason = str(redact_review_value(reason or "")).strip()
+    if not reason:
+        return False, "reason is required"
+
+    with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False, "task not found"
+        current_run_id = task_row["current_run_id"]
+        if task_row["status"] != "running" or current_run_id is None:
+            return False, "task is not in an active review run"
+        if expected_run_id is not None and int(current_run_id) != int(expected_run_id):
+            return False, "run_id mismatch"
+
+        claimed_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(current_run_id)),
+        ).fetchone()
+        try:
+            claimed_payload = (
+                json.loads(claimed_event["payload"])
+                if claimed_event and claimed_event["payload"]
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            claimed_payload = {}
+        if not isinstance(claimed_payload, dict):
+            claimed_payload = {}
+        if claimed_payload.get("source_status") != "review":
+            return False, "active run was not claimed from review"
+
+        requested_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if requested_event is None:
+            return False, "no prior review_requested event"
+        try:
+            requested_payload = (
+                json.loads(requested_event["payload"])
+                if requested_event["payload"]
+                else {}
+            )
+        except (json.JSONDecodeError, TypeError):
+            requested_payload = {}
+        if not isinstance(requested_payload, dict):
+            requested_payload = {}
+        implementer = requested_payload.get("implementer")
+        if not isinstance(implementer, str) or not implementer.strip():
+            return False, "review handoff has no valid implementer provenance"
+        reviewer = task_row["assignee"]
+        if isinstance(reviewer, str) and reviewer.strip():
+            reviewer = _canonical_assignee(reviewer)
+        else:
+            reviewer = None
+
+        new_status = _landing_status_after_parents(conn, task_id)
+        # NOTE: consecutive_failures is deliberately PRESERVED (neither
+        # reset nor incremented). Review transitions are not evidence the
+        # pathology cleared — only complete_task's success path resets the
+        # breaker counter (mirrors unblock_task, #35072).
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?,
+                   assignee = COALESCE(?, assignee),
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (new_status, implementer, task_id, int(current_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed during review handoff"
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="changes_requested",
+            status=new_status,
+            summary=reason,
+        )
+        # The reviewed SHA is immutable until native Review explicitly asks
+        # for changes. At that boundary the canonical PR remains task-bound,
+        # while the next implementation run may reserve a new immutable head
+        # for the next review revision.
+        conn.execute(
+            "UPDATE coding_worker_lifecycle SET head_sha=NULL, "
+            "review_submitted_at=NULL, wait_kind=NULL, operation_key=NULL, "
+            "wait_started_at=NULL, wait_deadline=NULL, silent_checks=0, "
+            "updated_at=? WHERE task_id=?",
+            (int(time.time()), task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "changes_requested",
+            {
+                "reason": reason,
+                "implementer": implementer,
+                "reviewer": reviewer,
+                "status": new_status,
+            },
+            run_id=run_id,
+        )
+    return True, implementer
+
+
 
 
 def request_review_changes(
@@ -7176,6 +7580,47 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _cleanup_worktree_workspace(
+    task_id: str, path: str, branch_name: Optional[str] = None
+) -> None:
+    """Remove a finished task's linked git worktree when it holds no work.
+
+    Mirrors the safety judgment of the CLI startup pruner
+    (``cli._prune_stale_worktrees``): removal requires a clean working tree
+    AND every commit reachable from a remote-tracking ref. Any doubt — dirty
+    files, unpushed commits, unresolvable repo, failing git — preserves the
+    worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
+    with it; custom branches are kept. Best-effort like the scratch path.
+    """
+    try:
+        from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
+    except Exception:
+        return  # CLI safety predicates unavailable — preserve
+    try:
+        wp = Path(path).expanduser()
+        if not wp.is_dir():
+            return
+        common = _git_common_dir(wp)
+        if common is None or common.name != ".git":
+            return  # not a linked worktree of a normal repo — never guess
+        repo_root = common.parent
+        if wp.resolve(strict=False) == repo_root.resolve(strict=False):
+            return  # never remove the main checkout
+        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+            _log.info(
+                "Preserving worktree for task %s: dirty or unpushed work at %s",
+                task_id, wp,
+            )
+            return
+        _remove_task_worktree_under_lifecycle_lock(
+            task_id, wp, repo_root, common, branch_name
+        )
+    except Exception:
+        pass  # best-effort — never block completion
+
+
+
+
 def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
     """Clean up parent scratch workspaces now that *task_id* completed.
 
@@ -8314,34 +8759,188 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _worktree_lock_reason(
+    repo_root: Path, worktree: Path,
+) -> tuple[bool, Optional[str]]:
+    """Return whether Git's worktree lock state was readable and its reason."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    target = worktree.resolve(strict=False)
+    current: Optional[Path] = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):]).resolve(strict=False)
+        elif current == target and (line == "locked" or line.startswith("locked ")):
+            return True, line[len("locked"):].strip()
+    return True, None
+
+
+def _task_worktree_lock_reason(branch_name: str) -> str:
+    return f"active Hermes Kanban task {branch_name}"
+
+
+def _lock_task_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+    """Idempotently lease an existing checkout to one active Kanban task."""
+    from .active_sessions import _FileLock
+
+    common = _git_common_dir(repo_root)
+    if common is None:
+        raise RuntimeError(f"cannot resolve git common dir for {repo_root}")
+    expected = _task_worktree_lock_reason(branch_name)
+    with _FileLock(common / "hermes-worktree-lifecycle.lock"):
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "worktree", "lock", "--reason",
+                expected, str(target),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        known, reason = _worktree_lock_reason(repo_root, target)
+        if not known or reason != expected:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"git worktree lock failed for {target}: {detail}")
+
+
+def _remove_task_worktree_under_lifecycle_lock(
+    task_id: str,
+    worktree: Path,
+    repo_root: Path,
+    common_dir: Path,
+    branch_name: Optional[str],
+) -> None:
+    """Release only this task's lock, then remove its provably safe tree."""
+    from .active_sessions import _FileLock
+
+    branch = (branch_name or "").strip() or f"wt/{task_id}"
+    expected = _task_worktree_lock_reason(branch)
+    with _FileLock(common_dir / "hermes-worktree-lifecycle.lock"):
+        known, reason = _worktree_lock_reason(repo_root, worktree)
+        if not known:
+            _log.warning(
+                "Preserving worktree for task %s: unable to verify lock at %s",
+                task_id, worktree,
+            )
+            return
+        if reason and reason != expected:
+            _log.info(
+                "Preserving worktree for task %s: foreign lock at %s (%s)",
+                task_id, worktree, reason,
+            )
+            return
+        if reason:
+            unlock = subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "unlock", str(worktree)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+            if unlock.returncode != 0:
+                _log.warning(
+                    "git worktree unlock failed for task %s at %s: %s",
+                    task_id, worktree,
+                    (unlock.stderr or unlock.stdout or "").strip(),
+                )
+                return
+        # No --force: Git rechecks dirtiness and any lock acquired after our
+        # owned unlock, so races always fail toward preserving user work.
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", str(worktree)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            _log.warning(
+                "git worktree remove failed for task %s at %s: %s",
+                task_id, worktree,
+                (result.stderr or result.stdout or "").strip(),
+            )
+            return
+        _log.debug("Removed worktree workspace: %s", worktree)
+        if branch.startswith("wt/"):
+            subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "-D", branch],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+    """Materialize and lifecycle-lock a task worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            _lock_task_worktree(repo_root, target, branch_name)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
-    if _git_branch_exists(repo_root, branch_name):
-        cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
-    else:
-        cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
-        ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=60,
-        check=False,
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+    from .active_sessions import _FileLock
+
+    if repo_common is None:
+        raise RuntimeError(f"cannot resolve git common dir for {repo_root}")
+    reason = _task_worktree_lock_reason(branch_name)
+    with _FileLock(repo_common / "hermes-worktree-lifecycle.lock"):
+        # Recheck inside the cross-process lock: two dispatcher processes may
+        # have observed the path missing before either materialized it.
+        if target.exists() and _git_common_dir(target) == repo_common:
+            known, locked_reason = _worktree_lock_reason(repo_root, target)
+            if known and locked_reason == reason:
+                return
+            raise RuntimeError(f"worktree {target} is owned by another lifecycle")
+        if _git_branch_exists(repo_root, branch_name):
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add", "--lock",
+                "--reason", reason, str(target), branch_name,
+            ]
+        else:
+            cmd = [
+                "git", "-C", str(repo_root), "worktree", "add", "--lock",
+                "--reason", reason, "-b", branch_name, str(target), "HEAD",
+            ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
         )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(
+                f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+            )
 
 
 def _resolve_worktree_workspace(
@@ -8398,6 +8997,9 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            _lock_task_worktree(
+                _git_common_dir(requested).parent, requested, branch_name
+            )
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -10676,6 +11278,25 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        try:
+            from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+            allocate_workspace(
+                conn,
+                claimed.id,
+                workspace,
+                lease_token=claimed.claim_lock or f"run:{claimed.current_run_id}",
+                now=int(time.time()),
+                ttl_seconds=_resolve_claim_ttl_seconds(ttl_seconds),
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace allocation: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10794,6 +11415,25 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        try:
+            from hermes_cli.coding_worker_lifecycle import allocate_workspace
+
+            allocate_workspace(
+                conn,
+                claimed.id,
+                workspace,
+                lease_token=claimed.claim_lock or f"run:{claimed.current_run_id}",
+                now=int(time.time()),
+                ttl_seconds=_resolve_claim_ttl_seconds(ttl_seconds),
+            )
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace allocation: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
