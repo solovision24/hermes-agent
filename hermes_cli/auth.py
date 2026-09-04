@@ -1491,22 +1491,19 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 
 
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
-    """Return the persisted credential pool, or one provider slice.
+    """Return persisted pool entries without allowing Codex profile shadows.
 
-    In profile mode, the profile's credential pool is authoritative. If a
-    provider has no entries in the profile, entries from the global-root
-    ``auth.json`` are used as a read-only fallback — so workers spawned in a
-    profile can see providers that were only authenticated at global scope.
-
-    Profile entries always win: the global fallback only applies per-provider
-    when the profile has zero entries for that provider. Once the user runs
-    ``hermes auth add <provider>`` inside the profile, profile entries
-    fully shadow global for that provider on the next read.
-
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
-    See issue #18594 follow-up.
+    Codex is a single-use-refresh OAuth provider: every profile must read the
+    canonical root pool and singleton. Other providers retain the existing
+    profile-first/global-fallback isolation semantics.
     """
-    auth_store = _load_auth_store()
+    active_path = _auth_file_path()
+    codex_path = _codex_auth_file_path()
+    with _auth_store_lock(target_path=codex_path if provider_id in (None, "openai-codex") else active_path):
+        auth_store = _load_auth_store(codex_path if provider_id == "openai-codex" else active_path)
+        if provider_id == "openai-codex":
+            pool = auth_store.get("credential_pool")
+            return list(pool.get(provider_id, [])) if isinstance(pool, dict) and isinstance(pool.get(provider_id), list) else []
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
@@ -1518,6 +1515,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         global_pool = maybe_global_pool
 
     if provider_id is None:
+        if not _same_path(active_path, codex_path):
+            canonical_store = _load_auth_store(codex_path)
+            canonical_pool = canonical_store.get("credential_pool")
+            if isinstance(canonical_pool, dict) and isinstance(canonical_pool.get("openai-codex"), list):
+                pool = dict(pool)
+                pool["openai-codex"] = list(canonical_pool["openai-codex"])
         merged = dict(pool)
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
@@ -1629,8 +1632,9 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    target_path = _codex_auth_file_path() if provider_id == "openai-codex" else _auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1668,7 +1672,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:

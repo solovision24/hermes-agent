@@ -200,6 +200,45 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
 
 
+def test_codex_pool_ignores_stale_profile_shadow(profile_env):
+    """Codex pool reads always use the canonical root store."""
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "canonical", "access_token": "root"}],
+        "openrouter": [{"id": "root-other", "access_token": "root"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local", "access_token": "stale"}],
+        "openrouter": [{"id": "profile-other", "access_token": "profile"}],
+    }))
+
+    assert [entry["id"] for entry in read_credential_pool("openai-codex")] == ["canonical"]
+    assert [entry["id"] for entry in read_credential_pool("openrouter")] == ["profile-other"]
+    assert [entry["id"] for entry in read_credential_pool(None)["openai-codex"]] == ["canonical"]
+
+
+def test_codex_pool_write_targets_canonical_root_and_preserves_other_provider(profile_env):
+    """Codex writes rotate root state without mutating isolated providers."""
+    from hermes_cli.auth import write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "root-other", "access_token": "root"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local", "access_token": "stale"}],
+        "openrouter": [{"id": "profile-other", "access_token": "profile"}],
+    }))
+
+    write_credential_pool("openai-codex", [{"id": "fresh", "access_token": "new"}])
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    profile = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert root["credential_pool"]["openai-codex"][0]["id"] == "fresh"
+    assert profile["credential_pool"]["openai-codex"][0]["id"] == "stale-local"
+    assert profile["credential_pool"]["openrouter"][0]["id"] == "profile-other"
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
