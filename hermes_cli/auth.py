@@ -1580,6 +1580,16 @@ def _merge_disk_cooldown_state(
         )
 
         disk_status = disk_entry.get("last_status")
+        # A pool status update can be based on an old in-memory token pair.
+        # For single-use OAuth credentials, the on-disk generation wins when
+        # it was refreshed after that snapshot was read. Merge the complete
+        # generation so a stale status write cannot restore a consumed token.
+        disk_refresh_ts = _parse_absolute_timestamp(disk_entry.get("last_refresh")) or 0.0
+        mem_refresh_ts = _parse_absolute_timestamp(entry.get("last_refresh")) or 0.0
+        if disk_refresh_ts > mem_refresh_ts:
+            for token_field in ("access_token", "refresh_token", "last_refresh"):
+                if token_field in disk_entry:
+                    entry[token_field] = disk_entry[token_field]
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return entry
         # A token change means the caller re-authed/refreshed this entry and

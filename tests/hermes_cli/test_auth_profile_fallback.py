@@ -252,6 +252,29 @@ def test_codex_pool_all_provider_read_removes_shadow_when_root_has_none(profile_
     assert "openai-codex" not in read_credential_pool(None)
 
 
+def test_codex_pool_stale_status_write_keeps_newer_token_generation(profile_env):
+    """A stale status snapshot must not restore a rotated refresh token."""
+    from hermes_cli.auth import write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "same-id", "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh", "last_refresh": "2026-09-04T19:00:00Z",
+        }],
+    }))
+    write_credential_pool("openai-codex", [{
+        "id": "same-id", "access_token": "stale-access",
+        "refresh_token": "stale-refresh", "last_refresh": "2026-09-04T18:00:00Z",
+        "last_status": "exhausted", "last_status_at": 2000,
+    }])
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    entry = root["credential_pool"]["openai-codex"][0]
+    assert entry["access_token"] == "fresh-access"
+    assert entry["refresh_token"] == "fresh-refresh"
+    assert entry["last_refresh"] == "2026-09-04T19:00:00Z"
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):

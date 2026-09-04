@@ -1516,8 +1516,9 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        codex_auth_path = auth_mod._codex_auth_file_path()
+                        with _auth_store_lock(target_path=codex_auth_path):
+                            auth_store = _load_auth_store(codex_auth_path)
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1537,7 +1538,10 @@ class CredentialPool:
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
                                         _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        _save_auth_store(
+                                            auth_store,
+                                            target_path=codex_auth_path,
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
