@@ -239,6 +239,19 @@ def test_codex_pool_write_targets_canonical_root_and_preserves_other_provider(pr
     assert profile["credential_pool"]["openrouter"][0]["id"] == "profile-other"
 
 
+def test_codex_pool_all_provider_read_removes_shadow_when_root_has_none(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "root-other"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local"}],
+    }))
+
+    assert "openai-codex" not in read_credential_pool(None)
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):

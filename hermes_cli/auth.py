@@ -1518,8 +1518,9 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         if not _same_path(active_path, codex_path):
             canonical_store = _load_auth_store(codex_path)
             canonical_pool = canonical_store.get("credential_pool")
+            pool = dict(pool)
+            pool.pop("openai-codex", None)
             if isinstance(canonical_pool, dict) and isinstance(canonical_pool.get("openai-codex"), list):
-                pool = dict(pool)
                 pool["openai-codex"] = list(canonical_pool["openai-codex"])
         merged = dict(pool)
         for gp_key, gp_entries in global_pool.items():
