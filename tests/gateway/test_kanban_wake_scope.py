@@ -17,6 +17,7 @@ from gateway.run import GatewayRunner
 from gateway.session import build_session_key
 from hermes_cli import kanban_db as kb
 from plugins.platforms.slack.adapter import SlackAdapter
+from tools import operational_sender
 
 TEAM = "T0B8U2M6NRE"
 CHANNEL = "C0BCDG3H66P"
@@ -36,6 +37,9 @@ class UnscopedAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+    def extract_local_files(self, text):
+        return [], text
 
 
 def _slack_adapter(channel_team=None):
@@ -63,6 +67,30 @@ def _runner(adapter, platform=Platform.SLACK):
 
 async def _one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
+
+    # Telegram operational delivery is intentionally isolated from the Halo
+    # adapter.  Keep this wake-scope test at the real sender transport
+    # boundary, without requiring credentials or making a network call.
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            }}
+        return {"ok": True, "result": {
+            "message_id": 1,
+            "from": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            },
+            "chat": {"id": operational_sender.DEFAULT_CHAT_ID},
+        }}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
 
     async def fake_sleep(delay):
         if delay == 5:

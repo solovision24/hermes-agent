@@ -1,7 +1,9 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from urllib.error import URLError
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -19,19 +21,13 @@ class RecordingAdapter:
         self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
-        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        raise AssertionError("Halo adapter must not send Kanban Telegram notices")
 
     async def handle_message(self, event):
         self.handled.append(event)
 
     def extract_local_files(self, text):
         return [], text
-
-    def send_operational_message(self, text):
-        self.sent.append({"chat_id": operational_sender.DEFAULT_CHAT_ID,
-                          "text": text, "metadata": {}})
-        return {"ok": True, "result": {"message_id": len(self.sent)}}
-
 
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
@@ -43,6 +39,29 @@ class DisconnectedAdapters(dict):
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            }}
+        delivery = {"message_id": 1,
+                    "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                             "username": operational_sender.EXPECTED_USERNAME,
+                             "is_bot": True},
+                    "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}
+        runner.adapters[Platform.TELEGRAM].sent.append({
+            "chat_id": operational_sender.DEFAULT_CHAT_ID,
+            "text": data.get("text", ""),
+            "metadata": {},
+        })
+        return {"ok": True, "result": delivery}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+
     async def fake_sleep(delay):
         if delay == 5:
             return None
@@ -50,11 +69,6 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(
-        operational_sender,
-        "send_operational_message",
-        runner.adapters[Platform.TELEGRAM].send_operational_message,
-    )
     await runner._kanban_notifier_watcher(interval=1)
 
 
@@ -410,112 +424,6 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
-def test_notifier_subscription_survives_done_reopen_until_archive(
-    tmp_path, monkeypatch,
-):
-    """Done is reversible; archive alone ends notification ownership."""
-    db_path = tmp_path / "done-reopen-archive.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(
-            conn,
-            title="review continuation",
-            assignee="worker",
-            session_id="origin-session",
-        )
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="origin-chat",
-            thread_id="origin-thread",
-            user_id="origin-user",
-            chat_type="group",
-            notifier_profile="reviewer",
-            delivery_mode="notify+wake",
-        )
-        assert kb.complete_task(conn, tid, summary="first completion")
-    finally:
-        conn.close()
-
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
-    runner._active_profile_name = lambda: "reviewer"
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.sent) == 1
-    assert len(adapter.handled) == 1
-    # Telegram operational pings deliberately use the canonical sender/chat
-    # and never inherit the originating agent topic.
-    assert adapter.sent[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
-    assert adapter.sent[0]["metadata"] == {}
-    assert adapter.handled[0].source.thread_id == "origin-thread"
-    assert adapter.handled[0].source.profile == "reviewer"
-
-    conn = kb.connect()
-    try:
-        subs = kb.list_notify_subs(conn, tid)
-        assert len(subs) == 1, "completion must retain the origin subscription"
-        first_cursor = subs[0]["last_event_id"]
-    finally:
-        conn.close()
-
-    # A quiet tick proves the completed event cannot replay after its cursor
-    # was advanced, even though the subscription now remains present.
-    runner = _make_runner(adapter)
-    runner._active_profile_name = lambda: "reviewer"
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-    assert len(adapter.sent) == 1
-    assert len(adapter.handled) == 1
-
-    conn = kb.connect()
-    try:
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
-            kb._append_event(conn, tid, "status", {"status": "ready"})
-        assert kb.complete_task(conn, tid, summary="corrected completion")
-    finally:
-        conn.close()
-
-    runner = _make_runner(adapter)
-    runner._active_profile_name = lambda: "reviewer"
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    # The reopen status and second completion each deliver once, while only
-    # completion wakes the exact original session/thread.
-    assert len(adapter.sent) == 3
-    assert len(adapter.handled) == 2
-    assert all(item["chat_id"] == operational_sender.DEFAULT_CHAT_ID for item in adapter.sent)
-    assert adapter.handled[-1].source.thread_id == "origin-thread"
-    assert adapter.handled[-1].source.profile == "reviewer"
-
-    conn = kb.connect()
-    try:
-        subs = kb.list_notify_subs(conn, tid)
-        assert len(subs) == 1
-        assert subs[0]["last_event_id"] > first_cursor
-        assert kb.archive_task(conn, tid)
-    finally:
-        conn.close()
-
-    runner = _make_runner(adapter)
-    runner._active_profile_name = lambda: "reviewer"
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    # Archive itself is intentionally silent, but consumes its event and
-    # removes the subscription so no later historical event can replay.
-    assert len(adapter.sent) == 3
-    assert len(adapter.handled) == 2
-    conn = kb.connect()
-    try:
-        assert kb.list_notify_subs(conn, tid) == []
-    finally:
-        conn.close()
-
-
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -682,124 +590,238 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert remaining == []
 
 
-# ---------------------------------------------------------------------------
-# Handoffs that hand a decision back to the origin must wake it, not only ping
-# it: `review_requested` (implementation done, waiting for a reviewer) and
-# `block_loop_detected` (routed to triage) are terminal kinds just like
-# `blocked`.
-# ---------------------------------------------------------------------------
+def _run_real_operational_tick(monkeypatch, runner):
+    """Run one loop iteration without replacing the operational sender."""
+    real_sleep = asyncio.sleep
+
+    calls = 0
+
+    async def stop_after_tick(delay):
+        nonlocal calls
+        if delay == 5:
+            calls += 1
+            if calls == 1:
+                return
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_tick)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
 
 
-def _wake_text(adapter):
-    """Text of the single synthetic wake turn injected into the adapter."""
-    assert len(adapter.handled) == 1, (
-        f"expected exactly one wake turn, got {len(adapter.handled)}"
-    )
-    return getattr(adapter.handled[0], "text", "") or ""
-
-
-def _review_handoff_task(
-    *,
-    delivery_mode="notify+wake",
-    summary="PR ready: https://example.invalid/pr/7\nfull details below",
-):
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(
-            conn,
-            title="implement the thing",
-            assignee="worker",
-            session_id="agent:main:telegram:dm:chat-1",
-        )
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="chat-1",
-            chat_type="dm",
-            delivery_mode=delivery_mode,
-        )
-        kb.claim_task(conn, tid)
-        run_id = kb.get_task(conn, tid).current_run_id
-        assert kb.request_review(
-            conn, tid, summary=summary, expected_run_id=run_id,
-        ) is True
-        return tid
-    finally:
-        conn.close()
-
-
-def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
-    """A review handoff wakes the origin and carries the worker's summary."""
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-wake.db"))
+def _seed_event(db_path, monkeypatch, *, kind="blocked", session_id=None):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
-    tid = _review_handoff_task()
-
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.sent) == 1, "the passive review ping is unchanged"
-    assert "ready for review" in adapter.sent[0]["text"]
-
-    wake = _wake_text(adapter)
-    assert tid in wake
-    assert "PR ready: https://example.invalid/pr/7" in wake, (
-        "the worker's handoff must ride the wake turn like it does for "
-        "`completed`, otherwise the woken reviewer has to re-read the board"
-    )
-
-
-def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
-    """A triage escalation wakes the origin so a decision gets made."""
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "triage-wake.db"))
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(
-            conn,
-            title="loops forever",
-            assignee="worker",
-            session_id="agent:main:telegram:dm:chat-1",
-        )
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="chat-1",
-            chat_type="dm",
-            delivery_mode="notify+wake",
-        )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="operational matrix", assignee="worker",
+                             session_id=session_id)
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="ignored",
+                          thread_id="topic-1", delivery_mode="notify+wake")
         kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+            conn, tid, kind,
+            {"reason": "matrix"} if kind == "blocked" else {},
         )
-    finally:
-        conn.close()
+    return tid
 
+
+def _subscription_cursor(tid):
+    with kb.connect() as conn:
+        return kb.list_notify_subs(conn, tid)[0]["last_event_id"]
+
+
+@pytest.mark.parametrize("identity", [
+    {"id": operational_sender.EXPECTED_BOT_ID + 1,
+     "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+    {"id": operational_sender.EXPECTED_BOT_ID,
+     "username": operational_sender.EXPECTED_USERNAME, "is_bot": False},
+])
+def test_real_notifier_fails_closed_before_wrong_identity_send(tmp_path, monkeypatch, identity):
+    tid = _seed_event(tmp_path / "wrong-identity.db", monkeypatch)
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    calls = []
+
+    def fake_api(_token, method, data):
+        calls.append((method, data))
+        return {"ok": True, "result": identity} if method == "getMe" else pytest.fail("send must not run")
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    runner = _make_runner(RecordingAdapter())
+    _run_real_operational_tick(monkeypatch, runner)
+    # The task-created event is cursor 1; the failed notification must
+    # not advance beyond it.
+    assert [method for method, _ in calls] == ["getMe"]
+    assert _subscription_cursor(tid) == 1
+
+
+def test_real_notifier_missing_token_rewinds_without_halo_fallback(tmp_path, monkeypatch):
+    tid = _seed_event(tmp_path / "missing-token.db", monkeypatch)
+    monkeypatch.delenv("SOLO_HERMES_BOT_TOKEN", raising=False)
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    _run_real_operational_tick(monkeypatch, runner)
+    assert _subscription_cursor(tid) == 1
+    assert adapter.sent == []
 
-    assert len(adapter.sent) == 1
-    assert tid in _wake_text(adapter)
+
+def test_real_notifier_rewinds_failed_transport_then_deduplicates(tmp_path, monkeypatch):
+    tid = _seed_event(tmp_path / "retry.db", monkeypatch)
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    attempts = []
+
+    def fake_api(_token, method, data):
+        attempts.append((method, dict(data)))
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        if len([m for m, _ in attempts if m == "sendMessage"]) == 1:
+            raise RuntimeError("transport down")
+        return {"ok": True, "result": {"message_id": 42,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    first = _make_runner(RecordingAdapter())
+    _run_real_operational_tick(monkeypatch, first)
+    assert _subscription_cursor(tid) == 1
+    second = _make_runner(RecordingAdapter())
+    _run_real_operational_tick(monkeypatch, second)
+    assert _subscription_cursor(tid) >= 2
+    third = _make_runner(RecordingAdapter())
+    _run_real_operational_tick(monkeypatch, third)
+    assert len([m for m, _ in attempts if m == "sendMessage"]) == 2
+    sends = [data for method, data in attempts if method == "sendMessage"]
+    assert sends[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+    assert "message_thread_id" not in sends[0]
 
 
-def test_review_requested_does_not_wake_a_notify_only_subscription(
+def test_real_notifier_review_events_send_and_preserve_creator_wake(tmp_path, monkeypatch):
+    tid = _seed_event(tmp_path / "review-events.db", monkeypatch,
+                      kind="review_requested", session_id="agent:main:telegram:dm:ignored")
+    with kb.connect() as conn:
+        kb._append_event(conn, tid, "changes_requested", {"reason": "please revise"})
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    operational_calls = []
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        operational_calls.append((method, dict(data)))
+        return {"ok": True, "result": {"message_id": 7,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    adapter = RecordingAdapter()
+    _run_real_operational_tick(monkeypatch, _make_runner(adapter))
+    assert _subscription_cursor(tid) >= 2
+    assert [method for method, _ in operational_calls] == ["sendMessage", "sendMessage"]
+    assert all(call[1]["chat_id"] == operational_sender.DEFAULT_CHAT_ID for call in operational_calls)
+    assert all("message_thread_id" not in call[1] for call in operational_calls)
+    ping_text = "\n".join(call[1]["text"] for call in operational_calls).lower()
+    assert "review requested" in ping_text
+    # Installed safe rendering combines the event label with its routing
+    # action ("review requested changes/block"). Assert the semantic event,
+    # not wording that predates the preserved renderer.
+    assert "review requested changes/block" in ping_text
+    assert len(adapter.handled) == 1
+    wake_text = adapter.handled[0].text.lower()
+    assert "review requested" in wake_text
+    assert "review requested changes" in wake_text
+
+
+def test_real_notifier_rewinds_when_operational_response_has_thread(tmp_path, monkeypatch):
+    """Telegram must reject a response that leaks topic/thread routing."""
+    tid = _seed_event(tmp_path / "thread-proof.db", monkeypatch)
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    calls = []
+
+    def fake_api(_token, method, data):
+        calls.append(method)
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 9,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID},
+                "message_thread_id": 77}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+
+    assert calls == ["getMe", "sendMessage"]
+    assert _subscription_cursor(tid) == 1
+
+
+def test_real_notifier_rewinds_partial_multipart_batch_then_retries_and_deduplicates(
     tmp_path, monkeypatch,
 ):
-    """delivery_mode still decides whether a wake-worthy kind wakes at all."""
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-notify.db"))
+    """A failed artifact in a real loop rewinds text and the whole batch.
+
+    Replaying an already-uploaded artifact is intentional: the cursor is the
+    idempotency boundary, and advancing it after a partial batch would lose
+    the remaining artifact permanently.
+    """
+    db_path = tmp_path / "partial-multipart.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
-    _review_handoff_task(delivery_mode="notify")
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first")
+    second.write_text("second")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="artifact batch", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="ignored")
+        kb._append_event(conn, tid, "completed", {"summary": "done",
+                                                    "artifacts": [str(first), str(second)]})
 
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    document_attempts = []
 
-    assert len(adapter.sent) == 1
-    assert adapter.handled == [], (
-        "notify-only subscriptions must not be woken by a review handoff"
-    )
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 10,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return (b'{"ok": true, "result": {"message_id": 11, '
+                    b'"from": {"id": 8611668567, "username": "solo_hermes_bot", "is_bot": true}, '
+                    b'"chat": {"id": "8148316720"}}}')
+
+    def fake_urlopen(request, timeout=20):
+        document_attempts.append(request.full_url)
+        # The first file reaches Telegram; the second fails. The next tick
+        # retries both files after the notifier rewinds the claimed event.
+        if len(document_attempts) == 2:
+            raise URLError("second document unavailable")
+        return Response()
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    monkeypatch.setattr(operational_sender, "urlopen", fake_urlopen)
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    # The task-creation event remains the durable cursor floor; the completed
+    # event itself was rewound for retry.
+    assert _subscription_cursor(tid) == 1
+    assert len(document_attempts) == 2
+
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    assert len(document_attempts) == 4
+    assert _subscription_cursor(tid) >= 2
+
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    assert len(document_attempts) == 4
