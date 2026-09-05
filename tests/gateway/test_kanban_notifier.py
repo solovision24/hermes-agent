@@ -275,6 +275,53 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
         _release_singleton_lock(winner_handle)
 
 
+def test_real_telegram_notifier_loop_uses_transport_boundary(monkeypatch, tmp_path):
+    """The notifier loop must use the verified sender, never Halo.send()."""
+    db_path = tmp_path / "transport-boundary.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="transport proof", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="delivered")
+    finally:
+        conn.close()
+
+    calls = []
+    def fake_api(_token, method, data):
+        calls.append((method, data))
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 7,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+
+    class HaloForbidden:
+        async def send(self, *_args, **_kwargs):
+            raise AssertionError("Halo adapter must not send Kanban Telegram notices")
+    runner = _make_runner(HaloForbidden())
+    async def one_tick():
+        original_sleep = asyncio.sleep
+        async def stop_after_initial(delay):
+            if delay == 5:
+                return
+            runner._running = False
+            await original_sleep(0)
+        monkeypatch.setattr(asyncio, "sleep", stop_after_initial)
+        await runner._kanban_notifier_watcher(interval=1)
+    asyncio.run(one_tick())
+
+    assert calls[0][0] == "getMe"
+    assert calls[1] == ("sendMessage", {"chat_id": operational_sender.DEFAULT_CHAT_ID,
+                                          "text": calls[1][1]["text"]})
+    assert "message_thread_id" not in calls[1][1]
+
+
 class FailingAdapter:
     """Adapter whose send() always raises, simulating a transient send error."""
 
