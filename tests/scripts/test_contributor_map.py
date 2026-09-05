@@ -55,6 +55,63 @@ def test_effective_map_merges_legacy_and_directory():
         assert release.AUTHOR_MAP[email] == login
 
 
+def test_directory_mapping_wins_over_case_only_legacy_key():
+    merged = release._merge_author_maps(
+        {"Owner@Example.com": "legacy-owner"},
+        {"owner@example.COM": "directory-owner"},
+    )
+
+    assert merged == {"owner@example.COM": "directory-owner"}
+
+
+def test_all_consumers_resolve_common_mixed_case_fixture(tmp_path, monkeypatch):
+    """The CI, audit, and release lookup paths agree on one fixture."""
+    scripts = tmp_path / "scripts"
+    emails = tmp_path / "contributors" / "emails"
+    scripts.mkdir()
+    emails.mkdir(parents=True)
+    (emails / "Owner@Example.com").write_text("directory-owner\n", encoding="utf-8")
+    (scripts / "release.py").write_text(
+        'AUTHOR_MAP = {"owner@example.com": "legacy-owner"}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    assert audit.is_mapped("OWNER@EXAMPLE.COM")
+    for email in ("literal*gmail@example.com", "literal[gmail@example.com", "ordinary@example.com"):
+        assert not audit.is_mapped(email)
+
+    merged = release._merge_author_maps(
+        {"owner@example.com": "legacy-owner"},
+        {"Owner@Example.com": "directory-owner"},
+    )
+    monkeypatch.setattr(release, "AUTHOR_MAP", merged)
+    assert release.resolve_author("Author", "owner@EXAMPLE.com") == "@directory-owner"
+    assert release._lookup_author_map("ordinary@example.com") is None
+
+    # Execute the same fixed-string CI predicate used by the workflow.  This
+    # catches glob interpretation regressions that source-text assertions miss.
+    proc = subprocess.run(
+        ["bash", "-c", """
+        missing=()
+        for email in "$@"; do
+          case "$email" in
+            *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*) continue ;;
+          esac
+          if find contributors/emails -maxdepth 1 -type f -printf '%f\\n' | grep -Fxi -- "$email" | grep -q .; then continue; fi
+          if grep -iFq -- "\\\"${email}\\\"" scripts/release.py 2>/dev/null; then continue; fi
+          missing+=("$email")
+        done
+        printf '%s\\n' "${missing[@]}"
+        test "${#missing[@]}" -eq 3
+        """, "ci-check", "OWNER@EXAMPLE.COM", "literal*gmail@example.com",
+         "literal[gmail@example.com", "ordinary@example.com"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == [
+        "literal*gmail@example.com", "literal[gmail@example.com", "ordinary@example.com"
+    ]
+
+
 def test_resolve_author_matches_mapping_email_case_insensitively(monkeypatch):
     monkeypatch.setattr(release, "AUTHOR_MAP", {"agent@Agents-Mac-mini.local": "momomojo"})
 
