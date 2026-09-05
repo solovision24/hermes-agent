@@ -27,6 +27,34 @@ def test_operational_sender_rejects_wrong_identity(monkeypatch):
     assert calls == ["getMe"]
 
 
+def test_operational_sender_rejects_noncanonical_destination(monkeypatch):
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "not-printed")
+    monkeypatch.setattr(operational_sender, "_api_call", lambda *args: {
+        "ok": True,
+        "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME,
+                    "is_bot": True},
+    })
+    with pytest.raises(RuntimeError, match="destination"):
+        operational_sender.send_operational_message("Changed: test", "999")
+
+
+def test_operational_sender_requires_verified_delivery_proof(monkeypatch):
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "not-printed")
+
+    def fake_call(token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 1,
+                "from": {"id": 1, "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_call)
+    with pytest.raises(RuntimeError, match="delivery proof"):
+        operational_sender.send_operational_message("Changed: test")
+
+
 @pytest.mark.asyncio
 async def test_real_watcher_delivery_path_forbids_halo_adapter(monkeypatch):
     adapter = type("Adapter", (), {"send": AsyncMock()})()
