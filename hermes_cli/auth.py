@@ -954,6 +954,54 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+def _pytest_protected_auth_paths() -> tuple[Path, ...]:
+    """Return auth stores that tests must never read or write.
+
+    ``tests/conftest.py`` captures an inherited ``HERMES_ROOT`` before
+    collection and stores it in ``HERMES_TEST_REAL_ROOT``.  Keep that root in
+    the runtime seat belt even after the test environment rewires
+    ``HERMES_HOME``; otherwise a profile-shaped test could still reach the
+    externally supplied canonical store.  The active ``HERMES_ROOT`` is not
+    automatically denied because tests may deliberately point it at a
+    disposable synthetic root.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return ()
+    home_env = os.environ.get("HOME", "").strip()
+    roots = [
+        (Path(home_env).expanduser() if home_env else Path.home()) / ".hermes"
+    ]
+    captured_root = os.environ.get("HERMES_TEST_REAL_ROOT", "").strip()
+    if captured_root:
+        roots.append(Path(captured_root).expanduser())
+    protected: list[Path] = []
+    for root in roots:
+        try:
+            protected.append((root / "auth.json").resolve(strict=False))
+        except Exception:
+            protected.append(root / "auth.json")
+    return tuple(protected)
+
+
+def _is_pytest_protected_auth_path(path: Path) -> bool:
+    """Whether *path* is a captured or currently real pytest auth store."""
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    return any(resolved == protected for protected in _pytest_protected_auth_paths())
+
+
+def _assert_auth_store_path_allowed(path: Path) -> None:
+    """Refuse protected auth-store paths before any filesystem access."""
+    if _is_pytest_protected_auth_path(path):
+        raise RuntimeError(
+            f"Refusing to touch real user auth store during test run: {path}. "
+            "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+            "via scripts/run_tests.sh for hermetic CI-parity env."
+        )
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
@@ -962,17 +1010,7 @@ def _auth_file_path() -> Path:
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if resolved == real_home_auth:
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+        _assert_auth_store_path_allowed(path)
     return path
 
 
@@ -1026,15 +1064,8 @@ def _load_global_auth_store() -> Dict[str, Any]:
     global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
         return {}
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return {}
-            except Exception:
-                pass
+    if _is_pytest_protected_auth_path(global_path):
+        return {}
     try:
         return _load_auth_store(global_path)
     except Exception:
@@ -1159,6 +1190,8 @@ def _auth_store_lock(
     against a concurrent import on the shared store.
     """
     auth_path = target_path if target_path is not None else _auth_file_path()
+    if target_path is not None:
+        _assert_auth_store_path_allowed(auth_path)
     lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
     with _file_lock(
         lock_path,
@@ -1170,7 +1203,9 @@ def _auth_store_lock(
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
-    auth_file = auth_file or _auth_file_path()
+    auth_file = auth_file if auth_file is not None else _auth_file_path()
+    if auth_file is not None:
+        _assert_auth_store_path_allowed(auth_file)
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
@@ -1245,6 +1280,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    if target_path is not None:
+        _assert_auth_store_path_allowed(auth_file)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1491,22 +1528,19 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 
 
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
-    """Return the persisted credential pool, or one provider slice.
+    """Return persisted pool entries without allowing Codex profile shadows.
 
-    In profile mode, the profile's credential pool is authoritative. If a
-    provider has no entries in the profile, entries from the global-root
-    ``auth.json`` are used as a read-only fallback — so workers spawned in a
-    profile can see providers that were only authenticated at global scope.
-
-    Profile entries always win: the global fallback only applies per-provider
-    when the profile has zero entries for that provider. Once the user runs
-    ``hermes auth add <provider>`` inside the profile, profile entries
-    fully shadow global for that provider on the next read.
-
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
-    See issue #18594 follow-up.
+    Codex is a single-use-refresh OAuth provider: every profile must read the
+    canonical root pool and singleton. Other providers retain the existing
+    profile-first/global-fallback isolation semantics.
     """
-    auth_store = _load_auth_store()
+    active_path = _auth_file_path()
+    codex_path = _codex_auth_file_path()
+    with _auth_store_lock(target_path=codex_path if provider_id in (None, "openai-codex") else active_path):
+        auth_store = _load_auth_store(codex_path if provider_id == "openai-codex" else active_path)
+        if provider_id == "openai-codex":
+            pool = auth_store.get("credential_pool")
+            return list(pool.get(provider_id, [])) if isinstance(pool, dict) and isinstance(pool.get(provider_id), list) else []
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
@@ -1518,6 +1552,13 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         global_pool = maybe_global_pool
 
     if provider_id is None:
+        if not _same_path(active_path, codex_path):
+            canonical_store = _load_auth_store(codex_path)
+            canonical_pool = canonical_store.get("credential_pool")
+            pool = dict(pool)
+            pool.pop("openai-codex", None)
+            if isinstance(canonical_pool, dict) and isinstance(canonical_pool.get("openai-codex"), list):
+                pool["openai-codex"] = list(canonical_pool["openai-codex"])
         merged = dict(pool)
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
@@ -1544,6 +1585,30 @@ _POOL_STATUS_FIELDS = (
     "last_error_reason",
     "last_error_message",
     "last_error_reset_at",
+)
+
+# Codex refresh tokens are single-use credentials. A pool status write may be
+# based on an older in-memory snapshot, so it must not overwrite generation
+# material implicitly. Timestamps alone are not a safe CAS because they may
+# be equal, missing, skewed, or expired.
+_CODEX_GENERATION_FIELDS = (
+    "access_token",
+    "refresh_token",
+    "last_refresh",
+    "expires_at",
+    "expires_at_ms",
+    "agent_key",
+    "agent_key_expires_at",
+    "agent_key_expires_in",
+    "agent_key_obtained_at",
+    "agent_key_reused",
+    "obtained_at",
+    "expires_in",
+    "token_type",
+    "scope",
+    "client_id",
+    "portal_base_url",
+    "inference_base_url",
 )
 
 
@@ -1576,6 +1641,21 @@ def _merge_disk_cooldown_state(
         )
 
         disk_status = disk_entry.get("last_status")
+        # A pool status update can be based on an old in-memory snapshot. Do
+        # not use timestamp ordering as a generation CAS: equal timestamps,
+        # missing timestamps, clock skew, and expired timestamps are all valid
+        # states. The canonical on-disk generation wins for status-only
+        # writes. Explicit login/refresh replacement is marked by
+        # ``write_credential_pool(..., replaced_ids=...)`` and bypasses this
+        # merge while holding the same store lock.
+        if provider_id == "openai-codex":
+            merged_generation = dict(entry)
+            for field in _CODEX_GENERATION_FIELDS:
+                if field in disk_entry:
+                    merged_generation[field] = disk_entry[field]
+                else:
+                    merged_generation.pop(field, None)
+            entry = merged_generation
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return entry
         # A token change means the caller re-authed/refreshed this entry and
@@ -1609,6 +1689,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    replaced_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1624,13 +1705,20 @@ def write_credential_pool(
     For entries present on BOTH sides, status fields are merged by
     ``last_status_at`` recency via ``_merge_disk_cooldown_state`` so a stale
     snapshot cannot erase a cooldown/quarantine another process just wrote.
+    Codex generation-bearing fields are preserved from disk for these
+    status-only writes even when timestamps are equal, absent, skewed, or
+    expired. Callers that intentionally replace a credential generation must
+    list its ID in ``replaced_ids``; that replacement is committed under this
+    same lock, giving refresh/login paths an explicit generation boundary.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    replaced = {rid for rid in (replaced_ids or ()) if rid}
+    target_path = _codex_auth_file_path() if provider_id == "openai-codex" else _auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1647,14 +1735,40 @@ def write_credential_pool(
             for entry in existing_list
             if isinstance(entry, dict) and entry.get("id")
         }
+        # A terminal singleton quarantine removes the canonical provider
+        # tokens before committing the pool removal. A stale writer that was
+        # already holding the old ``device_code`` snapshot must not recreate
+        # that quarantined row after the winner releases the root lock.
+        if provider_id == "openai-codex":
+            state = _load_provider_state(auth_store, provider_id) or {}
+            state_tokens = state.get("tokens") if isinstance(state, dict) else None
+            has_canonical_pair = bool(
+                isinstance(state_tokens, dict)
+                and str(state_tokens.get("access_token") or "").strip()
+                and str(state_tokens.get("refresh_token") or "").strip()
+            )
+            if not has_canonical_pair:
+                sanitized_entries = [
+                    entry
+                    for entry in sanitized_entries
+                    if not (
+                        isinstance(entry, dict)
+                        and entry.get("source") == "device_code"
+                        and entry.get("id") not in replaced
+                    )
+                ]
         new_ids = {
             entry.get("id")
             for entry in sanitized_entries
             if isinstance(entry, dict) and entry.get("id")
         }
         merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+            (
+                entry
+                if entry.get("id") in replaced
+                else _merge_disk_cooldown_state(
+                    entry, existing_by_id.get(entry.get("id")), provider_id
+                )
             )
             if isinstance(entry, dict)
             else entry
@@ -1668,7 +1782,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -3521,18 +3635,26 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+def _codex_auth_file_path() -> Path:
+    """Return the canonical root auth store for Codex OAuth state."""
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "auth.json"
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
     """
+    auth_path = _codex_auth_file_path()
     if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _auth_store_lock(target_path=auth_path):
+            auth_store = _load_auth_store(auth_path)
     else:
-        auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+        auth_store = _load_auth_store(auth_path)
+    providers = auth_store.get("providers")
+    state = providers.get("openai-codex") if isinstance(providers, dict) else None
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3669,15 +3791,28 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+        # A login replacement is an explicit new generation. Carry every
+        # generation-bearing field that the provider returned and discard
+        # metadata from the previous login when the new payload omits it.
+        for field in _CODEX_GENERATION_FIELDS:
+            if field in {"access_token", "refresh_token", "last_refresh"}:
+                continue
+            if field in tokens:
+                entry[field] = tokens[field]
+            else:
+                entry.pop(field, None)
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
+    auth_path = _codex_auth_file_path()
+    with _auth_store_lock(target_path=auth_path):
+        auth_store = _load_auth_store(auth_path)
+        providers = auth_store.setdefault("providers", {})
+        raw_state = providers.get("openai-codex") if isinstance(providers, dict) else None
+        state = dict(raw_state) if isinstance(raw_state, dict) else {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3696,7 +3831,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=auth_path)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -4043,7 +4178,10 @@ def resolve_codex_runtime_credentials(
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        with _auth_store_lock(
+            timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0),
+            target_path=_codex_auth_file_path(),
+        ):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -4505,15 +4643,8 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the read-side guard in _load_global_auth_store). Uses the
     # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
-            except Exception:
-                return
+    if _is_pytest_protected_auth_path(global_path):
+        return
     try:
         _persist_provider_state_to_store(
             "xai-oauth",

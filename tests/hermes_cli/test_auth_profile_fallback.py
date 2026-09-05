@@ -12,9 +12,13 @@ authenticated only at the global root.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -50,6 +54,125 @@ def profile_env(tmp_path, monkeypatch):
 
 def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
+        for path in sorted(root.rglob("*"))
+    }
+
+
+@pytest.fixture()
+def protected_canonical_root(tmp_path, monkeypatch):
+    """Provide a protected canonical store beside a distinct test home."""
+    protected_root = tmp_path / "protected-root"
+    protected_root.mkdir()
+    (protected_root / "auth.json").write_bytes(
+        json.dumps(
+            _make_auth_store(
+                pool={"openai-codex": [{"id": "protected-entry"}]},
+                providers={
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "protected-access",
+                            "refresh_token": "protected-refresh",
+                        }
+                    }
+                },
+            ),
+            indent=2,
+        ).encode()
+    )
+    (protected_root / "sentinel.txt").write_bytes(b"must remain untouched\n")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "protected-auth-store-regression")
+    monkeypatch.setenv("HERMES_TEST_REAL_ROOT", str(protected_root))
+    monkeypatch.setenv("HERMES_ROOT", str(protected_root))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "separate-test-home"))
+    return protected_root
+
+
+def test_explicit_auth_store_helpers_refuse_protected_paths_before_io(
+    protected_canonical_root,
+):
+    """Explicit load/save/lock targets cannot bypass the pytest seat belt."""
+    import hermes_cli.auth as auth
+
+    auth_path = protected_canonical_root / "auth.json"
+    before = _tree_snapshot(protected_canonical_root)
+
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        auth._load_auth_store(auth_path)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        auth._save_auth_store({"providers": {}}, target_path=auth_path)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        with auth._auth_store_lock(target_path=auth_path):
+            pass
+
+    assert _tree_snapshot(protected_canonical_root) == before
+    assert not (protected_canonical_root / "auth.lock").exists()
+
+
+def test_codex_singleton_helpers_refuse_protected_canonical_root(
+    protected_canonical_root,
+):
+    """Codex singleton reads and saves stop before touching the root store."""
+    from hermes_cli.auth import _read_codex_tokens, _save_codex_tokens
+
+    before = _tree_snapshot(protected_canonical_root)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        _read_codex_tokens()
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        _save_codex_tokens(
+            {"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}
+        )
+
+    assert _tree_snapshot(protected_canonical_root) == before
+    assert not (protected_canonical_root / "auth.lock").exists()
+
+
+def test_codex_pool_helpers_refuse_protected_canonical_root(
+    protected_canonical_root,
+):
+    """Codex pool reads and writes stop before touching the root store."""
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    before = _tree_snapshot(protected_canonical_root)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        read_credential_pool("openai-codex")
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        write_credential_pool(
+            "openai-codex",
+            [{"id": "synthetic-entry", "access_token": "synthetic-access"}],
+        )
+
+    assert _tree_snapshot(protected_canonical_root) == before
+    assert not (protected_canonical_root / "auth.lock").exists()
+
+
+def test_unprotected_synthetic_canonical_root_remains_usable(tmp_path, monkeypatch):
+    """A disposable explicit root remains usable under pytest."""
+    from hermes_cli.auth import (
+        _read_codex_tokens,
+        _save_codex_tokens,
+        read_credential_pool,
+        write_credential_pool,
+    )
+
+    usable_root = tmp_path / "usable-root"
+    monkeypatch.setenv("HERMES_ROOT", str(usable_root))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "separate-test-home"))
+    _save_codex_tokens(
+        {"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}
+    )
+    assert _read_codex_tokens()["tokens"]["access_token"] == "synthetic-access"
+
+    write_credential_pool(
+        "openai-codex",
+        [{"id": "synthetic-entry", "access_token": "synthetic-access"}],
+    )
+    pool_entries = cast(list[dict], read_credential_pool("openai-codex"))
+    assert pool_entries[0]["id"] == "synthetic-entry"
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +321,132 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+def test_codex_pool_ignores_stale_profile_shadow(profile_env):
+    """Codex pool reads always use the canonical root store."""
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "canonical", "access_token": "root"}],
+        "openrouter": [{"id": "root-other", "access_token": "root"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local", "access_token": "stale"}],
+        "openrouter": [{"id": "profile-other", "access_token": "profile"}],
+    }))
+
+    assert [entry["id"] for entry in read_credential_pool("openai-codex")] == ["canonical"]
+    assert [entry["id"] for entry in read_credential_pool("openrouter")] == ["profile-other"]
+    assert [entry["id"] for entry in read_credential_pool(None)["openai-codex"]] == ["canonical"]
+
+
+def test_pytest_subprocess_sandboxes_inherited_hermes_root(tmp_path):
+    """An inherited canonical-root override cannot escape the test sandbox."""
+    sentinel_root = tmp_path / "external-root"
+    sentinel_root.mkdir()
+    sentinel_auth = sentinel_root / "auth.json"
+    sentinel_auth.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [{"id": "external-sentinel"}]
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    before = sentinel_auth.read_bytes()
+
+    env = dict(os.environ)
+    env["HERMES_ROOT"] = str(sentinel_root)
+    env["HERMES_HOME"] = str(tmp_path / "inherited-home")
+    env.pop("HERMES_TEST_REAL_ROOT", None)
+    project_root = Path(__file__).resolve().parents[2]
+    pythonpath = str(project_root)
+    if env.get("PYTHONPATH"):
+        pythonpath += os.pathsep + env["PYTHONPATH"]
+    env["PYTHONPATH"] = pythonpath
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__).resolve()),
+            "-q",
+            "-k",
+            "test_codex_pool_ignores_stale_profile_shadow",
+        ],
+        cwd=project_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sentinel_auth.read_bytes() == before
+    assert [path.name for path in sentinel_root.iterdir()] == ["auth.json"]
+
+
+def test_codex_pool_write_targets_canonical_root_and_preserves_other_provider(profile_env):
+    """Codex writes rotate root state without mutating isolated providers."""
+    from hermes_cli.auth import write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "root-other", "access_token": "root"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local", "access_token": "stale"}],
+        "openrouter": [{"id": "profile-other", "access_token": "profile"}],
+    }))
+
+    write_credential_pool("openai-codex", [{"id": "fresh", "access_token": "new"}])
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    profile = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert root["credential_pool"]["openai-codex"][0]["id"] == "fresh"
+    assert profile["credential_pool"]["openai-codex"][0]["id"] == "stale-local"
+    assert profile["credential_pool"]["openrouter"][0]["id"] == "profile-other"
+
+
+def test_codex_pool_all_provider_read_removes_shadow_when_root_has_none(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "root-other"}],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{"id": "stale-local"}],
+    }))
+
+    assert "openai-codex" not in read_credential_pool(None)
+
+
+def test_codex_pool_stale_status_write_keeps_newer_token_generation(profile_env):
+    """A stale status snapshot must not restore a rotated refresh token."""
+    from hermes_cli.auth import write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "same-id", "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh", "last_refresh": "2026-09-04T19:00:00Z",
+        }],
+    }))
+    write_credential_pool("openai-codex", [{
+        "id": "same-id", "access_token": "stale-access",
+        "refresh_token": "stale-refresh", "last_refresh": "2026-09-04T18:00:00Z",
+        "last_status": "exhausted", "last_status_at": 2000,
+    }])
+
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    entry = root["credential_pool"]["openai-codex"][0]
+    assert entry["access_token"] == "fresh-access"
+    assert entry["refresh_token"] == "fresh-refresh"
+    assert entry["last_refresh"] == "2026-09-04T19:00:00Z"
 
 
 

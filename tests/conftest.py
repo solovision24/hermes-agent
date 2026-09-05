@@ -58,6 +58,15 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+_PRE_SANDBOX_HERMES_ROOT = os.environ.get("HERMES_ROOT", "").strip()
+# Preserve the externally supplied root only as a test safety boundary.  The
+# resolver must not see it during collection or any ordinary test: otherwise
+# an inherited root silently wins over the per-test HERMES_HOME sandbox.
+if _PRE_SANDBOX_HERMES_ROOT:
+    os.environ["HERMES_TEST_REAL_ROOT"] = _PRE_SANDBOX_HERMES_ROOT
+else:
+    os.environ.pop("HERMES_TEST_REAL_ROOT", None)
+os.environ.pop("HERMES_ROOT", None)
 if not os.environ.get("HERMES_HOME"):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
@@ -414,6 +423,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
+    # HERMES_ROOT is a process-level canonical-root override.  An inherited
+    # value must not bypass the per-test HERMES_HOME sandbox; the original
+    # value is retained separately in HERMES_TEST_REAL_ROOT for store guards.
+    monkeypatch.delenv("HERMES_ROOT", raising=False)
 
     # Honcho's fallback host/config resolution legitimately reads the user's
     # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend

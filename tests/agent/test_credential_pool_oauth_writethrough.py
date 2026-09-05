@@ -61,11 +61,18 @@ def profile_and_root(tmp_path, monkeypatch):
     root is allowed, so point HOME away from the tmp root to keep the guard
     from tripping on these fixtures.
     """
-    profile_path = tmp_path / "profiles" / "work" / "auth.json"
-    root_path = tmp_path / "root" / "auth.json"
+    profile_home = tmp_path / "profiles" / "work"
+    profile_path = profile_home / "auth.json"
+    root_home = tmp_path / "root"
+    root_path = root_home / "auth.json"
 
     monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
     monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    # Mirror production resolution: Codex uses HERMES_ROOT as the canonical
+    # root while profile-scoped state uses HERMES_HOME.  The implementation
+    # now deliberately routes Codex write-through through this resolver.
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_ROOT", str(root_home))
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
     return profile_path, root_path
 
