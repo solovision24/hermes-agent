@@ -1,4 +1,4 @@
-# Kanban Telegram isolation — round 4 preservation evidence
+# Kanban Telegram isolation — preservation evidence
 
 ## Summary
 
@@ -16,11 +16,13 @@ This candidate is based on the canonical SoLo fork operational-watcher PR branch
 
 - `gateway/kanban_watchers.py`: Telegram completion-artifact failures now propagate after the batch, causing the existing notifier failure path to rewind the claimed cursor. Partial uploads are deliberately retried rather than falsely marked delivered.
 - `tests/test_kanban_operational_sender.py`: symlink-to-system-path denial and partial artifact failure regression coverage.
+- `tests/gateway/test_kanban_notifier.py`: the real watcher matrix now records every Halo adapter send attempt before raising; missing-token, wrong-identity, transport retry, response-thread rejection, review delivery, and multipart retry cases assert zero Halo attempts after each tick. Done→reopen status routing and archive cleanup assertions remain covered.
 - Existing PR changes retain exact operational bot identity/destination/no-topic proof, real notifier-loop sender isolation, local-path validation, and Review lifecycle wake behavior.
 
 ## Verification
 
-- Focused notifier/sender suites: 18 passed.
+- Focused real watcher notifier suite: 20 passed.
+- The installed legacy notifier suite remains incompatible with the dedicated Telegram sender unless its old adapter-send fixtures are migrated to the transport boundary; its run was recorded as 50 passed, 8 failed, 1 skipped (failures are fixture expectations, not accepted as product proof).
 - `py_compile` for changed Python modules: passed.
 - `git diff --check`: passed.
 - Shared runtime: intentionally not switched, installed, or restarted; release authority remains the paired-release owner task.

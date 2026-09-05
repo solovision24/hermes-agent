@@ -19,8 +19,10 @@ class RecordingAdapter:
     def __init__(self):
         self.sent = []
         self.handled = []
+        self.outbound_attempts = []
 
     async def send(self, chat_id, text, metadata=None):
+        self.outbound_attempts.append((chat_id, text, metadata))
         raise AssertionError("Halo adapter must not send Kanban Telegram notices")
 
     async def handle_message(self, event):
@@ -634,6 +636,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 3
     assert len(adapter.handled) == 2
+    assert adapter.sent[1]["text"].endswith("→ ready")
+    assert "corrected completion" in adapter.sent[2]["text"]
 
     with kb.connect() as conn:
         subs = kb.list_notify_subs(conn, tid)
@@ -643,6 +647,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 3
+    assert len(adapter.handled) == 2
+    assert adapter.outbound_attempts == []
     with kb.connect() as conn:
         assert kb.list_notify_subs(conn, tid) == []
 
@@ -760,12 +766,14 @@ def test_real_notifier_fails_closed_before_wrong_identity_send(tmp_path, monkeyp
         return {"ok": True, "result": identity} if method == "getMe" else pytest.fail("send must not run")
 
     monkeypatch.setattr(operational_sender, "_api_call", fake_api)
-    runner = _make_runner(RecordingAdapter())
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
     _run_real_operational_tick(monkeypatch, runner)
     # The task-created event is cursor 1; the failed notification must
     # not advance beyond it.
     assert [method for method, _ in calls] == ["getMe"]
     assert _subscription_cursor(tid) == 1
+    assert adapter.outbound_attempts == []
 
 
 def test_real_notifier_missing_token_rewinds_without_halo_fallback(tmp_path, monkeypatch):
@@ -776,6 +784,7 @@ def test_real_notifier_missing_token_rewinds_without_halo_fallback(tmp_path, mon
     _run_real_operational_tick(monkeypatch, runner)
     assert _subscription_cursor(tid) == 1
     assert adapter.sent == []
+    assert adapter.outbound_attempts == []
 
 
 def test_real_notifier_rewinds_failed_transport_then_deduplicates(tmp_path, monkeypatch):
@@ -796,12 +805,16 @@ def test_real_notifier_rewinds_failed_transport_then_deduplicates(tmp_path, monk
                 "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
 
     monkeypatch.setattr(operational_sender, "_api_call", fake_api)
-    first = _make_runner(RecordingAdapter())
+    first_adapter = RecordingAdapter()
+    first = _make_runner(first_adapter)
     _run_real_operational_tick(monkeypatch, first)
     assert _subscription_cursor(tid) == 1
-    second = _make_runner(RecordingAdapter())
+    assert first_adapter.outbound_attempts == []
+    second_adapter = RecordingAdapter()
+    second = _make_runner(second_adapter)
     _run_real_operational_tick(monkeypatch, second)
     assert _subscription_cursor(tid) >= 2
+    assert second_adapter.outbound_attempts == []
     third = _make_runner(RecordingAdapter())
     _run_real_operational_tick(monkeypatch, third)
     assert len([m for m, _ in attempts if m == "sendMessage"]) == 2
@@ -832,6 +845,7 @@ def test_real_notifier_review_events_send_and_preserve_creator_wake(tmp_path, mo
     monkeypatch.setattr(operational_sender, "_api_call", fake_api)
     adapter = RecordingAdapter()
     _run_real_operational_tick(monkeypatch, _make_runner(adapter))
+    assert adapter.outbound_attempts == []
     assert _subscription_cursor(tid) >= 2
     assert [method for method, _ in operational_calls] == ["sendMessage", "sendMessage"]
     assert all(call[1]["chat_id"] == operational_sender.DEFAULT_CHAT_ID for call in operational_calls)
@@ -866,10 +880,12 @@ def test_real_notifier_rewinds_when_operational_response_has_thread(tmp_path, mo
                 "message_thread_id": 77}}
 
     monkeypatch.setattr(operational_sender, "_api_call", fake_api)
-    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    adapter = RecordingAdapter()
+    _run_real_operational_tick(monkeypatch, _make_runner(adapter))
 
     assert calls == ["getMe", "sendMessage"]
     assert _subscription_cursor(tid) == 1
+    assert adapter.outbound_attempts == []
 
 
 def test_real_notifier_rewinds_partial_multipart_batch_then_retries_and_deduplicates(
@@ -928,15 +944,19 @@ def test_real_notifier_rewinds_partial_multipart_batch_then_retries_and_deduplic
 
     monkeypatch.setattr(operational_sender, "_api_call", fake_api)
     monkeypatch.setattr(operational_sender, "urlopen", fake_urlopen)
-    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    first_adapter = RecordingAdapter()
+    _run_real_operational_tick(monkeypatch, _make_runner(first_adapter))
     # The task-creation event remains the durable cursor floor; the completed
     # event itself was rewound for retry.
     assert _subscription_cursor(tid) == 1
     assert len(document_attempts) == 2
+    assert first_adapter.outbound_attempts == []
 
-    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    second_adapter = RecordingAdapter()
+    _run_real_operational_tick(monkeypatch, _make_runner(second_adapter))
     assert len(document_attempts) == 4
     assert _subscription_cursor(tid) >= 2
+    assert second_adapter.outbound_attempts == []
 
     _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
     assert len(document_attempts) == 4
