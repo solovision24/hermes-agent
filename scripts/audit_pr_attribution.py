@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKIP_SUBSTRINGS = (
     "teknium",
     "noreply@github.com",
+    "agent@Agents-Mac-mini.local",
     "dependabot",
     "github-actions",
     "anthropic.com",
