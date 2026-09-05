@@ -628,6 +628,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     assert adapter.sent[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
     assert adapter.sent[0]["metadata"] == {}
     assert adapter.handled[0].source.thread_id == "origin-thread"
+    assert adapter.handled[0].source.profile == "reviewer"
     assert adapter.outbound_attempts == []
 
     with kb.connect() as conn:
@@ -651,6 +652,10 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 3
     assert len(adapter.handled) == 2
+    assert all(item["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+               for item in adapter.sent)
+    assert adapter.handled[-1].source.thread_id == "origin-thread"
+    assert adapter.handled[-1].source.profile == "reviewer"
     assert adapter.sent[1]["text"].endswith("→ ready")
     assert "corrected completion" in adapter.sent[2]["text"]
     assert adapter.outbound_attempts == []
