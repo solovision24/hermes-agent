@@ -2108,8 +2108,40 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
     return mapping
 
 
+def _merge_author_maps(legacy: dict, directory: dict) -> dict:
+    """Merge mappings with directory entries winning case-insensitively.
+
+    The directory is the conflict-free source of new mappings, while the
+    legacy map contains historical entries.  A case-only spelling difference
+    must not let a legacy entry win merely because dictionary keys compare
+    case-sensitively; that would make resolution differ across consumers.
+    """
+    directory_keys = {email.casefold() for email in directory}
+    merged = {
+        email: login
+        for email, login in legacy.items()
+        if email.casefold() not in directory_keys
+    }
+    merged.update(directory)
+    return merged
+
+
 # Effective map: frozen legacy dict + directory entries (directory wins).
-AUTHOR_MAP = {**LEGACY_AUTHOR_MAP, **_load_contributor_dir()}
+AUTHOR_MAP = _merge_author_maps(LEGACY_AUTHOR_MAP, _load_contributor_dir())
+
+
+def _lookup_author_map(email: str) -> str | None:
+    """Look up an author email without depending on filename casing.
+
+    Mapping filenames are commit-author emails, and historical repositories
+    contain mixed-case spellings.  Filesystems/CI treat these keys
+    case-insensitively, so release mention generation must do the same.
+    """
+    folded = email.casefold()
+    for mapped_email, login in AUTHOR_MAP.items():
+        if mapped_email.casefold() == folded:
+            return login
+    return None
 
 
 def git(*args, cwd=None):
@@ -2229,7 +2261,7 @@ def update_version_files(semver: str, calver_date: str):
 def resolve_author(name: str, email: str) -> str:
     """Resolve a git author to a GitHub @mention."""
     # Try email lookup first
-    gh_user = AUTHOR_MAP.get(email)
+    gh_user = _lookup_author_map(email)
     if gh_user:
         return f"@{gh_user}"
 

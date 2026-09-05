@@ -113,6 +113,249 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     assert "kanban_request_changes" in resolve_toolset("kanban")
 
 
+def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "0" * 40
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=525,
+            head_sha=head_sha,
+            title="Harden production access",
+            reviewer="orion",
+            url="https://github.com/SoLoVisionLLC/SoLoRecall/pull/525",
+            metadata={"branch": "codex/rls-fix"},
+        )
+        assert task_id is not None
+        task_before = kb.get_task(conn, task_id)
+        assert task_before is not None
+        body_before = task_before.body
+        assert kb.claim_review_task(conn, task_id, claimer="orion:1") is not None
+        review_run = kb.get_task(conn, task_id).current_run_id
+        assert review_run is not None
+
+        ok, implementer = kb.request_changes(
+            conn,
+            task_id,
+            reason="Add ownership predicates and two-user regressions",
+            expected_run_id=review_run,
+        )
+        assert (ok, implementer) == (True, "dev")
+        task_after = kb.get_task(conn, task_id)
+        assert task_after is not None
+        assert task_after.status == "ready"
+        assert task_after.assignee == "dev"
+        assert task_after.body == body_before
+        events = kb.list_events(conn, task_id)
+        assert [event for event in events if event.kind == "review_requested"] == []
+        changed = [event for event in events if event.kind == "changes_requested"][-1]
+        assert changed.payload is not None
+        assert changed.payload["implementer"] == "dev"
+        assert changed.payload["reviewer"] == "orion"
+        assert changed.payload["provenance"] == "github_pr_external_intake"
+        assert changed.payload["github_pr"]["head_sha"] == head_sha
+
+        # Replaying the identical webhook must not reverse the DEV fallback
+        # back to review/orion.  This is the same-head replay regression that
+        # protects queued remediation from webhook delivery retries.
+        assert kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=525,
+            head_sha=head_sha,
+            title="Harden production access",
+            reviewer="orion",
+            url="https://github.com/SoLoVisionLLC/SoLoRecall/pull/525",
+            metadata={"branch": "codex/rls-fix"},
+            action="synchronize",
+        ) == task_id
+        replayed = kb.get_task(conn, task_id)
+        assert replayed is not None
+        assert (replayed.status, replayed.assignee) == ("ready", "dev")
+
+        # DEV remediation uses the normal implementer -> review handoff. The
+        # next changes request must preserve that standard provenance.
+        dev_run = kb.claim_task(conn, task_id, claimer="dev:1")
+        assert dev_run is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="Ownership predicates and regressions added",
+            reviewer="orion",
+            expected_run_id=dev_run.current_run_id,
+        )
+        assert kb.claim_review_task(conn, task_id, claimer="orion:2") is not None
+        second_run = kb.get_task(conn, task_id).current_run_id
+        assert second_run is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Cover the null-owner sharing case",
+            expected_run_id=second_run,
+        ) == (True, "dev")
+
+
+def test_external_intake_replay_preserves_parent_wait_and_completed_states(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A same-head webhook cannot reopen queued or completed remediation."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "1" * 40
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="Upstream work", assignee="builder")
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=526,
+            head_sha=head_sha,
+            title="Replay safety",
+            reviewer="orion",
+        )
+        assert task_id is not None
+        assert kb.claim_review_task(conn, task_id, claimer="orion:1") is not None
+        kb.link_tasks(conn, parent_id, task_id)
+        claimed = kb.get_task(conn, task_id)
+        assert claimed is not None
+        review_run = claimed.current_run_id
+        assert review_run is not None
+        assert kb.request_changes(conn, task_id, reason="Needs rework", expected_run_id=review_run) == (True, "dev")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and (task.status, task.assignee) == ("todo", "dev")
+
+        # The parent is still incomplete, so a replay must preserve todo.
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=526,
+            head_sha=head_sha, title="Replay safety", reviewer="orion",
+            action="synchronize",
+        ) == task_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None and (task.status, task.assignee) == ("todo", "dev")
+
+        assert kb.complete_task(conn, parent_id, result="upstream complete")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert kb.complete_task(conn, task_id, result="remediation complete")
+
+        # A completed card is also immutable under delivery retries.
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=526,
+            head_sha=head_sha, title="Replay safety", reviewer="orion",
+            action="synchronize",
+        ) == task_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None and (task.status, task.assignee) == ("done", "dev")
+
+
+def test_external_draft_intake_promotes_when_marked_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A draft's same-head ready webhook promotes intake-owned triage only."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "2" * 40
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=527,
+            head_sha=head_sha,
+            title="Draft review",
+            reviewer="orion",
+            draft=True,
+        )
+        assert task_id is not None
+        draft_task = kb.get_task(conn, task_id)
+        assert draft_task is not None
+        assert (draft_task.status, draft_task.assignee) == ("triage", "orion")
+
+        assert kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=527,
+            head_sha=head_sha,
+            title="Draft review ready",
+            reviewer="orion",
+            draft=False,
+            action="synchronize",
+        ) == task_id
+        promoted = kb.get_task(conn, task_id)
+        assert promoted is not None
+        assert (promoted.status, promoted.assignee) == ("review", "orion")
+        assert promoted.title == "Review PR #527: Draft review ready"
+        ingests = [event for event in kb.list_events(conn, task_id) if event.kind == "github_pr_ingested"]
+        assert len(ingests) == 2
+        assert ingests[-1].payload is not None
+        assert ingests[-1].payload["draft"] is False
+
+
+def test_reopened_draft_intake_promotes_when_marked_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reopened draft's same-head ready webhook promotes intake triage."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "3" * 40
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened review", reviewer="orion",
+        )
+        assert task_id is not None
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened review", reviewer="orion",
+            action="closed",
+        ) == task_id
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened draft", reviewer="orion",
+            draft=True, action="reopened",
+        ) == task_id
+        triage = kb.get_task(conn, task_id)
+        assert triage is not None and triage.status == "triage"
+
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened review ready", reviewer="orion",
+            draft=False, action="synchronize",
+        ) == task_id
+        promoted = kb.get_task(conn, task_id)
+        assert promoted is not None
+        assert (promoted.status, promoted.assignee) == ("review", "orion")
+        events = kb.list_events(conn, task_id)
+        assert [event.kind for event in events].count("github_pr_reopened") == 1
+        assert events[-1].kind == "github_pr_ingested"
+
+
 def test_review_cli_round_trip_preserves_handoff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
