@@ -43,6 +43,29 @@ class DisconnectedAdapters(dict):
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            }}
+        delivery = {"message_id": 1,
+                    "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                             "username": operational_sender.EXPECTED_USERNAME,
+                             "is_bot": True},
+                    "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}
+        runner.adapters[Platform.TELEGRAM].sent.append({
+            "chat_id": operational_sender.DEFAULT_CHAT_ID,
+            "text": data.get("text", ""),
+            "metadata": {},
+        })
+        return {"ok": True, "result": delivery}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+
     async def fake_sleep(delay):
         if delay == 5:
             return None
@@ -50,11 +73,6 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(
-        operational_sender,
-        "send_operational_message",
-        runner.adapters[Platform.TELEGRAM].send_operational_message,
-    )
     await runner._kanban_notifier_watcher(interval=1)
 
 
