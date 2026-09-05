@@ -134,6 +134,7 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
 # --- Command dispatch ---
 
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
