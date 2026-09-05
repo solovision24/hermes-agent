@@ -4535,12 +4535,14 @@ def ingest_pull_request(
                     conn.execute("UPDATE tasks SET title=?, body=? WHERE id=?", (desired_title, body, task_id))
                     _append_event(conn, task_id, "github_pr_metadata_updated", details)
                 return task_id
-            if (same_head["title"] == desired_title and same_head["body"] == body
-                    and same_head["assignee"] == desired_assignee and same_head["status"] == status):
-                return task_id
-            conn.execute("UPDATE tasks SET title=?, body=?, assignee=?, status=? WHERE id=?",
-                         (desired_title, body, desired_assignee, status, task_id))
-            _append_event(conn, task_id, "github_pr_ingested", details)
+            # A replay of the same immutable head must also never undo a
+            # downstream disposition.  In particular, the changes-requested
+            # fallback intentionally leaves the card ready (or todo while a
+            # parent is unfinished) for DEV, and a completed card must remain
+            # completed.  Reapplying the intake's desired review/orion state
+            # here would steal queued remediation or reopen finished work.
+            # Archived heads are handled above; every other existing status is
+            # an established lifecycle decision that the webhook must preserve.
             return task_id
 
         for row in active_rows:

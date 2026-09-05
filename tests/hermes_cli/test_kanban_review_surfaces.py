@@ -165,6 +165,24 @@ def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
         assert changed.payload["provenance"] == "github_pr_external_intake"
         assert changed.payload["github_pr"]["head_sha"] == head_sha
 
+        # Replaying the identical webhook must not reverse the DEV fallback
+        # back to review/orion.  This is the same-head replay regression that
+        # protects queued remediation from webhook delivery retries.
+        assert kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=525,
+            head_sha=head_sha,
+            title="Harden production access",
+            reviewer="orion",
+            url="https://github.com/SoLoVisionLLC/SoLoRecall/pull/525",
+            metadata={"branch": "codex/rls-fix"},
+            action="synchronize",
+        ) == task_id
+        replayed = kb.get_task(conn, task_id)
+        assert replayed is not None
+        assert (replayed.status, replayed.assignee) == ("ready", "dev")
+
         # DEV remediation uses the normal implementer -> review handoff. The
         # next changes request must preserve that standard provenance.
         dev_run = kb.claim_task(conn, task_id, claimer="dev:1")
@@ -185,6 +203,64 @@ def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
             reason="Cover the null-owner sharing case",
             expected_run_id=second_run,
         ) == (True, "dev")
+
+
+def test_external_intake_replay_preserves_parent_wait_and_completed_states(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A same-head webhook cannot reopen queued or completed remediation."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "1" * 40
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="Upstream work", assignee="builder")
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=526,
+            head_sha=head_sha,
+            title="Replay safety",
+            reviewer="orion",
+        )
+        assert task_id is not None
+        assert kb.claim_review_task(conn, task_id, claimer="orion:1") is not None
+        kb.link_tasks(conn, parent_id, task_id)
+        claimed = kb.get_task(conn, task_id)
+        assert claimed is not None
+        review_run = claimed.current_run_id
+        assert review_run is not None
+        assert kb.request_changes(conn, task_id, reason="Needs rework", expected_run_id=review_run) == (True, "dev")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and (task.status, task.assignee) == ("todo", "dev")
+
+        # The parent is still incomplete, so a replay must preserve todo.
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=526,
+            head_sha=head_sha, title="Replay safety", reviewer="orion",
+            action="synchronize",
+        ) == task_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None and (task.status, task.assignee) == ("todo", "dev")
+
+        assert kb.complete_task(conn, parent_id, result="upstream complete")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert kb.complete_task(conn, task_id, result="remediation complete")
+
+        # A completed card is also immutable under delivery retries.
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=526,
+            head_sha=head_sha, title="Replay safety", reviewer="orion",
+            action="synchronize",
+        ) == task_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None and (task.status, task.assignee) == ("done", "dev")
 
 
 def test_review_cli_round_trip_preserves_handoff(
