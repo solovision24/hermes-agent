@@ -899,14 +899,25 @@ class CredentialPool:
                     "last_error_message": None,
                     "last_error_reset_at": None,
                 }
+                supported_fields = {field_def.name for field_def in fields(entry)}
+                extra = dict(entry.extra or {})
                 for field in auth_mod._CODEX_GENERATION_FIELDS:
                     if field in {"access_token", "refresh_token"}:
                         continue
                     if field == "last_refresh":
                         if "last_refresh" in state:
-                            field_updates[field] = state["last_refresh"]
+                            value = state["last_refresh"]
+                        else:
+                            continue
                     elif field in tokens:
-                        field_updates[field] = tokens[field]
+                        value = tokens[field]
+                    else:
+                        continue
+                    if field in supported_fields:
+                        field_updates[field] = value
+                    else:
+                        extra[field] = value
+                field_updates["extra"] = extra
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
                 self._persist(

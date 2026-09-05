@@ -39,6 +39,96 @@ def _jwt_with_claims(claims: dict) -> str:
 
 
 
+@pytest.mark.parametrize("stale_status", ["dead", "exhausted"])
+def test_public_selection_resyncs_fresh_codex_login_metadata(
+    tmp_path, monkeypatch, stale_status
+):
+    """A fresh login revives stale entries and retains non-dataclass metadata."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    old_entry = {
+        "id": "codex-login",
+        "label": "synthetic-login",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "device_code",
+        "access_token": "SYNTHETIC_OLD_ACCESS",
+        "refresh_token": "SYNTHETIC_OLD_REFRESH",
+        "last_refresh": "SYNTHETIC_OLD_GENERATION",
+        "expires_at": "2000-01-01T00:00:00Z",
+        "expires_at_ms": 946684800000,
+        "token_type": "OldBearer",
+        "scope": "old-scope",
+        "last_status": stale_status,
+        "last_status_at": time.time(),
+        "last_error_code": 401,
+        "last_error_reason": "token_invalidated",
+        "last_error_reset_at": time.time() + 86400,
+    }
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "SYNTHETIC_OLD_ACCESS",
+                        "refresh_token": "SYNTHETIC_OLD_REFRESH",
+                        "expires_at": "2000-01-01T00:00:00Z",
+                        "expires_at_ms": 946684800000,
+                        "token_type": "OldBearer",
+                        "scope": "old-scope",
+                    },
+                    "last_refresh": "SYNTHETIC_OLD_GENERATION",
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [old_entry],
+                "openrouter": [
+                    {
+                        "id": "other-provider",
+                        "source": "manual",
+                        "access_token": "SYNTHETIC_OTHER_PROVIDER",
+                    }
+                ],
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import _save_codex_tokens
+
+    pool = load_pool("openai-codex")
+    assert pool.entries()[0].last_status == stale_status
+    _save_codex_tokens(  # type: ignore[arg-type]
+        {
+            "access_token": "SYNTHETIC_FRESH_ACCESS",
+            "refresh_token": "SYNTHETIC_FRESH_REFRESH",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "expires_at_ms": 4070908800000,
+            "token_type": "Bearer",
+            "scope": "synthetic",
+        },
+        last_refresh="SYNTHETIC_FRESH_GENERATION",
+    )
+
+    selected = pool.select()
+
+    assert selected is not None
+    assert selected.id == "codex-login"
+    assert selected.access_token == "SYNTHETIC_FRESH_ACCESS"
+    assert selected.refresh_token == "SYNTHETIC_FRESH_REFRESH"
+    assert selected.last_status is None
+    assert selected.expires_at_ms == 4070908800000
+    assert selected.last_refresh == "SYNTHETIC_FRESH_GENERATION"
+    assert selected.extra["token_type"] == "Bearer"
+    assert selected.extra["scope"] == "synthetic"
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert persisted["credential_pool"]["openrouter"][0]["access_token"] == (
+        "SYNTHETIC_OTHER_PROVIDER"
+    )
+
+
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     # Prevent auto-seeding from Codex CLI tokens on the host
