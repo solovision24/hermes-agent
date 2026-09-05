@@ -841,52 +841,42 @@ class CredentialPool:
             return entry
         try:
             auth_path = auth_mod._codex_auth_file_path()
+            # Keep read, adoption, and persistence under one canonical lock.
+            # A concurrent login must not advance the singleton to C and then
+            # have this older observed pool generation B overwrite it.
             with _auth_store_lock(target_path=auth_path):
                 auth_store = _load_auth_store(auth_path)
                 state = _load_provider_state(auth_store, "openai-codex")
-            if not isinstance(state, dict):
-                return entry
-            tokens = state.get("tokens")
-            if not isinstance(tokens, dict):
-                return entry
-            store_access = tokens.get("access_token", "")
-            store_refresh = tokens.get("refresh_token", "")
-            # Adopt auth.json tokens when either side differs.  Codex refresh
-            # tokens are single-use too, so a fresh refresh_token from
-            # another process means our entry's pair is consumed/stale.
-            #
-            # Also adopt when the store has a refresh_token but no
-            # access_token — another process may have rotated the pair
-            # and the store entry's access_token was already consumed;
-            # the important signal is the refresh_token difference.
-            entry_access = entry.access_token or ""
-            entry_refresh = entry.refresh_token or ""
-            should_adopt = False
-            if store_access and (
-                store_access != entry_access
-                or (store_refresh and store_refresh != entry_refresh)
-            ):
-                should_adopt = True
-            elif (
-                store_refresh
-                and store_refresh != entry_refresh
-                and not store_access
-            ):
-                # Store has only a refresh_token (no access_token) —
-                # another process rotated the pair.  Adopt the
-                # refresh_token so we don't replay the consumed one.
-                logger.info(
-                    "Pool entry %s: auth.json has newer refresh_token "
-                    "but no access_token; adopting refresh_token to "
-                    "avoid replaying consumed token",
-                    entry.id,
+                if not isinstance(state, dict):
+                    return entry
+                tokens = state.get("tokens")
+                if not isinstance(tokens, dict):
+                    return entry
+                store_access = tokens.get("access_token", "")
+                store_refresh = tokens.get("refresh_token", "")
+                entry_access = entry.access_token or ""
+                entry_refresh = entry.refresh_token or ""
+                should_adopt = bool(
+                    store_access
+                    and (
+                        store_access != entry_access
+                        or (store_refresh and store_refresh != entry_refresh)
+                    )
                 )
-                should_adopt = True
-
-            if should_adopt:
+                if (
+                    store_refresh
+                    and store_refresh != entry_refresh
+                    and not store_access
+                ):
+                    logger.info(
+                        "Pool entry %s: auth.json has newer refresh_token but no access_token; adopting refresh_token",
+                        entry.id,
+                    )
+                    should_adopt = True
+                if not should_adopt:
+                    return entry
                 logger.debug(
-                    "Pool entry %s: syncing Codex tokens from auth.json "
-                    "(refreshed by another process)",
+                    "Pool entry %s: syncing Codex tokens from auth.json (refreshed by another process)",
                     entry.id,
                 )
                 field_updates: Dict[str, Any] = {
@@ -904,27 +894,17 @@ class CredentialPool:
                 for field in auth_mod._CODEX_GENERATION_FIELDS:
                     if field in {"access_token", "refresh_token"}:
                         continue
-                    if field == "last_refresh":
-                        if "last_refresh" in state:
-                            value = state["last_refresh"]
-                        else:
-                            continue
-                    elif field in tokens:
-                        value = tokens[field]
-                    else:
-                        continue
+                    value = state.get("last_refresh") if field == "last_refresh" else tokens.get(field)
                     if field in supported_fields:
                         field_updates[field] = value
+                    elif value is None:
+                        extra.pop(field, None)
                     else:
                         extra[field] = value
                 field_updates["extra"] = extra
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
-                self._persist(
-                    replaced_ids=[updated.id]
-                    if self.provider == "openai-codex"
-                    else None
-                )
+                self._persist(replaced_ids=[updated.id])
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
