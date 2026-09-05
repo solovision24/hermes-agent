@@ -65,51 +65,77 @@ def test_directory_mapping_wins_over_case_only_legacy_key():
 
 
 def test_all_consumers_resolve_common_mixed_case_fixture(tmp_path, monkeypatch):
-    """The CI, audit, and release lookup paths agree on one fixture."""
+    """The CI, audit, and release lookup paths agree on one fixture.
+
+    Keep the positives distinct so a consumer that silently drops either the
+    directory or legacy source cannot pass this common-fixture regression.
+    """
     scripts = tmp_path / "scripts"
     emails = tmp_path / "contributors" / "emails"
     scripts.mkdir()
     emails.mkdir(parents=True)
-    (emails / "Owner@Example.com").write_text("directory-owner\n", encoding="utf-8")
+    (emails / "DirOnly@Example.com").write_text("directory-owner\n", encoding="utf-8")
+    (emails / "Overlap@Example.com").write_text("directory-overlap\n", encoding="utf-8")
     (scripts / "release.py").write_text(
-        'AUTHOR_MAP = {"owner@example.com": "legacy-owner"}\n', encoding="utf-8"
+        'AUTHOR_MAP = {"LegacyOnly@Example.net": "legacy-owner", '
+        '"overlap@example.com": "legacy-overlap"}\n', encoding="utf-8"
     )
     monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
-    assert audit.is_mapped("OWNER@EXAMPLE.COM")
-    for email in ("literal*gmail@example.com", "literal[gmail@example.com", "ordinary@example.com"):
+    positives = (
+        "dironly@example.com", "LEGACYONLY@example.NET", "overlap@example.com",
+    )
+    assert all(audit.is_mapped(email) for email in positives)
+    for email in ("*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com"):
         assert not audit.is_mapped(email)
 
     merged = release._merge_author_maps(
-        {"owner@example.com": "legacy-owner"},
-        {"Owner@Example.com": "directory-owner"},
+        {"LegacyOnly@Example.net": "legacy-owner", "overlap@example.com": "legacy-overlap"},
+        {"DirOnly@Example.com": "directory-owner", "Overlap@Example.com": "directory-overlap"},
     )
     monkeypatch.setattr(release, "AUTHOR_MAP", merged)
-    assert release.resolve_author("Author", "owner@EXAMPLE.com") == "@directory-owner"
-    assert release._lookup_author_map("ordinary@example.com") is None
+    assert release.resolve_author("Author", "DIRONLY@EXAMPLE.COM") == "@directory-owner"
+    assert release.resolve_author("Author", "legacyonly@EXAMPLE.net") == "@legacy-owner"
+    assert release.resolve_author("Author", "overlap@EXAMPLE.COM") == "@directory-overlap"
+    for email in ("*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com"):
+        assert release._lookup_author_map(email) is None
 
-    # Execute the same fixed-string CI predicate used by the workflow.  This
-    # catches glob interpretation regressions that source-text assertions miss.
+    # Execute the predicate directly from the workflow so this test cannot
+    # drift into validating a copied shell fragment.
+    workflow = (REPO_ROOT / ".github" / "workflows" / "contributor-check.yml").read_text(
+        encoding="utf-8"
+    )
+    predicate = workflow.split('          while IFS= read -r email; do\n', 1)[1].split(
+        '          done <<< "$NEW_EMAILS"\n', 1
+    )[0]
+    predicate = "while IFS= read -r email; do\n" + predicate + 'done <<< "$NEW_EMAILS"\n'
+    predicate = "\n".join(line[10:] if line.startswith("          ") else line
+                             for line in predicate.splitlines()) + "\n"
     proc = subprocess.run(
-        ["bash", "-c", """
-        missing=()
-        for email in "$@"; do
-          case "$email" in
-            *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*) continue ;;
-          esac
-          if find contributors/emails -maxdepth 1 -type f -printf '%f\\n' | grep -Fxi -- "$email" | grep -q .; then continue; fi
-          if grep -iFq -- "\\\"${email}\\\"" scripts/release.py 2>/dev/null; then continue; fi
-          missing+=("$email")
-        done
-        printf '%s\\n' "${missing[@]}"
-        test "${#missing[@]}" -eq 3
-        """, "ci-check", "OWNER@EXAMPLE.COM", "literal*gmail@example.com",
-         "literal[gmail@example.com", "ordinary@example.com"],
+        ["bash", "-c", "MISSING=''\nNEW_EMAILS=$1\n" + predicate
+         + "printf '%b' \"$MISSING\"\n", "ci-check",
+         "DIRONLY@example.com\nLEGACYONLY@EXAMPLE.NET\noverlap@example.com\n"
+         "*@example.com\n[Oo]verlap@Example.com\nordinary@example.com"],
         cwd=tmp_path, capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.splitlines() == [
-        "literal*gmail@example.com", "literal[gmail@example.com", "ordinary@example.com"
-    ]
+    assert all(f"  {email} (" in proc.stdout for email in (
+        "*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com",
+    ))
+    assert all(email not in proc.stdout for email in positives)
+
+
+def test_attribution_audit_rejects_email_named_directory(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"
+    emails = tmp_path / "contributors" / "emails"
+    scripts.mkdir()
+    emails.mkdir(parents=True)
+    (emails / "not-a-mapping@example.com").mkdir()
+    (emails / "real-mapping@example.com").write_text("real-user\n", encoding="utf-8")
+    (scripts / "release.py").write_text("AUTHOR_MAP = {}\n", encoding="utf-8")
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+
+    assert not audit.is_mapped("NOT-A-MAPPING@example.com")
+    assert audit.is_mapped("REAL-MAPPING@example.com")
 
 
 def test_resolve_author_matches_mapping_email_case_insensitively(monkeypatch):
