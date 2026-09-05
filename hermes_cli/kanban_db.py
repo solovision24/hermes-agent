@@ -6823,21 +6823,57 @@ def request_changes(
             "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
+        external_fallback = False
+        external_provenance = None
         if requested_event is None:
-            return False, "no prior review_requested event"
-        try:
-            requested_payload = (
-                json.loads(requested_event["payload"])
-                if requested_event["payload"]
-                else {}
-            )
-        except (json.JSONDecodeError, TypeError):
+            github_event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'github_pr_ingested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                github_payload = (
+                    json.loads(github_event["payload"])
+                    if github_event and github_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                github_payload = {}
+            if (
+                isinstance(github_payload, dict)
+                and github_payload.get("adapter") == "github_pr_native_ingest"
+                and github_payload.get("source") == "github_pull_request"
+                and isinstance(github_payload.get("repository"), str)
+                and isinstance(github_payload.get("number"), int)
+                and isinstance(github_payload.get("head_sha"), str)
+            ):
+                external_fallback = True
+                external_provenance = {
+                    key: github_payload.get(key)
+                    for key in ("repository", "number", "head_sha", "url")
+                    if github_payload.get(key) is not None
+                }
+            else:
+                return False, "no prior review_requested event"
+        if external_fallback:
             requested_payload = {}
+        else:
+            try:
+                requested_payload = (
+                    json.loads(requested_event["payload"])
+                    if requested_event and requested_event["payload"]
+                    else {}
+                )
+            except (json.JSONDecodeError, TypeError):
+                requested_payload = {}
         if not isinstance(requested_payload, dict):
             requested_payload = {}
         implementer = requested_payload.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():
-            return False, "review handoff has no valid implementer provenance"
+            if not external_fallback:
+                return False, "review handoff has no valid implementer provenance"
+            implementer = _canonical_assignee("dev")
         reviewer = task_row["assignee"]
         if isinstance(reviewer, str) and reviewer.strip():
             reviewer = _canonical_assignee(reviewer)
@@ -6879,6 +6915,14 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **(
+                    {
+                        "provenance": "github_pr_external_intake",
+                        "github_pr": external_provenance,
+                    }
+                    if external_fallback
+                    else {}
+                ),
             },
             run_id=run_id,
         )

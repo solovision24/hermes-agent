@@ -113,6 +113,80 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     assert "kanban_request_changes" in resolve_toolset("kanban")
 
 
+def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "0" * 40
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=525,
+            head_sha=head_sha,
+            title="Harden production access",
+            reviewer="orion",
+            url="https://github.com/SoLoVisionLLC/SoLoRecall/pull/525",
+            metadata={"branch": "codex/rls-fix"},
+        )
+        assert task_id is not None
+        task_before = kb.get_task(conn, task_id)
+        assert task_before is not None
+        body_before = task_before.body
+        assert kb.claim_review_task(conn, task_id, claimer="orion:1") is not None
+        review_run = kb.get_task(conn, task_id).current_run_id
+        assert review_run is not None
+
+        ok, implementer = kb.request_changes(
+            conn,
+            task_id,
+            reason="Add ownership predicates and two-user regressions",
+            expected_run_id=review_run,
+        )
+        assert (ok, implementer) == (True, "dev")
+        task_after = kb.get_task(conn, task_id)
+        assert task_after is not None
+        assert task_after.status == "ready"
+        assert task_after.assignee == "dev"
+        assert task_after.body == body_before
+        events = kb.list_events(conn, task_id)
+        assert [event for event in events if event.kind == "review_requested"] == []
+        changed = [event for event in events if event.kind == "changes_requested"][-1]
+        assert changed.payload is not None
+        assert changed.payload["implementer"] == "dev"
+        assert changed.payload["reviewer"] == "orion"
+        assert changed.payload["provenance"] == "github_pr_external_intake"
+        assert changed.payload["github_pr"]["head_sha"] == head_sha
+
+        # DEV remediation uses the normal implementer -> review handoff. The
+        # next changes request must preserve that standard provenance.
+        dev_run = kb.claim_task(conn, task_id, claimer="dev:1")
+        assert dev_run is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="Ownership predicates and regressions added",
+            reviewer="orion",
+            expected_run_id=dev_run.current_run_id,
+        )
+        assert kb.claim_review_task(conn, task_id, claimer="orion:2") is not None
+        second_run = kb.get_task(conn, task_id).current_run_id
+        assert second_run is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Cover the null-owner sharing case",
+            expected_run_id=second_run,
+        ) == (True, "dev")
+
+
 def test_review_cli_round_trip_preserves_handoff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
