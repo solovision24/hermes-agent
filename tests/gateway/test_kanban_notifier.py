@@ -19,9 +19,23 @@ class RecordingAdapter:
     def __init__(self):
         self.sent = []
         self.handled = []
+        self.outbound_attempts = []
 
     async def send(self, chat_id, text, metadata=None):
+        self.outbound_attempts.append(("send", chat_id, text, metadata))
         raise AssertionError("Halo adapter must not send Kanban Telegram notices")
+
+    async def send_multiple_images(self, **kwargs):
+        self.outbound_attempts.append(("send_multiple_images", kwargs))
+        raise AssertionError("Halo adapter must not send Kanban Telegram artifacts")
+
+    async def send_video(self, **kwargs):
+        self.outbound_attempts.append(("send_video", kwargs))
+        raise AssertionError("Halo adapter must not send Kanban Telegram artifacts")
+
+    async def send_document(self, **kwargs):
+        self.outbound_attempts.append(("send_document", kwargs))
+        raise AssertionError("Halo adapter must not send Kanban Telegram artifacts")
 
     async def handle_message(self, event):
         self.handled.append(event)
@@ -820,3 +834,100 @@ def test_real_notifier_rewinds_partial_multipart_batch_then_retries_and_deduplic
 
     _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
     assert len(document_attempts) == 4
+
+
+def _seed_review_handoff(db_path, monkeypatch, *, kind="review_requested",
+                         delivery_mode="notify+wake"):
+    """Create a wake-worthy handoff using the persisted subscription path."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review continuation", assignee="worker",
+                             session_id="agent:main:telegram:dm:origin-chat")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="origin-chat",
+                          thread_id="origin-thread", chat_type="dm",
+                          notifier_profile=None)
+        kb._append_event(conn, tid, kind, {"summary": "PR ready: https://example.invalid/pr/7",
+                                           "reason": "needs review"})
+    return tid
+
+
+def test_notifier_subscription_survives_done_reopen_until_archive(tmp_path, monkeypatch):
+    """Completion is reversible; archive, not done, ends notification ownership."""
+    tid = _seed_review_handoff(tmp_path / "done-reopen-archive.db", monkeypatch, kind="completed")
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.outbound_attempts == []
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        kb._append_event(conn, tid, "completed", {"summary": "corrected completion"})
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 3
+    assert len(adapter.handled) == 2
+    with kb.connect() as conn:
+        assert kb.archive_task(conn, tid)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn, tid) == []
+
+
+def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
+    """Review handoffs ping operations and wake the exact origin session."""
+    tid = _seed_review_handoff(tmp_path / "review-wake.db", monkeypatch)
+    adapter = RecordingAdapter()
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 1,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    _run_real_operational_tick(monkeypatch, _make_runner(adapter))
+    assert len(adapter.handled) == 1
+    assert tid in adapter.handled[0].text
+    assert adapter.outbound_attempts == []
+
+
+def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
+    """Triage escalation preserves the origin wake rather than only pinging."""
+    tid = _seed_review_handoff(tmp_path / "triage-wake.db", monkeypatch, kind="block_loop_detected")
+    with kb.connect() as conn:
+        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind=?",
+                     ('{"reason":"needs credentials","kind":"needs_input","recurrences":2,"limit":2}',
+                      tid, "block_loop_detected"))
+        conn.commit()
+    adapter = RecordingAdapter()
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 2,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    _run_real_operational_tick(monkeypatch, _make_runner(adapter))
+    assert len(adapter.handled) == 1
+    assert tid in adapter.handled[0].text
+    assert adapter.outbound_attempts == []
+
+
+def test_review_requested_does_not_wake_a_notify_only_subscription(tmp_path, monkeypatch):
+    """The delivery mode controls wake behavior independently of the ping."""
+    _seed_review_handoff(tmp_path / "review-notify.db", monkeypatch, delivery_mode="notify")
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert adapter.outbound_attempts == []
