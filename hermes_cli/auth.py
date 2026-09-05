@@ -954,6 +954,43 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
 
+def _pytest_protected_auth_paths() -> tuple[Path, ...]:
+    """Return auth stores that tests must never read or write.
+
+    ``tests/conftest.py`` captures an inherited ``HERMES_ROOT`` before
+    collection and stores it in ``HERMES_TEST_REAL_ROOT``.  Keep that root in
+    the runtime seat belt even after the test environment rewires
+    ``HERMES_HOME``; otherwise a profile-shaped test could still reach the
+    externally supplied canonical store.  The active ``HERMES_ROOT`` is not
+    automatically denied because tests may deliberately point it at a
+    disposable synthetic root.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return ()
+    home_env = os.environ.get("HOME", "").strip()
+    roots = [
+        (Path(home_env).expanduser() if home_env else Path.home()) / ".hermes"
+    ]
+    captured_root = os.environ.get("HERMES_TEST_REAL_ROOT", "").strip()
+    if captured_root:
+        roots.append(Path(captured_root).expanduser())
+    protected: list[Path] = []
+    for root in roots:
+        try:
+            protected.append((root / "auth.json").resolve(strict=False))
+        except Exception:
+            protected.append(root / "auth.json")
+    return tuple(protected)
+
+
+def _is_pytest_protected_auth_path(path: Path) -> bool:
+    """Whether *path* is a captured or currently real pytest auth store."""
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    return any(resolved == protected for protected in _pytest_protected_auth_paths())
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
@@ -962,12 +999,11 @@ def _auth_file_path() -> Path:
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
         try:
             resolved = path.resolve(strict=False)
         except Exception:
             resolved = path
-        if resolved == real_home_auth:
+        if _is_pytest_protected_auth_path(resolved):
             raise RuntimeError(
                 f"Refusing to touch real user auth store during test run: {path}. "
                 "Set HERMES_HOME to a tmp_path in your test fixture, or run "
@@ -1026,15 +1062,8 @@ def _load_global_auth_store() -> Dict[str, Any]:
     global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
         return {}
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return {}
-            except Exception:
-                pass
+    if _is_pytest_protected_auth_path(global_path):
+        return {}
     try:
         return _load_auth_store(global_path)
     except Exception:
@@ -4606,15 +4635,8 @@ def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
     # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
     # (mirrors the read-side guard in _load_global_auth_store). Uses the
     # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return
-            except Exception:
-                return
+    if _is_pytest_protected_auth_path(global_path):
+        return
     try:
         _persist_provider_state_to_store(
             "xai-oauth",

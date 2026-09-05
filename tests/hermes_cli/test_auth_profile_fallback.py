@@ -12,6 +12,9 @@ authenticated only at the global root.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -216,6 +219,57 @@ def test_codex_pool_ignores_stale_profile_shadow(profile_env):
     assert [entry["id"] for entry in read_credential_pool("openai-codex")] == ["canonical"]
     assert [entry["id"] for entry in read_credential_pool("openrouter")] == ["profile-other"]
     assert [entry["id"] for entry in read_credential_pool(None)["openai-codex"]] == ["canonical"]
+
+
+def test_pytest_subprocess_sandboxes_inherited_hermes_root(tmp_path):
+    """An inherited canonical-root override cannot escape the test sandbox."""
+    sentinel_root = tmp_path / "external-root"
+    sentinel_root.mkdir()
+    sentinel_auth = sentinel_root / "auth.json"
+    sentinel_auth.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openai-codex": [{"id": "external-sentinel"}]
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    before = sentinel_auth.read_bytes()
+
+    env = dict(os.environ)
+    env["HERMES_ROOT"] = str(sentinel_root)
+    env["HERMES_HOME"] = str(tmp_path / "inherited-home")
+    env.pop("HERMES_TEST_REAL_ROOT", None)
+    project_root = Path(__file__).resolve().parents[2]
+    pythonpath = str(project_root)
+    if env.get("PYTHONPATH"):
+        pythonpath += os.pathsep + env["PYTHONPATH"]
+    env["PYTHONPATH"] = pythonpath
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(Path(__file__).resolve()),
+            "-q",
+            "-k",
+            "test_codex_pool_ignores_stale_profile_shadow",
+        ],
+        cwd=project_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert sentinel_auth.read_bytes() == before
+    assert [path.name for path in sentinel_root.iterdir()] == ["auth.json"]
 
 
 def test_codex_pool_write_targets_canonical_root_and_preserves_other_provider(profile_env):
