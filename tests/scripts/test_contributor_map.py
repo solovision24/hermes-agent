@@ -6,6 +6,7 @@ AUTHOR_MAP dict in scripts/release.py is frozen; release.py merges both at
 import time with the directory winning on duplicates.
 """
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,14 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import release  # noqa: E402
 from add_contributor import add_contributor, read_mapping_file  # noqa: E402
+
+
+AUDIT_PATH = SCRIPTS_DIR / "audit_pr_attribution.py"
+_audit_spec = importlib.util.spec_from_file_location("audit_pr_attribution", AUDIT_PATH)
+if _audit_spec is None or _audit_spec.loader is None:
+    raise RuntimeError("could not load audit_pr_attribution")
+audit = importlib.util.module_from_spec(_audit_spec)
+_audit_spec.loader.exec_module(audit)
 
 
 # ── directory loader behavior ─────────────────────────────────────────
@@ -50,6 +59,38 @@ def test_resolve_author_matches_mapping_email_case_insensitively(monkeypatch):
     monkeypatch.setattr(release, "AUTHOR_MAP", {"agent@Agents-Mac-mini.local": "momomojo"})
 
     assert release.resolve_author("Agent", "agent@agents-Mac-mini.local") == "@momomojo"
+
+
+def test_attribution_audit_matches_legacy_email_case_insensitively(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (tmp_path / "contributors" / "emails").mkdir(parents=True)
+    (scripts / "release.py").write_text(
+        'AUTHOR_MAP = {"DECLANBATESMITH@OUTLOOK.COM": "cat-thats-fat"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    assert audit.is_mapped("declanbatesmith@outlook.com")
+
+
+def test_attribution_audit_rejects_unmapped_literal_controls(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"
+    emails = tmp_path / "contributors" / "emails"
+    scripts.mkdir()
+    emails.mkdir(parents=True)
+    (scripts / "release.py").write_text("AUTHOR_MAP = {}\n", encoding="utf-8")
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    for email in ("literal*gmail@example.com", "literal[gmail@example.com", "ordinary@example.com"):
+        assert not audit.is_mapped(email)
+
+
+def test_ci_lookup_controls_are_literal_and_case_insensitive():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "contributor-check.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "grep -Fxi -- \"$email\"" in workflow
+    assert "grep -iFq -- \"\\\"${email}\\\"\"" in workflow
+    assert "find contributors/emails -iname \"$email\"" not in workflow
 
 
 @pytest.mark.parametrize("email", ["literal*gmail@example.com", "literal[gmail@example.com"])
