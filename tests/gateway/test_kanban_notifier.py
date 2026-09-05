@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 
@@ -721,3 +722,97 @@ def test_real_notifier_review_events_send_and_preserve_creator_wake(tmp_path, mo
     assert adapter.sent == []
     assert len(adapter.handled) == 1
     assert "review requested" in adapter.handled[0].text.lower()
+
+
+def test_real_notifier_rewinds_when_operational_response_has_thread(tmp_path, monkeypatch):
+    """Telegram must reject a response that leaks topic/thread routing."""
+    tid = _seed_event(tmp_path / "thread-proof.db", monkeypatch)
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    calls = []
+
+    def fake_api(_token, method, data):
+        calls.append(method)
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 9,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID},
+                "message_thread_id": 77}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+
+    assert calls == ["getMe", "sendMessage"]
+    assert _subscription_cursor(tid) == 1
+
+
+def test_real_notifier_rewinds_partial_multipart_batch_then_retries_and_deduplicates(
+    tmp_path, monkeypatch,
+):
+    """A failed artifact in a real loop rewinds text and the whole batch.
+
+    Replaying an already-uploaded artifact is intentional: the cursor is the
+    idempotency boundary, and advancing it after a partial batch would lose
+    the remaining artifact permanently.
+    """
+    db_path = tmp_path / "partial-multipart.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("first")
+    second.write_text("second")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="artifact batch", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="ignored")
+        kb._append_event(conn, tid, "completed", {"summary": "done",
+                                                    "artifacts": [str(first), str(second)]})
+
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+    document_attempts = []
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
+                    "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        return {"ok": True, "result": {"message_id": 10,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return (b'{"ok": true, "result": {"message_id": 11, '
+                    b'"from": {"id": 8611668567, "username": "solo_hermes_bot", "is_bot": true}, '
+                    b'"chat": {"id": "8148316720"}}}')
+
+    def fake_urlopen(request, timeout=20):
+        document_attempts.append(request.full_url)
+        # The first file reaches Telegram; the second fails. The next tick
+        # retries both files after the notifier rewinds the claimed event.
+        if len(document_attempts) == 2:
+            raise URLError("second document unavailable")
+        return Response()
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    monkeypatch.setattr(operational_sender, "urlopen", fake_urlopen)
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    # The task-creation event remains the durable cursor floor; the completed
+    # event itself was rewound for retry.
+    assert _subscription_cursor(tid) == 1
+    assert len(document_attempts) == 2
+
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    assert len(document_attempts) == 4
+    assert _subscription_cursor(tid) >= 2
+
+    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    assert len(document_attempts) == 4
