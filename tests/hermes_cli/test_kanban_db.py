@@ -1100,7 +1100,7 @@ def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatc
 
     monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
 
-    delivered = []
+    requests = []
 
     def fake_api(_token, method, data):
         if method == "getMe":
@@ -1109,7 +1109,7 @@ def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatc
                 "username": operational_sender.EXPECTED_USERNAME,
                 "is_bot": True,
             }}
-        delivered.append(data.get("text", ""))
+        requests.append((method, dict(data)))
         return {"ok": True, "result": {"message_id": 1,
                 "from": {"id": operational_sender.EXPECTED_BOT_ID,
                          "username": operational_sender.EXPECTED_USERNAME,
@@ -1167,13 +1167,13 @@ def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatc
     monkeypatch.setattr(asyncio, "sleep", one_tick)
     asyncio.run(runner._kanban_notifier_watcher(interval=1))
 
-    adapter.sent.extend({"chat_id": "test-chat", "text": text, "metadata": {}}
-                       for text in delivered)
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["chat_id"] == "test-chat"
-    assert task_id in adapter.sent[0]["text"]
-    assert "gave up" in adapter.sent[0]["text"]
-    assert "test failure" in adapter.sent[0]["text"]
+    sends = [data for method, data in requests if method == "sendMessage"]
+    assert len(sends) == 1
+    assert sends[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+    assert task_id in sends[0]["text"]
+    assert "gave up" in sends[0]["text"]
+    assert "test failure" in sends[0]["text"]
+    assert adapter.sent == []
 
     with kb.connect() as conn:
         sub = kb.list_notify_subs(conn, task_id)[0]

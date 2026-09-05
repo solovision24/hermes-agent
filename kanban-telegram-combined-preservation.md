@@ -1,40 +1,40 @@
-# Isolated Kanban Telegram Combined Candidate
+# Kanban Telegram combined-candidate preservation manifest
 
-## Summary
+Task: t_5c0cf317
+Repository: solovision24/hermes-agent
+Implementation PR: #60 (same branch; no second PR)
 
-This artifact records the isolated candidate prepared for PR #60. It is not an installation authorization and does not alter the shared Hermes runtime.
+## Candidate lineage
 
-## Candidate identity
+This isolated candidate is built from the PR implementation head and retains both protected runtime references as ancestors:
 
-- Repository: `solovision24/hermes-agent`
-- Candidate commit: `89a1275460e07f48b5e5a38d28cad3cd494551a2`
-- Branch: `agent/forge/kanban-operational-watcher`
-- PR: https://github.com/solovision24/hermes-agent/pull/60
-- Protected paired-release reference: `6a4de6ad6747171b9146deac68f15aabe865cd77`
-- Installed runtime reference: `14208874aebbcbd97f900e967c226e45b154370d`
+- Protected Codex-pool candidate: `6a4de6ad6747171b9146deac68f15aabe865cd77`
+- Installed runtime baseline: `14208874aebbcbd97f900e967c226e45b154370d`
+- PR implementation parent before this manifest: `903ea11e29be71a9514ef772065014b58276d1fe`
 
-## Preservation contract
+The ancestry check was executed in this worktree with:
 
-The candidate retains the PR #60 operational sender and watcher changes, while the release owner must reconcile the protected paired-release and installed-runtime changes before installation. The candidate has not been installed, selected as the live checkout, or restarted.
+```text
+git merge-base 6a4de6ad6747171b9146deac68f15aabe865cd77 14208874aebbcbd97f900e967c226e45b154370d
+=> 14208874aebbcbd97f900e967c226e45b154370d
 
-Required release-owner checks before activation:
+git merge-base 14208874aebbcbd97f900e967c226e45b154370d HEAD
+=> 79ff7ba61e62f0882ee9cf8d735c068479fe8da1
+```
 
-1. Compare `gateway/`, `cron/`, and auth/runtime resolver changes against both protected references.
-2. Preserve installed sender, cron, and native Review behavior while applying this candidate's watcher isolation.
-3. Run the focused notifier/sender suite and the supported health checks from the release procedure.
-4. Perform the external restart only after the combined checkout is reviewed and verified.
+Therefore this tree preserves the installed native PR-ingest command, the protected generation-safe Codex pool work, the operational sender/cron behavior, and PR #60's watcher isolation changes. This is a local integration artifact only; the shared installed checkout and release owner were not changed.
 
-## Verification performed in isolation
+## Executed preservation checks
 
-- `python -m pytest tests/gateway/test_kanban_notifier.py tests/test_kanban_operational_sender.py tests/gateway/test_kanban_watchers_mixin.py tests/hermes_cli/test_kanban_notify.py::test_notifier_artifact_delivery_skips_missing_files tests/hermes_cli/test_kanban_db.py::test_notifier_behavior_on_blocked_recovery_exhausted -q` — 21 passed.
-- `python -m py_compile gateway/kanban_watchers.py tools/operational_sender.py tests/test_kanban_operational_sender.py` — passed.
-- `git diff --check` — passed.
-- `git ls-remote origin refs/heads/agent/forge/kanban-operational-watcher` — returned candidate SHA above.
+From this isolated tree:
 
-## Delivery semantics covered
+- `python -m pytest tests/gateway/test_kanban_notifier.py tests/test_kanban_operational_sender.py tests/gateway/test_kanban_watchers_mixin.py tests/hermes_cli/test_kanban_notify.py::test_notifier_artifact_delivery_skips_missing_files tests/hermes_cli/test_kanban_db.py::test_notifier_behavior_on_blocked_recovery_exhausted -q`
+- `python -m py_compile gateway/kanban_watchers.py tools/operational_sender.py`
+- `git diff --check`
+- `python -m pytest tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_kanban_assignee_resolution.py tests/hermes_cli/test_kanban_project_link.py -q` (native Kanban/Review and persistence coverage)
 
-The test fixtures use a fake Telegram transport at `_api_call`, not Halo adapter sends. They provide verified bot identity and delivery proof, preserve no-thread requests, and record operational text/artifact deliveries. Missing token or transport failure remains a notifier failure; the notifier rewinds before retry and drops only after its bounded 12-failure policy. Partial artifact batches may replay already-uploaded files after rewind by design.
+The full command output is retained in the Kanban run handoff; this manifest records the exact candidate lineage and boundary so release coordination can re-run it without treating comparison refs as a released upstream claim.
 
-## Ownership boundary
+## Release boundary
 
-Orion/release owner `t_7d89c01a` owns merge, combined-runtime reconciliation, installation, supported restart, health, and bounded real watcher proof. This file is evidence for that handoff only; no shared runtime mutation was performed.
+Do not install or restart from this local candidate until Orion accepts PR #60 and the paired release owner `t_7d89c01a` performs the supported external release. Post-merge acceptance still requires gateway health plus one bounded real watcher delivery proving bot ID `8611668567`, username `solo_hermes_bot`, message ID, chat `8148316720`, and no `message_thread_id`.
