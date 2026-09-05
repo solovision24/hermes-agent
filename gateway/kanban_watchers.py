@@ -616,6 +616,16 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "review_requested":
+                            summary = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                summary = f": {str(ev.payload['summary'])[:160]}"
+                            msg = f"🔎 {board_tag}{tag}Kanban {sub['task_id']} review requested{summary}"
+                        elif kind == "changes_requested":
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:160]}"
+                            msg = f"🛠 {board_tag}{tag}Kanban {sub['task_id']} changes requested{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -845,13 +855,7 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
                         # Kinds that hand a decision back to the origin, so the
-                        # origin has to take a turn. ``review_requested`` (the
-                        # implementation is done and waits for a reviewer),
-                        # ``changes_requested`` (a reviewer BLOCKed and work
-                        # returns to the implementer) and ``block_loop_detected``
-                        # (routed to triage) belong here for the same reason
-                        # ``blocked`` does. ``status`` / ``archived`` /
-                        # ``unblocked`` stay out: bookkeeping.
+                        # origin has to take a turn.
                         _WAKE_KINDS = (
                             "completed", "gave_up", "crashed", "timed_out",
                             "blocked", "review_requested", "changes_requested",
@@ -1241,15 +1245,19 @@ class GatewayKanbanWatchersMixin:
         if not candidates:
             return
 
+        # Apply the same denylist, symlink and safe-root policy used by normal
+        # platform uploads before selecting the Telegram transport.  The
+        # operational sender is an isolation boundary, not a bypass around
+        # local-file validation.
+        from gateway.platforms.base import BasePlatformAdapter
+        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        if not candidates:
+            return
+
         if metadata.get("_platform") == "telegram":
             from tools.operational_sender import send_operational_document
             for path in candidates:
                 await asyncio.to_thread(send_operational_document, path)
-            return
-
-        from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
-        if not candidates:
             return
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}

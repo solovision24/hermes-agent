@@ -80,3 +80,29 @@ async def test_non_telegram_delivery_preserves_adapter_and_metadata():
         adapter, "slack", "chat", "Kanban update", {"thread_id": "thread"}
     )
     adapter.send.assert_awaited_once_with("chat", "Kanban update", metadata={"thread_id": "thread"})
+
+
+@pytest.mark.asyncio
+async def test_telegram_artifacts_apply_local_path_policy_before_sender(monkeypatch, tmp_path):
+    """Telegram isolation must not become an attachment path bypass."""
+    adapter = type("Adapter", (), {
+        "extract_local_files": lambda self, text: (["/etc/hosts", str(tmp_path / "ok.txt")], text),
+    })()
+    allowed = tmp_path / "ok.txt"
+    allowed.write_text("safe test artifact")
+    sent = []
+
+    def fake_document(path, caption=""):
+        sent.append(path)
+        return {"ok": True}
+
+    monkeypatch.setattr("tools.operational_sender.send_operational_document", fake_document)
+    await kanban_watchers.GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+        kanban_watchers.GatewayKanbanWatchersMixin(),
+        adapter=adapter,
+        chat_id="ignored",
+        metadata={"_platform": "telegram"},
+        event_payload={"summary": "artifact"},
+        task=None,
+    )
+    assert sent == [str(allowed.resolve())]
