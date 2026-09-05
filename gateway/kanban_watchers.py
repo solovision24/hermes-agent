@@ -49,6 +49,15 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     return reason
 
 
+async def _deliver_kanban_text(adapter: Any, platform: str, chat_id: str,
+                               message: str, metadata: dict) -> Any:
+    """Deliver a watcher text ping, isolating Telegram from Halo."""
+    if platform == "telegram":
+        from tools.operational_sender import send_operational_message
+        return await asyncio.to_thread(send_operational_message, message)
+    return await adapter.send(chat_id, message, metadata=metadata)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -740,8 +749,8 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            _send_res = await _deliver_kanban_text(
+                                adapter, platform_str, sub["chat_id"], msg, metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -768,7 +777,10 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            # Telegram watcher notifications are isolated to
+                            # the operational bot; the normal adapter would
+                            # leak completion attachments through Halo too.
+                            if kind == "completed" and platform_str != "telegram":
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
