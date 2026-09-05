@@ -72,7 +72,17 @@ def is_mapped(email: str) -> bool:
         return True
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:
-        if f'"{email}"' in release_py.read_text(encoding="utf-8", errors="replace"):
+        # Keep the audit's legacy lookup equivalent to release.resolve_author
+        # and the CI gate.  A case-sensitive substring check incorrectly
+        # rejects historical mixed-case author addresses.
+        quoted_email = email.casefold()
+        if any(
+            key.casefold() == quoted_email
+            for key in re.findall(
+                r'''["']([^"']+)["']\s*:\s*["'][^"']+["']''',
+                release_py.read_text(encoding="utf-8", errors="replace"),
+            )
+        ):
             return True
     except OSError:
         pass
