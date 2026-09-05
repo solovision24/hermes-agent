@@ -979,5 +979,7 @@ def test_real_notifier_rewinds_partial_multipart_batch_then_retries_and_deduplic
     assert _subscription_cursor(tid) >= 2
     assert second_adapter.outbound_attempts == []
 
-    _run_real_operational_tick(monkeypatch, _make_runner(RecordingAdapter()))
+    third_adapter = RecordingAdapter()
+    _run_real_operational_tick(monkeypatch, _make_runner(third_adapter))
     assert len(document_attempts) == 4
+    assert third_adapter.outbound_attempts == []
