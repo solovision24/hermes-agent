@@ -12,8 +12,9 @@ Logic (kept in sync with contributor-check.yml):
   - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
-  - everything else must have ``contributors/emails/<email>`` or a legacy
-    AUTHOR_MAP entry in scripts/release.py
+  - everything else must have ``contributors/emails/<email>`` (matched
+    case-insensitively for macOS/Linux portability) or a legacy AUTHOR_MAP
+    entry in scripts/release.py
 
 ``--fix`` resolution order for an unmapped email:
   1. bare ``<login>@users.noreply.github.com`` → ``<login>``, verified via
@@ -36,7 +37,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKIP_SUBSTRINGS = (
     "teknium",
     "noreply@github.com",
-    "agent@Agents-Mac-mini.local",
     "dependabot",
     "github-actions",
     "anthropic.com",
@@ -67,7 +67,8 @@ def is_mapped(email: str) -> bool:
         return True
     if ID_NOREPLY_RE.search(email):
         return True
-    if (REPO_ROOT / "contributors" / "emails" / email).is_file():
+    mappings_dir = REPO_ROOT / "contributors" / "emails"
+    if any(path.name.casefold() == email.casefold() for path in mappings_dir.iterdir()):
         return True
     release_py = REPO_ROOT / "scripts" / "release.py"
     try:
