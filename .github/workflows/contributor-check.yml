@@ -54,11 +54,15 @@ jobs:
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
-            if find contributors/emails -maxdepth 1 -type f -iname "$email" -print -quit | grep -q .; then
+            # Use fixed-string matching: find -iname treats email text as a
+            # glob, so a literal '*' or '[' in an email could bypass the gate.
+            if find contributors/emails -maxdepth 1 -type f -printf '%f\n' | grep -Fxi -- "$email" | grep -q .; then
               continue  # mapped via the contributors directory
             fi
 
-            if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
+            # AUTHOR_MAP is legacy Python data; compare its quoted keys
+            # case-insensitively without interpreting email text as a pattern.
+            if ! grep -iFq -- "\"${email}\"" scripts/release.py 2>/dev/null; then
               AUTHOR=$(git log --author="$email" --format='%an' -1)
               MISSING="${MISSING}\n  ${email} (${AUTHOR})"
             fi

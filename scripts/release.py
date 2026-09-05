@@ -2112,6 +2112,20 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
 AUTHOR_MAP = {**LEGACY_AUTHOR_MAP, **_load_contributor_dir()}
 
 
+def _lookup_author_map(email: str) -> str | None:
+    """Look up an author email without depending on filename casing.
+
+    Mapping filenames are commit-author emails, and historical repositories
+    contain mixed-case spellings.  Filesystems/CI treat these keys
+    case-insensitively, so release mention generation must do the same.
+    """
+    folded = email.casefold()
+    for mapped_email, login in AUTHOR_MAP.items():
+        if mapped_email.casefold() == folded:
+            return login
+    return None
+
+
 def git(*args, cwd=None):
     """Run a git command and return stdout."""
     result = subprocess.run(
@@ -2229,7 +2243,7 @@ def update_version_files(semver: str, calver_date: str):
 def resolve_author(name: str, email: str) -> str:
     """Resolve a git author to a GitHub @mention."""
     # Try email lookup first
-    gh_user = AUTHOR_MAP.get(email)
+    gh_user = _lookup_author_map(email)
     if gh_user:
         return f"@{gh_user}"
 

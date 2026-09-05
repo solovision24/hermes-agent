@@ -46,6 +46,19 @@ def test_effective_map_merges_legacy_and_directory():
         assert release.AUTHOR_MAP[email] == login
 
 
+def test_resolve_author_matches_mapping_email_case_insensitively(monkeypatch):
+    monkeypatch.setattr(release, "AUTHOR_MAP", {"agent@Agents-Mac-mini.local": "momomojo"})
+
+    assert release.resolve_author("Agent", "agent@agents-Mac-mini.local") == "@momomojo"
+
+
+@pytest.mark.parametrize("email", ["literal*gmail@example.com", "literal[gmail@example.com"])
+def test_lookup_author_map_treats_email_as_literal(monkeypatch, email):
+    monkeypatch.setattr(release, "AUTHOR_MAP", {email: "mapped-user"})
+
+    assert release.resolve_author("Author", email.upper()) == "@mapped-user"
+
+
 
 
 # ── add_contributor.py CLI behavior ───────────────────────────────────
