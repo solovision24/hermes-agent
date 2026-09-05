@@ -21,19 +21,13 @@ class RecordingAdapter:
         self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
-        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        raise AssertionError("Halo adapter must not send Kanban Telegram notices")
 
     async def handle_message(self, event):
         self.handled.append(event)
 
     def extract_local_files(self, text):
         return [], text
-
-    def send_operational_message(self, text):
-        self.sent.append({"chat_id": operational_sender.DEFAULT_CHAT_ID,
-                          "text": text, "metadata": {}})
-        return {"ok": True, "result": {"message_id": len(self.sent)}}
-
 
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
@@ -706,10 +700,13 @@ def test_real_notifier_review_events_send_and_preserve_creator_wake(tmp_path, mo
         kb._append_event(conn, tid, "changes_requested", {"reason": "please revise"})
     monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
 
+    operational_calls = []
+
     def fake_api(_token, method, data):
         if method == "getMe":
             return {"ok": True, "result": {"id": operational_sender.EXPECTED_BOT_ID,
                     "username": operational_sender.EXPECTED_USERNAME, "is_bot": True}}
+        operational_calls.append((method, dict(data)))
         return {"ok": True, "result": {"message_id": 7,
                 "from": {"id": operational_sender.EXPECTED_BOT_ID,
                          "username": operational_sender.EXPECTED_USERNAME, "is_bot": True},
@@ -719,9 +716,16 @@ def test_real_notifier_review_events_send_and_preserve_creator_wake(tmp_path, mo
     adapter = RecordingAdapter()
     _run_real_operational_tick(monkeypatch, _make_runner(adapter))
     assert _subscription_cursor(tid) >= 2
-    assert adapter.sent == []
+    assert [method for method, _ in operational_calls] == ["sendMessage", "sendMessage"]
+    assert all(call[1]["chat_id"] == operational_sender.DEFAULT_CHAT_ID for call in operational_calls)
+    assert all("message_thread_id" not in call[1] for call in operational_calls)
+    ping_text = "\n".join(call[1]["text"] for call in operational_calls).lower()
+    assert "review requested" in ping_text
+    assert "changes requested" in ping_text
     assert len(adapter.handled) == 1
-    assert "review requested" in adapter.handled[0].text.lower()
+    wake_text = adapter.handled[0].text.lower()
+    assert "review requested" in wake_text
+    assert "changes requested" in wake_text
 
 
 def test_real_notifier_rewinds_when_operational_response_has_thread(tmp_path, monkeypatch):
