@@ -4535,6 +4535,33 @@ def ingest_pull_request(
                     conn.execute("UPDATE tasks SET title=?, body=? WHERE id=?", (desired_title, body, task_id))
                     _append_event(conn, task_id, "github_pr_metadata_updated", details)
                 return task_id
+            # A draft PR is intentionally held in triage until a later
+            # synchronize webhook marks it ready.  This is the one same-head
+            # replay that is still owned by intake rather than a downstream
+            # lifecycle transition; promote it to review without changing
+            # any DEV remediation disposition (ready/todo/done below).
+            if same_head["status"] == "triage" and not draft:
+                previous_intake = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND kind = 'github_pr_ingested' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                try:
+                    previous_details = (
+                        json.loads(previous_intake["payload"])
+                        if previous_intake and previous_intake["payload"]
+                        else {}
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    previous_details = {}
+                if isinstance(previous_details, dict) and previous_details.get("draft") is True:
+                    conn.execute(
+                        "UPDATE tasks SET title=?, body=?, assignee=?, status=? WHERE id=?",
+                        (desired_title, body, desired_assignee, status, task_id),
+                    )
+                    _append_event(conn, task_id, "github_pr_ingested", details)
+                    return task_id
             # A replay of the same immutable head must also never undo a
             # downstream disposition.  In particular, the changes-requested
             # fallback intentionally leaves the card ready (or todo while a

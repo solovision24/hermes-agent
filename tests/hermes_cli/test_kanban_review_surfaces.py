@@ -263,6 +263,54 @@ def test_external_intake_replay_preserves_parent_wait_and_completed_states(
         assert task is not None and (task.status, task.assignee) == ("done", "dev")
 
 
+def test_external_draft_intake_promotes_when_marked_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A draft's same-head ready webhook promotes intake-owned triage only."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "2" * 40
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=527,
+            head_sha=head_sha,
+            title="Draft review",
+            reviewer="orion",
+            draft=True,
+        )
+        assert task_id is not None
+        draft_task = kb.get_task(conn, task_id)
+        assert draft_task is not None
+        assert (draft_task.status, draft_task.assignee) == ("triage", "orion")
+
+        assert kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=527,
+            head_sha=head_sha,
+            title="Draft review ready",
+            reviewer="orion",
+            draft=False,
+            action="synchronize",
+        ) == task_id
+        promoted = kb.get_task(conn, task_id)
+        assert promoted is not None
+        assert (promoted.status, promoted.assignee) == ("review", "orion")
+        assert promoted.title == "Review PR #527: Draft review ready"
+        ingests = [event for event in kb.list_events(conn, task_id) if event.kind == "github_pr_ingested"]
+        assert len(ingests) == 2
+        assert ingests[-1].payload is not None
+        assert ingests[-1].payload["draft"] is False
+
+
 def test_review_cli_round_trip_preserves_handoff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
