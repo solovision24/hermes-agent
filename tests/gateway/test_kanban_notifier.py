@@ -590,6 +590,121 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     assert remaining == []
 
 
+def test_notifier_subscription_survives_done_reopen_until_archive(
+    tmp_path, monkeypatch,
+):
+    """Done is reversible; archive alone ends notification ownership."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "done-reopen-archive.db"))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review continuation", assignee="worker",
+                             session_id="origin-session")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="origin-chat",
+                          thread_id="origin-thread", user_id="origin-user",
+                          chat_type="group", notifier_profile="reviewer",
+                          delivery_mode="notify+wake")
+        assert kb.complete_task(conn, tid, summary="first completion")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.sent[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+    assert adapter.sent[0]["metadata"] == {}
+    assert adapter.handled[0].source.thread_id == "origin-thread"
+
+    with kb.connect() as conn:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        first_cursor = subs[0]["last_event_id"]
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+
+    with kb.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        assert kb.complete_task(conn, tid, summary="corrected completion")
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 3
+    assert len(adapter.handled) == 2
+
+    with kb.connect() as conn:
+        subs = kb.list_notify_subs(conn, tid)
+        assert len(subs) == 1 and subs[0]["last_event_id"] > first_cursor
+        assert kb.archive_task(conn, tid)
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "reviewer"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 3
+    with kb.connect() as conn:
+        assert kb.list_notify_subs(conn, tid) == []
+
+
+def _wake_text(adapter):
+    assert len(adapter.handled) == 1
+    return getattr(adapter.handled[0], "text", "") or ""
+
+
+def _review_handoff_task(*, delivery_mode="notify+wake"):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="implement the thing", assignee="worker",
+                             session_id="agent:main:telegram:dm:chat-1")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                          chat_type="dm", delivery_mode=delivery_mode)
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        assert kb.request_review(conn, tid,
+                                 summary="PR ready: https://example.invalid/pr/7",
+                                 expected_run_id=run_id)
+        return tid
+
+
+def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-wake.db"))
+    kb.init_db()
+    tid = _review_handoff_task()
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert "ready for review" in adapter.sent[0]["text"]
+    wake = _wake_text(adapter)
+    assert tid in wake
+    assert "PR ready: https://example.invalid/pr/7" in wake
+
+
+def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "triage-wake.db"))
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="loops forever", assignee="worker",
+                             session_id="agent:main:telegram:dm:chat-1")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                          chat_type="dm", delivery_mode="notify+wake")
+        kb._append_event(conn, tid, "block_loop_detected",
+                          {"reason": "needs credentials", "kind": "needs_input"})
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert tid in _wake_text(adapter)
+
+
+def test_review_requested_does_not_wake_a_notify_only_subscription(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "review-notify.db"))
+    kb.init_db()
+    _review_handoff_task(delivery_mode="notify")
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert adapter.handled == []
+
+
 def _run_real_operational_tick(monkeypatch, runner):
     """Run one loop iteration without replacing the operational sender."""
     real_sleep = asyncio.sleep
