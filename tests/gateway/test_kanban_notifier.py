@@ -448,8 +448,10 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
     assert len(adapter.sent) == 1
     assert len(adapter.handled) == 1
-    assert adapter.sent[0]["chat_id"] == "origin-chat"
-    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"
+    # Telegram operational pings deliberately use the canonical sender/chat
+    # and never inherit the originating agent topic.
+    assert adapter.sent[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+    assert adapter.sent[0]["metadata"] == {}
     assert adapter.handled[0].source.thread_id == "origin-thread"
     assert adapter.handled[0].source.profile == "reviewer"
 
@@ -486,7 +488,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     # completion wakes the exact original session/thread.
     assert len(adapter.sent) == 3
     assert len(adapter.handled) == 2
-    assert all(item["chat_id"] == "origin-chat" for item in adapter.sent)
+    assert all(item["chat_id"] == operational_sender.DEFAULT_CHAT_ID for item in adapter.sent)
     assert adapter.handled[-1].source.thread_id == "origin-thread"
     assert adapter.handled[-1].source.profile == "reviewer"
 
