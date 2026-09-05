@@ -39,12 +39,14 @@ jobs:
 
           # An email is mapped if it has a file in contributors/emails/
           # (one file per email — conflict-free) or an entry in the frozen
-          # legacy AUTHOR_MAP in scripts/release.py.
+          # legacy AUTHOR_MAP in scripts/release.py.  Match mapping filenames
+          # case-insensitively so mappings created on macOS remain usable on
+          # Linux CI without creating a case-colliding second file.
           MISSING=""
           while IFS= read -r email; do
-            # Skip bot emails and known local-machine identity artifacts.
+            # Skip teknium and bot emails
             case "$email" in
-              *teknium*|*noreply@github.com*|agent@Agents-Mac-mini.local|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
                 continue ;;
             esac
 
@@ -52,7 +54,7 @@ jobs:
               continue  # GitHub id+login noreply emails auto-resolve
             fi
 
-            if [ -f "contributors/emails/${email}" ]; then
+            if find contributors/emails -maxdepth 1 -type f -iname "$email" -print -quit | grep -q .; then
               continue  # mapped via the contributors directory
             fi
 
