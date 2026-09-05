@@ -106,3 +106,58 @@ async def test_telegram_artifacts_apply_local_path_policy_before_sender(monkeypa
         task=None,
     )
     assert sent == [str(allowed.resolve())]
+
+
+@pytest.mark.asyncio
+async def test_telegram_artifact_symlink_is_denied(monkeypatch, tmp_path):
+    """The sender boundary must not make symlinked system files uploadable."""
+    # A symlink into a system path must remain denied after realpath
+    # resolution, even though the link itself is under the temporary root.
+    link = tmp_path / "linked.txt"
+    link.symlink_to("/etc/hosts")
+    adapter = type("Adapter", (), {
+        "extract_local_files": lambda self, text: ([str(link)], text),
+    })()
+    sent = []
+    monkeypatch.setattr(
+        "tools.operational_sender.send_operational_document",
+        lambda path, caption="": sent.append(path),
+    )
+    await kanban_watchers.GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+        kanban_watchers.GatewayKanbanWatchersMixin(),
+        adapter=adapter,
+        chat_id="ignored",
+        metadata={"_platform": "telegram"},
+        event_payload={"summary": "artifact"},
+        task=None,
+    )
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_telegram_partial_artifact_failure_is_reported(monkeypatch, tmp_path):
+    """A partial upload must fail the batch so the caller can rewind."""
+    first, second = tmp_path / "first.txt", tmp_path / "second.txt"
+    first.write_text("first")
+    second.write_text("second")
+    adapter = type("Adapter", (), {
+        "extract_local_files": lambda self, text: ([str(first), str(second)], text),
+    })()
+    calls = []
+
+    def send_document(path, caption=""):
+        calls.append(path)
+        if path == str(second):
+            raise RuntimeError("transport failure")
+
+    monkeypatch.setattr("tools.operational_sender.send_operational_document", send_document)
+    with pytest.raises(RuntimeError, match="artifact delivery failed"):
+        await kanban_watchers.GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+            kanban_watchers.GatewayKanbanWatchersMixin(),
+            adapter=adapter,
+            chat_id="ignored",
+            metadata={"_platform": "telegram"},
+            event_payload={"summary": "artifact"},
+            task=None,
+        )
+    assert calls == [str(first), str(second)]

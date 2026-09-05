@@ -959,8 +959,20 @@ class GatewayKanbanWatchersMixin:
 
         if metadata.get("_platform") == "telegram":
             from tools.operational_sender import send_operational_document
+            failures = []
             for path in candidates:
-                await asyncio.to_thread(send_operational_document, path)
+                try:
+                    await asyncio.to_thread(send_operational_document, path)
+                except Exception as exc:
+                    failures.append((path, exc))
+            if failures:
+                # A partial batch may already have reached Telegram. Still
+                # fail the notification so the caller rewinds the claim and
+                # retries the batch instead of falsely advancing its cursor.
+                raise RuntimeError(
+                    "operational artifact delivery failed for "
+                    + ", ".join(path for path, _ in failures)
+                ) from failures[0][1]
             return
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -973,6 +985,7 @@ class GatewayKanbanWatchersMixin:
         image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
 
+        failures = []
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
@@ -980,6 +993,7 @@ class GatewayKanbanWatchersMixin:
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )
             except Exception as exc:
+                failures.append((image_paths[0], exc))
                 logger.warning(
                     "kanban notifier: image batch upload failed: %s", exc,
                 )
@@ -996,10 +1010,16 @@ class GatewayKanbanWatchersMixin:
                         chat_id=chat_id, file_path=path, metadata=metadata,
                     )
             except Exception as exc:
+                failures.append((path, exc))
                 logger.warning(
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+        if failures:
+            raise RuntimeError(
+                "artifact delivery failed for "
+                + ", ".join(path for path, _ in failures)
+            ) from failures[0][1]
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
