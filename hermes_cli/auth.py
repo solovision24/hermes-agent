@@ -991,6 +991,17 @@ def _is_pytest_protected_auth_path(path: Path) -> bool:
         resolved = path
     return any(resolved == protected for protected in _pytest_protected_auth_paths())
 
+
+def _assert_auth_store_path_allowed(path: Path) -> None:
+    """Refuse protected auth-store paths before any filesystem access."""
+    if _is_pytest_protected_auth_path(path):
+        raise RuntimeError(
+            f"Refusing to touch real user auth store during test run: {path}. "
+            "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+            "via scripts/run_tests.sh for hermetic CI-parity env."
+        )
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
@@ -999,16 +1010,7 @@ def _auth_file_path() -> Path:
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if _is_pytest_protected_auth_path(resolved):
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+        _assert_auth_store_path_allowed(path)
     return path
 
 
@@ -1188,6 +1190,8 @@ def _auth_store_lock(
     against a concurrent import on the shared store.
     """
     auth_path = target_path if target_path is not None else _auth_file_path()
+    if target_path is not None:
+        _assert_auth_store_path_allowed(auth_path)
     lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
     with _file_lock(
         lock_path,
@@ -1199,7 +1203,9 @@ def _auth_store_lock(
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
-    auth_file = auth_file or _auth_file_path()
+    auth_file = auth_file if auth_file is not None else _auth_file_path()
+    if auth_file is not None:
+        _assert_auth_store_path_allowed(auth_file)
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
@@ -1274,6 +1280,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
     auth_file = target_path if target_path is not None else _auth_file_path()
+    if target_path is not None:
+        _assert_auth_store_path_allowed(auth_file)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.

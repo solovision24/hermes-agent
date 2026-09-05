@@ -18,6 +18,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -53,6 +54,125 @@ def profile_env(tmp_path, monkeypatch):
 
 def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes | None]:
+    return {
+        str(path.relative_to(root)): path.read_bytes() if path.is_file() else None
+        for path in sorted(root.rglob("*"))
+    }
+
+
+@pytest.fixture()
+def protected_canonical_root(tmp_path, monkeypatch):
+    """Provide a protected canonical store beside a distinct test home."""
+    protected_root = tmp_path / "protected-root"
+    protected_root.mkdir()
+    (protected_root / "auth.json").write_bytes(
+        json.dumps(
+            _make_auth_store(
+                pool={"openai-codex": [{"id": "protected-entry"}]},
+                providers={
+                    "openai-codex": {
+                        "tokens": {
+                            "access_token": "protected-access",
+                            "refresh_token": "protected-refresh",
+                        }
+                    }
+                },
+            ),
+            indent=2,
+        ).encode()
+    )
+    (protected_root / "sentinel.txt").write_bytes(b"must remain untouched\n")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "protected-auth-store-regression")
+    monkeypatch.setenv("HERMES_TEST_REAL_ROOT", str(protected_root))
+    monkeypatch.setenv("HERMES_ROOT", str(protected_root))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "separate-test-home"))
+    return protected_root
+
+
+def test_explicit_auth_store_helpers_refuse_protected_paths_before_io(
+    protected_canonical_root,
+):
+    """Explicit load/save/lock targets cannot bypass the pytest seat belt."""
+    import hermes_cli.auth as auth
+
+    auth_path = protected_canonical_root / "auth.json"
+    before = _tree_snapshot(protected_canonical_root)
+
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        auth._load_auth_store(auth_path)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        auth._save_auth_store({"providers": {}}, target_path=auth_path)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        with auth._auth_store_lock(target_path=auth_path):
+            pass
+
+    assert _tree_snapshot(protected_canonical_root) == before
+    assert not (protected_canonical_root / "auth.lock").exists()
+
+
+def test_codex_singleton_helpers_refuse_protected_canonical_root(
+    protected_canonical_root,
+):
+    """Codex singleton reads and saves stop before touching the root store."""
+    from hermes_cli.auth import _read_codex_tokens, _save_codex_tokens
+
+    before = _tree_snapshot(protected_canonical_root)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        _read_codex_tokens()
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        _save_codex_tokens(
+            {"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}
+        )
+
+    assert _tree_snapshot(protected_canonical_root) == before
+    assert not (protected_canonical_root / "auth.lock").exists()
+
+
+def test_codex_pool_helpers_refuse_protected_canonical_root(
+    protected_canonical_root,
+):
+    """Codex pool reads and writes stop before touching the root store."""
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    before = _tree_snapshot(protected_canonical_root)
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        read_credential_pool("openai-codex")
+    with pytest.raises(RuntimeError, match="Refusing to touch real user auth store"):
+        write_credential_pool(
+            "openai-codex",
+            [{"id": "synthetic-entry", "access_token": "synthetic-access"}],
+        )
+
+    assert _tree_snapshot(protected_canonical_root) == before
+    assert not (protected_canonical_root / "auth.lock").exists()
+
+
+def test_unprotected_synthetic_canonical_root_remains_usable(tmp_path, monkeypatch):
+    """A disposable explicit root remains usable under pytest."""
+    from hermes_cli.auth import (
+        _read_codex_tokens,
+        _save_codex_tokens,
+        read_credential_pool,
+        write_credential_pool,
+    )
+
+    usable_root = tmp_path / "usable-root"
+    monkeypatch.setenv("HERMES_ROOT", str(usable_root))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "separate-test-home"))
+    _save_codex_tokens(
+        {"access_token": "synthetic-access", "refresh_token": "synthetic-refresh"}
+    )
+    assert _read_codex_tokens()["tokens"]["access_token"] == "synthetic-access"
+
+    write_credential_pool(
+        "openai-codex",
+        [{"id": "synthetic-entry", "access_token": "synthetic-access"}],
+    )
+    pool_entries = cast(list[dict], read_credential_pool("openai-codex"))
+    assert pool_entries[0]["id"] == "synthetic-entry"
 
 
 # ---------------------------------------------------------------------------
