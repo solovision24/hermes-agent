@@ -10,6 +10,7 @@ from gateway.kanban_watchers import (
 )
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from tools import operational_sender
 
 
 class RecordingAdapter:
@@ -22,6 +23,14 @@ class RecordingAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+
+    def extract_local_files(self, text):
+        return [], text
+
+    def send_operational_message(self, text):
+        self.sent.append({"chat_id": operational_sender.DEFAULT_CHAT_ID,
+                          "text": text, "metadata": {}})
+        return {"ok": True, "result": {"message_id": len(self.sent)}}
 
 
 class DisconnectedAdapters(dict):
@@ -41,6 +50,11 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        operational_sender,
+        "send_operational_message",
+        runner.adapters[Platform.TELEGRAM].send_operational_message,
+    )
     await runner._kanban_notifier_watcher(interval=1)
 
 
@@ -118,13 +132,8 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert adapter.sent[0]["metadata"] == {
-        "chat_type": "dm",
-        "direct_messages_topic_id": "20197",
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": "462",
-        "thread_id": "20197",
-    }
+    # Operational Telegram delivery intentionally strips topic/reply metadata.
+    assert adapter.sent[0]["metadata"] == {}
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
     assert adapter.handled[0].source.thread_id == "20197"
@@ -210,7 +219,7 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
-    assert [delivery["chat_id"] for delivery in adapter.sent] == ["writer-chat"]
+    assert [delivery["chat_id"] for delivery in adapter.sent] == [operational_sender.DEFAULT_CHAT_ID]
     assert owned_tid in adapter.sent[0]["text"]
     assert len(_unseen_terminal_events_for(foreign_tid, "default-chat")) == 1
 
@@ -260,7 +269,7 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
         winner_runner = _make_runner(winner_adapter)
         winner_runner._kanban_dispatcher_lock_handle = winner_handle
         asyncio.run(_run_one_notifier_tick(monkeypatch, winner_runner))
-        assert [item["chat_id"] for item in winner_adapter.sent] == ["legacy-chat"]
+        assert [item["chat_id"] for item in winner_adapter.sent] == [operational_sender.DEFAULT_CHAT_ID]
         assert task_id in winner_adapter.sent[0]["text"]
     finally:
         _release_singleton_lock(loser_handle)

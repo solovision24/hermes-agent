@@ -780,20 +780,21 @@ class GatewayKanbanWatchersMixin:
                             # Telegram watcher notifications are isolated to
                             # the operational bot; the normal adapter would
                             # leak completion attachments through Halo too.
-                            if kind == "completed" and platform_str != "telegram":
+                            if kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
                                         chat_id=sub["chat_id"],
-                                        metadata=metadata,
+                                        metadata={**metadata, "_platform": platform_str},
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
                                     )
                                 except Exception as art_exc:
-                                    logger.debug(
+                                    logger.warning(
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                                    raise
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -1238,6 +1239,12 @@ class GatewayKanbanWatchersMixin:
                 _add(p)
 
         if not candidates:
+            return
+
+        if metadata.get("_platform") == "telegram":
+            from tools.operational_sender import send_operational_document
+            for path in candidates:
+                await asyncio.to_thread(send_operational_document, path)
             return
 
         from gateway.platforms.base import BasePlatformAdapter
