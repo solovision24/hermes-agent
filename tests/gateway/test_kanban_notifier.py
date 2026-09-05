@@ -25,6 +25,18 @@ class RecordingAdapter:
         self.outbound_attempts.append((chat_id, text, metadata))
         raise AssertionError("Halo adapter must not send Kanban Telegram notices")
 
+    async def send_multiple_images(self, **kwargs):
+        self.outbound_attempts.append(("send_multiple_images", kwargs))
+        raise AssertionError("Halo adapter must not upload Kanban artifacts")
+
+    async def send_video(self, **kwargs):
+        self.outbound_attempts.append(("send_video", kwargs))
+        raise AssertionError("Halo adapter must not upload Kanban artifacts")
+
+    async def send_document(self, **kwargs):
+        self.outbound_attempts.append(("send_document", kwargs))
+        raise AssertionError("Halo adapter must not upload Kanban artifacts")
+
     async def handle_message(self, event):
         self.handled.append(event)
 
@@ -616,6 +628,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     assert adapter.sent[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
     assert adapter.sent[0]["metadata"] == {}
     assert adapter.handled[0].source.thread_id == "origin-thread"
+    assert adapter.outbound_attempts == []
 
     with kb.connect() as conn:
         subs = kb.list_notify_subs(conn, tid)
@@ -625,6 +638,8 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     runner._active_profile_name = lambda: "reviewer"
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    assert adapter.outbound_attempts == []
 
     with kb.connect() as conn:
         with kb.write_txn(conn):
@@ -638,6 +653,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
     assert len(adapter.handled) == 2
     assert adapter.sent[1]["text"].endswith("→ ready")
     assert "corrected completion" in adapter.sent[2]["text"]
+    assert adapter.outbound_attempts == []
 
     with kb.connect() as conn:
         subs = kb.list_notify_subs(conn, tid)
@@ -680,6 +696,7 @@ def test_review_requested_wakes_the_origin_session(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
     assert len(adapter.sent) == 1
     assert "ready for review" in adapter.sent[0]["text"]
+    assert adapter.outbound_attempts == []
     wake = _wake_text(adapter)
     assert tid in wake
     assert "PR ready: https://example.invalid/pr/7" in wake
@@ -699,6 +716,7 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
     assert len(adapter.sent) == 1
     assert tid in _wake_text(adapter)
+    assert adapter.outbound_attempts == []
 
 
 def test_review_requested_does_not_wake_a_notify_only_subscription(tmp_path, monkeypatch):
@@ -709,6 +727,7 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(tmp_path, mon
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
     assert len(adapter.sent) == 1
     assert adapter.handled == []
+    assert adapter.outbound_attempts == []
 
 
 def _run_real_operational_tick(monkeypatch, runner):
@@ -815,9 +834,11 @@ def test_real_notifier_rewinds_failed_transport_then_deduplicates(tmp_path, monk
     _run_real_operational_tick(monkeypatch, second)
     assert _subscription_cursor(tid) >= 2
     assert second_adapter.outbound_attempts == []
-    third = _make_runner(RecordingAdapter())
+    third_adapter = RecordingAdapter()
+    third = _make_runner(third_adapter)
     _run_real_operational_tick(monkeypatch, third)
     assert len([m for m, _ in attempts if m == "sendMessage"]) == 2
+    assert third_adapter.outbound_attempts == []
     sends = [data for method, data in attempts if method == "sendMessage"]
     assert sends[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
     assert "message_thread_id" not in sends[0]

@@ -3,6 +3,7 @@ import asyncio
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from tools import operational_sender
 
 
 class RecordingAdapter:
@@ -22,6 +23,33 @@ class RecordingAdapter:
 
 async def _run_one_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
+
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            }}
+        adapter = runner.adapters[Platform.TELEGRAM]
+        adapter.sent.append({
+            "chat_id": operational_sender.DEFAULT_CHAT_ID,
+            "text": data["text"],
+            "metadata": {},
+        })
+        if adapter.fail_send:
+            raise RuntimeError("transient send failure")
+        return {"ok": True, "result": {
+            "message_id": 1,
+            "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                     "username": operational_sender.EXPECTED_USERNAME,
+                     "is_bot": True},
+            "chat": {"id": operational_sender.DEFAULT_CHAT_ID},
+        }}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
 
     async def fake_sleep(delay):
         if delay == 5:
@@ -105,7 +133,8 @@ def test_changes_requested_notify_wake_is_actionable_and_exactly_routed(tmp_path
     text = adapter.sent[0]["text"]
     assert text.startswith(f"🛑 [default] Kanban {task_id} review requested changes/BLOCK: Tests need updates")
     assert "reviewer @claude-qa → implementer @codex-cua" in text
-    assert adapter.sent[0]["metadata"]["thread_id"] == "topic-7"
+    assert adapter.sent[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+    assert adapter.sent[0]["metadata"] == {}
     assert len(adapter.handled) == 1
     wake = adapter.handled[0]
     assert wake.source.chat_id == "chat-1"
