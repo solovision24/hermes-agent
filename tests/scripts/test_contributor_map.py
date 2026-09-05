@@ -82,7 +82,7 @@ def test_all_consumers_resolve_common_mixed_case_fixture(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
     positives = (
-        "dironly@example.com", "LEGACYONLY@example.NET", "overlap@example.com",
+        "DIRONLY@example.com", "LEGACYONLY@EXAMPLE.NET", "overlap@example.com",
     )
     assert all(audit.is_mapped(email) for email in positives)
     for email in ("*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com"):
@@ -110,18 +110,51 @@ def test_all_consumers_resolve_common_mixed_case_fixture(tmp_path, monkeypatch):
     predicate = "while IFS= read -r email; do\n" + predicate + 'done <<< "$NEW_EMAILS"\n'
     predicate = "\n".join(line[10:] if line.startswith("          ") else line
                              for line in predicate.splitlines()) + "\n"
-    proc = subprocess.run(
-        ["bash", "-c", "MISSING=''\nNEW_EMAILS=$1\n" + predicate
-         + "printf '%b' \"$MISSING\"\n", "ci-check",
-         "DIRONLY@example.com\nLEGACYONLY@EXAMPLE.NET\noverlap@example.com\n"
-         "*@example.com\n[Oo]verlap@Example.com\nordinary@example.com"],
-        cwd=tmp_path, capture_output=True, text=True,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert all(f"  {email} (" in proc.stdout for email in (
+    ci_inputs = "\n".join((
+        "DIRONLY@example.com", "LEGACYONLY@EXAMPLE.NET", "overlap@example.com",
         "*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com",
     ))
-    assert all(email not in proc.stdout for email in positives)
+
+    def run_ci() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", "MISSING=''\nNEW_EMAILS=$1\n" + predicate
+             + "printf '%b' \"$MISSING\"\n", "ci-check", ci_inputs],
+            cwd=tmp_path, capture_output=True, text=True,
+        )
+
+    proc = run_ci()
+    assert proc.returncode == 0, proc.stderr
+    expected_missing = (
+        "*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com",
+    )
+    assert {line.strip().split(" ", 1)[0] for line in proc.stdout.splitlines()
+            if line.startswith("  ")} == set(expected_missing)
+    assert all(f"  {email} (" in proc.stdout for email in expected_missing)
+    assert all(f"  {email} (" not in proc.stdout for email in positives)
+
+    # Prove the common fixture really covers both mapping sources: removing
+    # either source must make its source-specific positive fail the actual CI
+    # predicate, rather than letting an overlapping positive mask the gap.
+    release_py = scripts / "release.py"
+    release_backup = scripts / "release.py.disabled"
+    release_py.rename(release_backup)
+    try:
+        legacy_disabled = run_ci()
+    finally:
+        release_backup.rename(release_py)
+    assert legacy_disabled.returncode == 0, legacy_disabled.stderr
+    assert "  LEGACYONLY@EXAMPLE.NET (" in legacy_disabled.stdout
+    assert "  DIRONLY@example.com (" not in legacy_disabled.stdout
+
+    emails_backup = tmp_path / "contributors" / "emails.disabled"
+    emails.rename(emails_backup)
+    try:
+        directory_disabled = run_ci()
+    finally:
+        emails_backup.rename(emails)
+    assert directory_disabled.returncode == 0, directory_disabled.stderr
+    assert "  DIRONLY@example.com (" in directory_disabled.stdout
+    assert "  LEGACYONLY@EXAMPLE.NET (" not in directory_disabled.stdout
 
 
 def test_attribution_audit_rejects_email_named_directory(tmp_path, monkeypatch):
