@@ -10,7 +10,9 @@ This candidate is based on the canonical SoLo fork operational-watcher PR branch
 - Fork `origin/main` at verification: `6e7f38c3f3e70066d16fa35cd8c716b49c043c6d`
 - Protected paired-release candidate (not replaced): `6a4de6ad6747171b9146deac68f15aabe865cd77`
 - Installed runtime reference (not replaced): `14208874aebbcbd97f900e967c226e45b154370d`
-- Working candidate SHA: recorded after commit and push in Kanban handoff
+- Working candidate SHA: `9a7351340fce24858b3c5bebfb5d728fd4adb7f1` (isolated combined candidate)
+- Working candidate tree: `22385d90ffa4639413fe408ba5ee50eb5ef8316a`
+- Working candidate path: `/tmp/kanban-integrate`
 
 ## Change scope
 
@@ -21,10 +23,13 @@ This candidate is based on the canonical SoLo fork operational-watcher PR branch
 
 ## Verification
 
-- Focused real watcher notifier suite: 20 passed.
+- Focused preservation suite: 146 passed (in-process imports from the committed isolated candidate).
+- Multipart retry/dedup retains its adapter and asserts zero Halo outbound attempts on the dedup tick; the discard-adapter mutation now fails.
 - The installed legacy notifier suite remains incompatible with the dedicated Telegram sender unless its old adapter-send fixtures are migrated to the transport boundary; its run was recorded as 50 passed, 8 failed, 1 skipped (failures are fixture expectations, not accepted as product proof).
 - `py_compile` for changed Python modules: passed.
 - `git diff --check`: passed.
+- Candidate checkout: clean at `9a7351340fce24858b3c5bebfb5d728fd4adb7f1`.
+- This manifest commit is separate from the tested candidate commit; PR #60 remains the public implementation artifact.
 - Shared runtime: intentionally not switched, installed, or restarted; release authority remains the paired-release owner task.
 
 ## Release boundary
