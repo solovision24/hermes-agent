@@ -132,10 +132,33 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     from gateway.run import GatewayRunner
     from gateway.config import Platform
     from tools import kanban_tools as kt
+    from tools import operational_sender
 
     # Allow ``tmp_path`` through the media-delivery safety filter. See the
     # companion test for the full explanation.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    runner_holder = {}
+    uploaded_paths = []
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            }}
+        if runner_holder.get("runner") is not None:
+            runner_holder["runner"]._running = False
+        return {"ok": True, "result": {"message_id": 1,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME,
+                         "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
+    monkeypatch.setattr(operational_sender, "send_operational_document", lambda path, caption="": uploaded_paths.append(path) or {"ok": True})
 
     real_pdf = tmp_path / "real.pdf"
     real_pdf.write_bytes(b"%PDF-fake")
@@ -158,6 +181,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
         os.environ.pop("HERMES_KANBAN_TASK", None)
 
     runner = object.__new__(GatewayRunner)
+    runner_holder["runner"] = runner
     runner._running = True
     runner._kanban_sub_fail_counts = {}
     runner._kanban_dispatcher_lock_handle = object()
@@ -193,5 +217,5 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
         )
 
     # Only the real file was uploaded.
-    assert len(documents_uploaded) == 1
-    assert "real.pdf" in documents_uploaded[0]
+    assert len(uploaded_paths) == 1
+    assert "real.pdf" in uploaded_paths[0]

@@ -25,6 +25,15 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+async def _deliver_kanban_text(adapter: Any, platform: str, chat_id: str,
+                               message: str, metadata: dict) -> Any:
+    """Deliver a watcher text ping, isolating Telegram from Halo."""
+    if platform == "telegram":
+        from tools.operational_sender import send_operational_message
+        return await asyncio.to_thread(send_operational_message, message)
+    return await adapter.send(chat_id, message, metadata=metadata)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -171,7 +180,7 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -453,6 +462,16 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "review_requested":
+                            summary = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                summary = f": {str(ev.payload['summary'])[:160]}"
+                            msg = f"🔎 {board_tag}{tag}Kanban {sub['task_id']} review requested{summary}"
+                        elif kind == "changes_requested":
+                            reason = ""
+                            if ev.payload and ev.payload.get("reason"):
+                                reason = f": {str(ev.payload['reason'])[:160]}"
+                            msg = f"🛠 {board_tag}{tag}Kanban {sub['task_id']} changes requested{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -543,8 +562,8 @@ class GatewayKanbanWatchersMixin:
                             # the self-post outcome, not by skipping the send.
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            _send_res = await _deliver_kanban_text(
+                                adapter, platform_str, sub["chat_id"], msg, metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -571,20 +590,24 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
+                            # Telegram watcher notifications are isolated to
+                            # the operational bot; the normal adapter would
+                            # leak completion attachments through Halo too.
                             if kind == "completed":
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
                                         chat_id=sub["chat_id"],
-                                        metadata=metadata,
+                                        metadata={**metadata, "_platform": platform_str},
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,
                                     )
                                 except Exception as art_exc:
-                                    logger.debug(
+                                    logger.warning(
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
+                                    raise
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
@@ -634,7 +657,7 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "block_loop_detected", "review_requested", "changes_requested")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
@@ -652,6 +675,8 @@ class GatewayKanbanWatchersMixin:
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "review_requested" in _wake_kinds: _parts.append("review requested")
+                            if "changes_requested" in _wake_kinds: _parts.append("changes requested")
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -923,9 +948,31 @@ class GatewayKanbanWatchersMixin:
         if not candidates:
             return
 
+        # Apply the same denylist, symlink and safe-root policy used by normal
+        # platform uploads before selecting the Telegram transport.  The
+        # operational sender is an isolation boundary, not a bypass around
+        # local-file validation.
         from gateway.platforms.base import BasePlatformAdapter
         candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
         if not candidates:
+            return
+
+        if metadata.get("_platform") == "telegram":
+            from tools.operational_sender import send_operational_document
+            failures = []
+            for path in candidates:
+                try:
+                    await asyncio.to_thread(send_operational_document, path)
+                except Exception as exc:
+                    failures.append((path, exc))
+            if failures:
+                # A partial batch may already have reached Telegram. Still
+                # fail the notification so the caller rewinds the claim and
+                # retries the batch instead of falsely advancing its cursor.
+                raise RuntimeError(
+                    "operational artifact delivery failed for "
+                    + ", ".join(path for path, _ in failures)
+                ) from failures[0][1]
             return
 
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -938,6 +985,7 @@ class GatewayKanbanWatchersMixin:
         image_paths = [p for p in candidates if _Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if _Path(p).suffix.lower() not in _IMAGE_EXTS]
 
+        failures = []
         if image_paths:
             try:
                 batch = [(f"file://{_quote(p)}", "") for p in image_paths]
@@ -945,6 +993,7 @@ class GatewayKanbanWatchersMixin:
                     chat_id=chat_id, images=batch, metadata=metadata,
                 )
             except Exception as exc:
+                failures.append((image_paths[0], exc))
                 logger.warning(
                     "kanban notifier: image batch upload failed: %s", exc,
                 )
@@ -961,10 +1010,16 @@ class GatewayKanbanWatchersMixin:
                         chat_id=chat_id, file_path=path, metadata=metadata,
                     )
             except Exception as exc:
+                failures.append((path, exc))
                 logger.warning(
                     "kanban notifier: artifact upload (%s) failed: %s",
                     path, exc,
                 )
+        if failures:
+            raise RuntimeError(
+                "artifact delivery failed for "
+                + ", ".join(path for path, _ in failures)
+            ) from failures[0][1]
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.

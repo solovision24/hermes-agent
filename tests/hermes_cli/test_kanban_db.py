@@ -1096,6 +1096,27 @@ def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatc
 
     from gateway.config import Platform
     from gateway.run import GatewayRunner
+    from tools import operational_sender
+
+    monkeypatch.setenv("SOLO_HERMES_BOT_TOKEN", "test-token")
+
+    requests = []
+
+    def fake_api(_token, method, data):
+        if method == "getMe":
+            return {"ok": True, "result": {
+                "id": operational_sender.EXPECTED_BOT_ID,
+                "username": operational_sender.EXPECTED_USERNAME,
+                "is_bot": True,
+            }}
+        requests.append((method, dict(data)))
+        return {"ok": True, "result": {"message_id": 1,
+                "from": {"id": operational_sender.EXPECTED_BOT_ID,
+                         "username": operational_sender.EXPECTED_USERNAME,
+                         "is_bot": True},
+                "chat": {"id": operational_sender.DEFAULT_CHAT_ID}}}
+
+    monkeypatch.setattr(operational_sender, "_api_call", fake_api)
 
     class RecordingAdapter:
         def __init__(self):
@@ -1146,11 +1167,13 @@ def test_notifier_behavior_on_blocked_recovery_exhausted(kanban_home, monkeypatc
     monkeypatch.setattr(asyncio, "sleep", one_tick)
     asyncio.run(runner._kanban_notifier_watcher(interval=1))
 
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["chat_id"] == "test-chat"
-    assert task_id in adapter.sent[0]["text"]
-    assert "gave up" in adapter.sent[0]["text"]
-    assert "test failure" in adapter.sent[0]["text"]
+    sends = [data for method, data in requests if method == "sendMessage"]
+    assert len(sends) == 1
+    assert sends[0]["chat_id"] == operational_sender.DEFAULT_CHAT_ID
+    assert task_id in sends[0]["text"]
+    assert "gave up" in sends[0]["text"]
+    assert "test failure" in sends[0]["text"]
+    assert adapter.sent == []
 
     with kb.connect() as conn:
         sub = kb.list_notify_subs(conn, task_id)[0]
