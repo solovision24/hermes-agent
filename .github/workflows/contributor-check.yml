@@ -42,9 +42,9 @@ jobs:
           # legacy AUTHOR_MAP in scripts/release.py.
           MISSING=""
           while IFS= read -r email; do
-            # Skip teknium and bot emails
+            # Skip bot emails and known local-machine identity artifacts.
             case "$email" in
-              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+              *teknium*|*noreply@github.com*|agent@Agents-Mac-mini.local|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
                 continue ;;
             esac
 
