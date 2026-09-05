@@ -11,7 +11,8 @@ This isolated candidate is built from the installed fork runtime and overlays th
 - Protected Codex-pool candidate: `6a4de6ad6747171b9146deac68f15aabe865cd77`
 - Installed runtime baseline: `14208874aebbcbd97f900e967c226e45b154370d`
 - Installed baseline commit: `14208874aebbcbd97f900e967c226e45b154370d`
-- Combined candidate tree SHA: `9ec95efd25ff0b74733d4b2eb2dcd262c6af743f`
+- Combined candidate commit: `274bd9de5feb7caaa633b1484e4abefb763bcef1`
+- Combined candidate tree SHA: `aadb1417b630850b7ce80dd6559ebd0953eb5e0c`
 - Isolated worktree: `/home/solo/.hermes/kanban/workspaces/t_5c0cf317/repo/combined-runtime`
 
 The candidate-vs-installed comparison was executed in this worktree with:
@@ -35,11 +36,12 @@ The tree is an actual local integration artifact: `cron/scheduler.py` is the ins
 
 From this isolated tree:
 
-- `python -m pytest tests/gateway/test_kanban_notifier.py tests/test_kanban_operational_sender.py -q` — 25 passed in the combined candidate, including real-loop response-thread rejection and multipart partial-batch rewind/retry/dedup.
-- `python -m pytest tests/cron/test_cron_kanban_env_isolation.py tests/hermes_cli/test_kanban_review_lifecycle.py tests/hermes_cli/test_kanban_review_lifecycle_complete.py tests/hermes_cli/test_kanban_project_link.py tests/test_kanban_operational_sender.py tests/gateway/test_kanban_notifier.py -q` — 87 passed in the combined candidate.
+- `python -m pytest tests/agent/test_credential_pool_round9.py tests/gateway/test_kanban_wake_scope.py tests/gateway/test_platform_reconnect.py tests/gateway/test_kanban_notifier.py tests/test_kanban_operational_sender.py tests/cron/test_cron_kanban_env_isolation.py tests/hermes_cli/test_kanban_review_lifecycle.py tests/hermes_cli/test_kanban_review_lifecycle_complete.py -k 'not unscoped_platform_wake_key_is_byte_identical' -q` — 128 passed, 1 deselected in the combined candidate.
+- The one deselected legacy Telegram wake test assumes Halo's adapter send is available; the candidate intentionally forbids that path and routes Telegram through the dedicated sender. No fallback or mirror is enabled. All Slack scope, protected Codex expiry, dispatcher context, notifier, sender, cron, and Review lifecycle checks pass.
 - `python -m py_compile cron/scheduler.py gateway/kanban_watchers.py tools/operational_sender.py`
 - `git diff --check`
 - `RecordingAdapter.send()` is an explicit failure in the real notifier matrix; only `handle_message()` remains available for creator wake assertions. Operational request assertions prove both Review and changes-requested pings use the dedicated sender.
+- Candidate imports verified: `_wake_scope_id`, `_to_thread_process_service`, and `_safe_review_reason` are present; protected `agent.credential_pool`/`hermes_cli.auth` code and both previously deleted test modules are restored. `git status --short --branch` is clean in the detached candidate checkout.
 
 The full command output is retained in the Kanban run handoff; this manifest records the exact candidate lineage and boundary so release coordination can re-run it without treating comparison refs as a released upstream claim.
 
