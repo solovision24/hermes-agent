@@ -1550,6 +1550,30 @@ _POOL_STATUS_FIELDS = (
     "last_error_reset_at",
 )
 
+# Codex refresh tokens are single-use credentials. A pool status write may be
+# based on an older in-memory snapshot, so it must not overwrite generation
+# material implicitly. Timestamps alone are not a safe CAS because they may
+# be equal, missing, skewed, or expired.
+_CODEX_GENERATION_FIELDS = (
+    "access_token",
+    "refresh_token",
+    "last_refresh",
+    "expires_at",
+    "expires_at_ms",
+    "agent_key",
+    "agent_key_expires_at",
+    "agent_key_expires_in",
+    "agent_key_obtained_at",
+    "agent_key_reused",
+    "obtained_at",
+    "expires_in",
+    "token_type",
+    "scope",
+    "client_id",
+    "portal_base_url",
+    "inference_base_url",
+)
+
 
 def _merge_disk_cooldown_state(
     entry: Dict[str, Any],
@@ -1580,16 +1604,21 @@ def _merge_disk_cooldown_state(
         )
 
         disk_status = disk_entry.get("last_status")
-        # A pool status update can be based on an old in-memory token pair.
-        # For single-use OAuth credentials, the on-disk generation wins when
-        # it was refreshed after that snapshot was read. Merge the complete
-        # generation so a stale status write cannot restore a consumed token.
-        disk_refresh_ts = _parse_absolute_timestamp(disk_entry.get("last_refresh")) or 0.0
-        mem_refresh_ts = _parse_absolute_timestamp(entry.get("last_refresh")) or 0.0
-        if disk_refresh_ts > mem_refresh_ts:
-            for token_field in ("access_token", "refresh_token", "last_refresh"):
-                if token_field in disk_entry:
-                    entry[token_field] = disk_entry[token_field]
+        # A pool status update can be based on an old in-memory snapshot. Do
+        # not use timestamp ordering as a generation CAS: equal timestamps,
+        # missing timestamps, clock skew, and expired timestamps are all valid
+        # states. The canonical on-disk generation wins for status-only
+        # writes. Explicit login/refresh replacement is marked by
+        # ``write_credential_pool(..., replaced_ids=...)`` and bypasses this
+        # merge while holding the same store lock.
+        if provider_id == "openai-codex":
+            merged_generation = dict(entry)
+            for field in _CODEX_GENERATION_FIELDS:
+                if field in disk_entry:
+                    merged_generation[field] = disk_entry[field]
+                else:
+                    merged_generation.pop(field, None)
+            entry = merged_generation
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return entry
         # A token change means the caller re-authed/refreshed this entry and
@@ -1623,6 +1652,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    replaced_ids: Optional[Iterable[str]] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1638,11 +1668,17 @@ def write_credential_pool(
     For entries present on BOTH sides, status fields are merged by
     ``last_status_at`` recency via ``_merge_disk_cooldown_state`` so a stale
     snapshot cannot erase a cooldown/quarantine another process just wrote.
+    Codex generation-bearing fields are preserved from disk for these
+    status-only writes even when timestamps are equal, absent, skewed, or
+    expired. Callers that intentionally replace a credential generation must
+    list its ID in ``replaced_ids``; that replacement is committed under this
+    same lock, giving refresh/login paths an explicit generation boundary.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
+    replaced = {rid for rid in (replaced_ids or ()) if rid}
     target_path = _codex_auth_file_path() if provider_id == "openai-codex" else _auth_file_path()
     with _auth_store_lock(target_path=target_path):
         auth_store = _load_auth_store(target_path)
@@ -1662,14 +1698,40 @@ def write_credential_pool(
             for entry in existing_list
             if isinstance(entry, dict) and entry.get("id")
         }
+        # A terminal singleton quarantine removes the canonical provider
+        # tokens before committing the pool removal. A stale writer that was
+        # already holding the old ``device_code`` snapshot must not recreate
+        # that quarantined row after the winner releases the root lock.
+        if provider_id == "openai-codex":
+            state = _load_provider_state(auth_store, provider_id) or {}
+            state_tokens = state.get("tokens") if isinstance(state, dict) else None
+            has_canonical_pair = bool(
+                isinstance(state_tokens, dict)
+                and str(state_tokens.get("access_token") or "").strip()
+                and str(state_tokens.get("refresh_token") or "").strip()
+            )
+            if not has_canonical_pair:
+                sanitized_entries = [
+                    entry
+                    for entry in sanitized_entries
+                    if not (
+                        isinstance(entry, dict)
+                        and entry.get("source") == "device_code"
+                        and entry.get("id") not in replaced
+                    )
+                ]
         new_ids = {
             entry.get("id")
             for entry in sanitized_entries
             if isinstance(entry, dict) and entry.get("id")
         }
         merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+            (
+                entry
+                if entry.get("id") in replaced
+                else _merge_disk_cooldown_state(
+                    entry, existing_by_id.get(entry.get("id")), provider_id
+                )
             )
             if isinstance(entry, dict)
             else entry
@@ -3692,6 +3754,16 @@ def _sync_codex_pool_entries(
         entry["last_error_reason"] = None
         entry["last_error_message"] = None
         entry["last_error_reset_at"] = None
+        # A login replacement is an explicit new generation. Carry every
+        # generation-bearing field that the provider returned and discard
+        # metadata from the previous login when the new payload omits it.
+        for field in _CODEX_GENERATION_FIELDS:
+            if field in {"access_token", "refresh_token", "last_refresh"}:
+                continue
+            if field in tokens:
+                entry[field] = tokens[field]
+            else:
+                entry.pop(field, None)
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:

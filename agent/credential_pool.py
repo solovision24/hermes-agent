@@ -702,7 +702,12 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        replaced_ids: Optional[List[str]] = None,
+    ) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -710,6 +715,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                replaced_ids=replaced_ids,
             )
 
     def _is_terminal_auth_failure(
@@ -841,8 +847,9 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            auth_path = auth_mod._codex_auth_file_path()
+            with _auth_store_lock(target_path=auth_path):
+                auth_store = _load_auth_store(auth_path)
                 state = _load_provider_state(auth_store, "openai-codex")
             if not isinstance(state, dict):
                 return entry
@@ -899,14 +906,42 @@ class CredentialPool:
                     "last_error_message": None,
                     "last_error_reset_at": None,
                 }
-                if state.get("last_refresh"):
-                    field_updates["last_refresh"] = state["last_refresh"]
+                for field in auth_mod._CODEX_GENERATION_FIELDS:
+                    if field in {"access_token", "refresh_token"}:
+                        continue
+                    if field == "last_refresh":
+                        if "last_refresh" in state:
+                            field_updates[field] = state["last_refresh"]
+                    elif field in tokens:
+                        field_updates[field] = tokens[field]
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
-                self._persist()
+                self._persist(
+                    replaced_ids=[updated.id]
+                    if self.provider == "openai-codex"
+                    else None
+                )
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
+        return entry
+
+    def _sync_codex_entry_from_canonical_pool(self, entry: PooledCredential) -> PooledCredential:
+        """Adopt a newer same-ID Codex generation from the root pool."""
+        try:
+            raw_entries = read_credential_pool("openai-codex")
+            for payload in raw_entries:
+                if not isinstance(payload, dict) or payload.get("id") != entry.id:
+                    continue
+                stored = PooledCredential.from_dict("openai-codex", payload)
+                if (
+                    stored.access_token != entry.access_token
+                    or stored.refresh_token != entry.refresh_token
+                ):
+                    self._replace_entry(entry, stored)
+                    return stored
+        except Exception as exc:
+            logger.debug("Failed to sync Codex entry from canonical pool: %s", exc)
         return entry
 
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -1196,6 +1231,12 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    entry_payload = entry.to_dict()
+                    for field in auth_mod._CODEX_GENERATION_FIELDS:
+                        if field in {"access_token", "refresh_token", "last_refresh"}:
+                            continue
+                        if field in entry_payload:
+                            tokens[field] = entry_payload[field]
 
                 elif self.provider == "xai-oauth":
                     tokens = state.get("tokens")
@@ -1207,7 +1248,21 @@ class CredentialPool:
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
 
-                if is_from_root and _wt_provider_id:
+                if self.provider == "openai-codex":
+                    # Codex always uses the canonical root store. The auth
+                    # store above was loaded from that exact target while
+                    # holding its lock, so commit directly instead of
+                    # inferring a source path from the profile fallback.
+                    # This keeps the singleton and pool generations coherent
+                    # for the next waiting refresh transaction.
+                    _store_provider_state(
+                        auth_store,
+                        "openai-codex",
+                        state,
+                        set_active=False,
+                    )
+                    _save_auth_store(auth_store, target_path=sync_target)
+                elif is_from_root and _wt_provider_id:
                     # Grant was resolved from root — write back to root
                     # only.  Do NOT call _store_provider_state on the
                     # profile auth_store (it would create a shadowing
@@ -1261,10 +1316,16 @@ class CredentialPool:
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
+                    if synced is entry:
+                        synced = self._sync_codex_entry_from_canonical_pool(entry)
                     if synced is not entry:
+                        # A waiter may have loaded the same single-use
+                        # generation before the winner rotated it. The
+                        # canonical reread is the generation CAS: adopt the
+                        # winner and do not POST the newly consumed token a
+                        # second time, even when the caller requested force.
                         entry = synced
-                        if not force and not self._entry_needs_refresh(entry):
-                            return entry
+                        return entry
                     return self._refresh_entry_impl(entry, force=force)
                 if (
                     synced.access_token != entry.access_token
@@ -1340,6 +1401,8 @@ class CredentialPool:
                     access_token=refreshed["access_token"],
                     refresh_token=refreshed["refresh_token"],
                     last_refresh=refreshed.get("last_refresh"),
+                    expires_at=refreshed.get("expires_at", entry.expires_at),
+                    expires_at_ms=refreshed.get("expires_at_ms", entry.expires_at_ms),
                 )
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the
@@ -1526,8 +1589,8 @@ class CredentialPool:
                                     store_refresh = str(tokens.get("refresh_token") or "").strip()
                                     entry_refresh = str(entry.refresh_token or "").strip()
                                     if not store_refresh or store_refresh == entry_refresh:
-                                        tokens.pop("access_token", None)
-                                        tokens.pop("refresh_token", None)
+                                        for token_field in auth_mod._CODEX_GENERATION_FIELDS:
+                                            tokens.pop(token_field, None)
                                         state["tokens"] = tokens
                                         state["last_auth_error"] = {
                                             "provider": "openai-codex",
@@ -1638,7 +1701,11 @@ class CredentialPool:
             last_error_reset_at=None,
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        self._persist(
+            replaced_ids=[updated.id]
+            if self.provider == "openai-codex"
+            else None
+        )
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
