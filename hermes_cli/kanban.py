@@ -440,7 +440,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     p_ingest_pr = sub.add_parser(
-        "ingest-pr", help="Idempotently create/update a Review card from a GitHub pull_request event"
+        "ingest-pr", help="Idempotently create/update one canonical Review card from a GitHub pull_request event"
     )
     p_ingest_pr.add_argument("--repository", required=True, help="owner/repo")
     p_ingest_pr.add_argument("--number", required=True, type=int, help="Pull request number")

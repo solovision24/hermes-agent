@@ -311,6 +311,51 @@ def test_external_draft_intake_promotes_when_marked_ready(
         assert ingests[-1].payload["draft"] is False
 
 
+def test_reopened_draft_intake_promotes_when_marked_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reopened draft's same-head ready webhook promotes intake triage."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    head_sha = "3" * 40
+    with kb.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened review", reviewer="orion",
+        )
+        assert task_id is not None
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened review", reviewer="orion",
+            action="closed",
+        ) == task_id
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened draft", reviewer="orion",
+            draft=True, action="reopened",
+        ) == task_id
+        triage = kb.get_task(conn, task_id)
+        assert triage is not None and triage.status == "triage"
+
+        assert kb.ingest_pull_request(
+            conn, repository="solovisionllc/solorecall", number=528,
+            head_sha=head_sha, title="Reopened review ready", reviewer="orion",
+            draft=False, action="synchronize",
+        ) == task_id
+        promoted = kb.get_task(conn, task_id)
+        assert promoted is not None
+        assert (promoted.status, promoted.assignee) == ("review", "orion")
+        events = kb.list_events(conn, task_id)
+        assert [event.kind for event in events].count("github_pr_reopened") == 1
+        assert events[-1].kind == "github_pr_ingested"
+
+
 def test_review_cli_round_trip_preserves_handoff(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

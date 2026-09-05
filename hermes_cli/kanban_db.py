@@ -4541,9 +4541,13 @@ def ingest_pull_request(
             # lifecycle transition; promote it to review without changing
             # any DEV remediation disposition (ready/todo/done below).
             if same_head["status"] == "triage" and not draft:
+                # A close/reopen cycle archives the original intake and emits
+                # ``github_pr_reopened`` instead of another ingested event.
+                # Use the latest intake-owned provenance from either event so
+                # a reopened draft can still promote when marked ready.
                 previous_intake = conn.execute(
                     "SELECT payload FROM task_events "
-                    "WHERE task_id = ? AND kind = 'github_pr_ingested' "
+                    "WHERE task_id = ? AND kind IN ('github_pr_ingested', 'github_pr_reopened') "
                     "ORDER BY id DESC LIMIT 1",
                     (task_id,),
                 ).fetchone()

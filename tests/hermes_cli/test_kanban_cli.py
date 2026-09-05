@@ -127,6 +127,21 @@ def test_ingest_pr_reopen_reuses_archived_head_without_duplicate(kanban_home):
     assert [row["id"] for row in rows] == [initial["id"]]
 
 
+def test_ingest_pr_reopened_draft_promotes_on_ready(kanban_home):
+    key = "--repository acme/widget --number 15 --head-sha 3333333333333333333333333333333333333333"
+    initial = json.loads(kc.run_slash(f"ingest-pr {key} --title initial --assignee reviewer --json"))
+    kc.run_slash(f"ingest-pr {key} --title closed --action closed --json")
+    reopened = json.loads(kc.run_slash(
+        f"ingest-pr {key} --title reopened --assignee reviewer --draft --action reopened --json"
+    ))
+    ready = json.loads(kc.run_slash(
+        f"ingest-pr {key} --title ready --assignee reviewer --action synchronize --json"
+    ))
+    assert reopened["id"] == initial["id"] == ready["id"]
+    assert reopened["status"] == "triage"
+    assert ready["status"] == "review"
+
+
 def test_ingest_pr_fences_untrusted_payload(kanban_home):
     payload = json.loads(kc.run_slash(
         "ingest-pr --repository acme/widget --number 14 --head-sha 2222222222222222222222222222222222222222 "
