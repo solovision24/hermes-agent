@@ -3240,12 +3240,34 @@ def request_changes(
             return False, "active run was not claimed from review"
 
         requested_event = _latest_event(conn, task_id, "review_requested")
+        external_fallback = False
+        external_provenance = None
         if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+            github_event = _latest_event(conn, task_id, "github_pr_ingested")
+            github_payload = _json_dict(_row_get(github_event, "payload"))
+            if (
+                github_payload.get("adapter") == "github_pr_native_ingest"
+                and github_payload.get("source") == "github_pull_request"
+                and isinstance(github_payload.get("repository"), str)
+                and isinstance(github_payload.get("number"), int)
+                and isinstance(github_payload.get("head_sha"), str)
+            ):
+                external_fallback = True
+                external_provenance = {
+                    key: github_payload.get(key)
+                    for key in ("repository", "number", "head_sha", "url")
+                    if github_payload.get(key) is not None
+                }
+            else:
+                return False, "no prior review_requested event"
+        requested_payload = _json_dict(_row_get(requested_event, "payload"))
+        implementer = _nonblank_str(requested_payload.get("implementer"))
         if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
+            if not external_fallback:
+                return False, "review handoff has no valid implementer provenance"
+            implementer = _canonical_assignee("dev")
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+ (fix(kanban): route external review changes to dev)
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3276,6 +3298,15 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **(external_provenance or {}),
+                **(
+                    {
+                        "provenance": "github_pr_external_intake",
+                        "github_pr": external_provenance,
+                    }
+                    if external_fallback
+                    else {}
+                ),
             },
             run_id=run_id,
         )
