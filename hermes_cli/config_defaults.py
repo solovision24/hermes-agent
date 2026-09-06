@@ -8,6 +8,13 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Resolve one deterministic model target before each user turn. The
+    # selected target is pinned for the whole turn; this is separate from
+    # provider fallback/provider_routing and is disabled by default.
+    "adaptive_model_routing": {
+        "enabled": False,
+        "routes": {},
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the

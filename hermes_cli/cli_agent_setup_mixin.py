@@ -325,6 +325,9 @@ class CLIAgentSetupMixin:
         API call is marked accordingly.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.adaptive_routing import resolve_route
+        from hermes_cli.config import load_config
+        from cli import logger
 
         runtime = {
             "api_key": self.api_key,
@@ -338,11 +341,41 @@ class CLIAgentSetupMixin:
             "args": list(self.acp_args or []),
             "credential_pool": getattr(self, "_credential_pool", None),
         }
+        adaptive = resolve_route(
+            load_config(), user_message, current_model=self.model,
+            current_provider=runtime["provider"],
+        )
+        if adaptive.enabled:
+            if adaptive.provider and adaptive.provider != runtime["provider"]:
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    switched = resolve_runtime_provider(
+                        requested=adaptive.provider, target_model=adaptive.model
+                    )
+                    runtime.update({k: switched.get(k) for k in (
+                        "api_key", "base_url", "provider", "requested_provider",
+                        "api_mode", "command", "args", "credential_pool",
+                    ) if k in switched})
+                except Exception:
+                    # A route must never make a healthy primary turn fail just
+                    # because its optional target is unavailable.
+                    adaptive = adaptive.__class__(adaptive.category, adaptive.level,
+                        self.model, runtime["provider"],
+                        adaptive.reason + "; target unavailable")
+            selected_model = adaptive.model or self.model
+        else:
+            selected_model = self.model
+        logger.info(
+            "Adaptive route: category=%s level=%s model=%s provider=%s reason=%s",
+            adaptive.category, adaptive.level, selected_model,
+            runtime.get("provider"), adaptive.reason,
+        )
         route = {
-            "model": self.model,
+            "model": selected_model,
             "runtime": runtime,
+            "adaptive": adaptive.as_dict(),
             "signature": (
-                self.model,
+                selected_model,
                 runtime["provider"],
                 runtime["requested_provider"],
                 runtime["base_url"],

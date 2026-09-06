@@ -9059,6 +9059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reaches the model on the gateway turn path.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from hermes_cli.adaptive_routing import resolve_route
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -9073,11 +9074,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "capabilities": dict(runtime_kwargs.get("capabilities") or {}),
         }
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
+        adaptive = resolve_route(
+            getattr(self, "config", None), user_message,
+            current_model=model, current_provider=runtime["provider"] or "",
+        )
+        selected_model = adaptive.model or model
+        # Gateway provider credentials are resolved by the caller. Keep the
+        # target provider explicit in audit metadata; a provider switch is only
+        # safe when the caller already supplied that runtime.
+        logger.info(
+            "Adaptive route: category=%s level=%s model=%s provider=%s reason=%s",
+            adaptive.category, adaptive.level, selected_model,
+            runtime.get("provider"), adaptive.reason,
+        )
         route = {
-            "model": model,
+            "model": selected_model,
             "runtime": runtime,
+            "adaptive": adaptive.as_dict(),
             "signature": (
-                model,
+                selected_model,
                 runtime["provider"],
                 runtime["requested_provider"],
                 runtime["base_url"],
