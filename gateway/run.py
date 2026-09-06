@@ -9078,10 +9078,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(self, "config", None), user_message,
             current_model=model, current_provider=runtime["provider"] or "",
         )
+        if adaptive.enabled and adaptive.provider and adaptive.provider != runtime["provider"]:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                switched = resolve_runtime_provider(
+                    requested=adaptive.provider, target_model=adaptive.model
+                )
+                runtime.update({k: switched.get(k) for k in (
+                    "api_key", "base_url", "provider", "requested_provider",
+                    "api_mode", "command", "args", "credential_pool",
+                ) if k in switched})
+            except Exception:
+                adaptive = adaptive.__class__(
+                    adaptive.category, adaptive.level, model,
+                    runtime["provider"], adaptive.reason + "; target unavailable",
+                )
         selected_model = adaptive.model or model
-        # Gateway provider credentials are resolved by the caller. Keep the
-        # target provider explicit in audit metadata; a provider switch is only
-        # safe when the caller already supplied that runtime.
         logger.info(
             "Adaptive route: category=%s level=%s model=%s provider=%s reason=%s",
             adaptive.category, adaptive.level, selected_model,
