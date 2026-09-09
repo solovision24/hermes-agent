@@ -204,6 +204,31 @@ def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
         ) == (True, "dev")
 
 
+def test_external_intake_defaults_omitted_reviewer_to_orion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    with kbc.connect() as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="solovisionllc/solorecall",
+            number=529,
+            head_sha="4" * 40,
+            title="Default reviewer",
+        )
+        assert task_id is not None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert (task.status, task.assignee) == ("review", "orion")
+
+
 def test_external_intake_replay_preserves_parent_wait_and_completed_states(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

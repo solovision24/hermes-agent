@@ -2081,7 +2081,7 @@ def ingest_pull_request(
             conn.execute("UPDATE tasks SET status='archived', completed_at=?, result=? WHERE id=?",
                          (int(time.time()), "Superseded by new GitHub PR head", row["id"]))
             _append_event(conn, row["id"], "github_pr_superseded", {**details, "superseded_by": head_sha})
-        task_id = create_task(conn, title=desired_title, body=body, assignee=reviewer,
+        task_id = create_task(conn, title=desired_title, body=body, assignee=desired_assignee,
                               idempotency_key=key, created_by="github-webhook", initial_status="running")
         # create_task deliberately accepts only dispatcher-owned starting states;
         # external intake is a guarded lifecycle transition into Review/Triage.
