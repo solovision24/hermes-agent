@@ -2313,6 +2313,28 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+async def _send_telegram_home_operational_notification(
+    chat_id: str,
+    message: str,
+) -> Any:
+    """Send a home-channel lifecycle notice through the verified bot only.
+
+    Home-channel startup/shutdown broadcasts are operational notices, not
+    conversation replies.  Keep them off the active profile/Halo adapter so a
+    shared Telegram chat cannot receive them from the wrong bot or inherit a
+    topic/reply target.  The sender validates identity, canonical destination,
+    and the response proof; exceptions intentionally propagate to the caller's
+    existing best-effort handling.
+    """
+    from tools import operational_sender
+
+    return await asyncio.to_thread(
+        operational_sender.send_operational_message,
+        message,
+        str(chat_id),
+    )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -9324,18 +9346,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    home.chat_id,
-                    home.thread_id,
-                    adapter=adapter,
-                )
-                if metadata:
-                    result = await adapter.send_notification(
-                        str(home.chat_id), msg, metadata=metadata
+                if platform is Platform.TELEGRAM:
+                    result = await _send_telegram_home_operational_notification(
+                        str(home.chat_id), msg
                     )
                 else:
-                    result = await adapter.send_notification(str(home.chat_id), msg)
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        home.chat_id,
+                        home.thread_id,
+                        adapter=adapter,
+                    )
+                    if metadata:
+                        result = await adapter.send_notification(
+                            str(home.chat_id), msg, metadata=metadata
+                        )
+                    else:
+                        result = await adapter.send_notification(str(home.chat_id), msg)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
@@ -21056,30 +21083,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             try:
-                metadata = self._thread_metadata_for_target(
-                    platform,
-                    home.chat_id,
-                    home.thread_id,
-                    adapter=transport.adapter,
-                )
-                if transport.is_relay:
-                    metadata = dict(metadata or {})
-                    if home.user_id:
-                        metadata["user_id"] = home.user_id
-                    if home.scope_id:
-                        metadata["scope_id"] = home.scope_id
-                send_metadata = _non_conversational_metadata(metadata, platform=platform)
-                if send_metadata is not None or transport.is_relay:
-                    result = await transport.send_notification(
-                        platform,
-                        str(home.chat_id),
-                        message,
-                        metadata=send_metadata,
-                    )
-                else:
-                    result = await transport.adapter.send_notification(
+                if platform is Platform.TELEGRAM:
+                    result = await _send_telegram_home_operational_notification(
                         str(home.chat_id), message
                     )
+                else:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        home.chat_id,
+                        home.thread_id,
+                        adapter=transport.adapter,
+                    )
+                    if transport.is_relay:
+                        metadata = dict(metadata or {})
+                        if home.user_id:
+                            metadata["user_id"] = home.user_id
+                        if home.scope_id:
+                            metadata["scope_id"] = home.scope_id
+                    send_metadata = _non_conversational_metadata(metadata, platform=platform)
+                    if send_metadata is not None or transport.is_relay:
+                        result = await transport.send_notification(
+                            platform,
+                            str(home.chat_id),
+                            message,
+                            metadata=send_metadata,
+                        )
+                    else:
+                        result = await transport.adapter.send_notification(
+                            str(home.chat_id), message
+                        )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
