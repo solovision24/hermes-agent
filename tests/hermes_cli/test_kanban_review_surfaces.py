@@ -202,7 +202,6 @@ def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
             reason="Cover the null-owner sharing case",
             expected_run_id=second_run,
         ) == (True, "dev")
- (fix(kanban): route external review changes to dev)
 
 
 def test_external_intake_replay_preserves_parent_wait_and_completed_states(

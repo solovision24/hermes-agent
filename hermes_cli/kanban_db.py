@@ -2082,7 +2082,10 @@ def ingest_pull_request(
                          (int(time.time()), "Superseded by new GitHub PR head", row["id"]))
             _append_event(conn, row["id"], "github_pr_superseded", {**details, "superseded_by": head_sha})
         task_id = create_task(conn, title=desired_title, body=body, assignee=reviewer,
-                              idempotency_key=key, created_by="github-webhook", initial_status=status)
+                              idempotency_key=key, created_by="github-webhook", initial_status="running")
+        # create_task deliberately accepts only dispatcher-owned starting states;
+        # external intake is a guarded lifecycle transition into Review/Triage.
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
         _append_event(conn, task_id, "github_pr_ingested", details)
     return task_id
 
@@ -3300,8 +3303,6 @@ def request_changes(
                 return False, "review handoff has no valid implementer provenance"
             implementer = _canonical_assignee("dev")
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
- (fix(kanban): route external review changes to dev)
-
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
