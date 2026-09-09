@@ -318,6 +318,20 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    _cmd("ingest-pr", [
+        _arg("--repository", required=True, help="GitHub owner/repository"),
+        _arg("--number", required=True, type=int, help="Pull request number"),
+        _arg("--head-sha", required=True, help="Immutable pull request head SHA"),
+        _arg("--title", required=True, help="Pull request title"),
+        _arg("--assignee", help="Reviewer profile"),
+        _arg("--url", help="Pull request URL"),
+        _arg("--draft", action="store_true"),
+        _arg("--checks-passed", choices=("true", "false")),
+        _arg("--mergeable", choices=("true", "false")),
+        _arg("--action", choices=("open", "reopened", "synchronize", "closed", "merged"), default="open"),
+        _arg("--metadata", help="Additional JSON object metadata"),
+        _json_flag(),
+    ], help="Idempotently ingest a GitHub pull request into Review"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
