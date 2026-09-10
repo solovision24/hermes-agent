@@ -134,6 +134,7 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 
 # --- Command dispatch ---
 
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
@@ -976,6 +977,30 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ingest_pr(args: argparse.Namespace) -> int:
+    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+    if rc:
+        return rc
+    as_bool = lambda value: None if value is None else value == "true"
+    with kbc.connect_closing() as conn:
+        task_id = kb.ingest_pull_request(
+            conn, repository=args.repository, number=args.number, head_sha=args.head_sha,
+            title=args.title, reviewer=args.assignee, url=args.url, draft=args.draft,
+            checks_passed=as_bool(args.checks_passed), mergeable=as_bool(args.mergeable),
+            metadata=metadata, action=args.action,
+        )
+        if not task_id:
+            return _err("kanban: GitHub intake did not produce a task id")
+        task = kb.get_task(conn, task_id)
+    if task is None:
+        return _err(f"kanban: ingested task {task_id} could not be read back")
+    if getattr(args, "json", False):
+        _print_json(_task_to_dict(task))
+    else:
+        print(f"Ingested GitHub PR as {task_id} ({task.status})")
+    return 0
+
+
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
@@ -1239,7 +1264,8 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
-    "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "request-review": _cmd_request_review, "ingest-pr": _cmd_ingest_pr,
+    "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
