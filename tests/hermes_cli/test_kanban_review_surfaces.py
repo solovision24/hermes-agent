@@ -124,7 +124,7 @@ def test_external_github_intake_routes_changes_to_dev_and_can_re_review(
     kb.init_db()
 
     head_sha = "0" * 40
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.ingest_pull_request(
             conn,
             repository="solovisionllc/solorecall",
@@ -217,7 +217,7 @@ def test_external_intake_replay_preserves_parent_wait_and_completed_states(
     kb.init_db()
 
     head_sha = "1" * 40
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="Upstream work", assignee="builder")
         task_id = kb.ingest_pull_request(
             conn,
@@ -275,7 +275,7 @@ def test_external_draft_intake_promotes_when_marked_ready(
     kb.init_db()
 
     head_sha = "2" * 40
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.ingest_pull_request(
             conn,
             repository="solovisionllc/solorecall",
@@ -323,7 +323,7 @@ def test_reopened_draft_intake_promotes_when_marked_ready(
     kb.init_db()
 
     head_sha = "3" * 40
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.ingest_pull_request(
             conn, repository="solovisionllc/solorecall", number=528,
             head_sha=head_sha, title="Reopened review", reviewer="orion",
