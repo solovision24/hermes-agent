@@ -6,6 +6,7 @@ AUTHOR_MAP dict in scripts/release.py is frozen; release.py merges both at
 import time with the directory winning on duplicates.
 """
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,14 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import release  # noqa: E402
 from add_contributor import add_contributor, read_mapping_file  # noqa: E402
+
+
+AUDIT_PATH = SCRIPTS_DIR / "audit_pr_attribution.py"
+_audit_spec = importlib.util.spec_from_file_location("audit_pr_attribution", AUDIT_PATH)
+if _audit_spec is None or _audit_spec.loader is None:
+    raise RuntimeError("could not load audit_pr_attribution")
+audit = importlib.util.module_from_spec(_audit_spec)
+_audit_spec.loader.exec_module(audit)
 
 
 # ── directory loader behavior ─────────────────────────────────────────
@@ -44,6 +53,167 @@ def test_effective_map_merges_legacy_and_directory():
     )
     for email, login in release._load_contributor_dir().items():
         assert release.AUTHOR_MAP[email] == login
+
+
+def test_directory_mapping_wins_over_case_only_legacy_key():
+    merged = release._merge_author_maps(
+        {"Owner@Example.com": "legacy-owner"},
+        {"owner@example.COM": "directory-owner"},
+    )
+
+    assert merged == {"owner@example.COM": "directory-owner"}
+
+
+def test_all_consumers_resolve_common_mixed_case_fixture(tmp_path, monkeypatch):
+    """The CI, audit, and release lookup paths agree on one fixture.
+
+    Keep the positives distinct so a consumer that silently drops either the
+    directory or legacy source cannot pass this common-fixture regression.
+    """
+    scripts = tmp_path / "scripts"
+    emails = tmp_path / "contributors" / "emails"
+    scripts.mkdir()
+    emails.mkdir(parents=True)
+    (emails / "DirOnly@Example.com").write_text("directory-owner\n", encoding="utf-8")
+    (emails / "Overlap@Example.com").write_text("directory-overlap\n", encoding="utf-8")
+    (scripts / "release.py").write_text(
+        'AUTHOR_MAP = {"LegacyOnly@Example.net": "legacy-owner", '
+        '"overlap@example.com": "legacy-overlap"}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    positives = (
+        "DIRONLY@example.com", "LEGACYONLY@EXAMPLE.NET", "overlap@example.com",
+    )
+    assert all(audit.is_mapped(email) for email in positives)
+    for email in ("*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com"):
+        assert not audit.is_mapped(email)
+
+    merged = release._merge_author_maps(
+        {"LegacyOnly@Example.net": "legacy-owner", "overlap@example.com": "legacy-overlap"},
+        {"DirOnly@Example.com": "directory-owner", "Overlap@Example.com": "directory-overlap"},
+    )
+    monkeypatch.setattr(release, "AUTHOR_MAP", merged)
+    assert release.resolve_author("Author", "DIRONLY@EXAMPLE.COM") == "@directory-owner"
+    assert release.resolve_author("Author", "legacyonly@EXAMPLE.net") == "@legacy-owner"
+    assert release.resolve_author("Author", "overlap@EXAMPLE.COM") == "@directory-overlap"
+    for email in ("*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com"):
+        assert release._lookup_author_map(email) is None
+
+    # Execute the predicate directly from the workflow so this test cannot
+    # drift into validating a copied shell fragment.
+    workflow = (REPO_ROOT / ".github" / "workflows" / "contributor-check.yml").read_text(
+        encoding="utf-8"
+    )
+    predicate = workflow.split('          while IFS= read -r email; do\n', 1)[1].split(
+        '          done <<< "$NEW_EMAILS"\n', 1
+    )[0]
+    predicate = "while IFS= read -r email; do\n" + predicate + 'done <<< "$NEW_EMAILS"\n'
+    predicate = "\n".join(line[10:] if line.startswith("          ") else line
+                             for line in predicate.splitlines()) + "\n"
+    ci_inputs = "\n".join((
+        "DIRONLY@example.com", "LEGACYONLY@EXAMPLE.NET", "overlap@example.com",
+        "*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com",
+    ))
+
+    def run_ci() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", "MISSING=''\nNEW_EMAILS=$1\n" + predicate
+             + "printf '%b' \"$MISSING\"\n", "ci-check", ci_inputs],
+            cwd=tmp_path, capture_output=True, text=True,
+        )
+
+    proc = run_ci()
+    assert proc.returncode == 0, proc.stderr
+    expected_missing = (
+        "*@example.com", "[Oo]verlap@Example.com", "ordinary@example.com",
+    )
+    assert {line.strip().split(" ", 1)[0] for line in proc.stdout.splitlines()
+            if line.startswith("  ")} == set(expected_missing)
+    assert all(f"  {email} (" in proc.stdout for email in expected_missing)
+    assert all(f"  {email} (" not in proc.stdout for email in positives)
+
+    # Prove the common fixture really covers both mapping sources: removing
+    # either source must make its source-specific positive fail the actual CI
+    # predicate, rather than letting an overlapping positive mask the gap.
+    release_py = scripts / "release.py"
+    release_backup = scripts / "release.py.disabled"
+    release_py.rename(release_backup)
+    try:
+        legacy_disabled = run_ci()
+    finally:
+        release_backup.rename(release_py)
+    assert legacy_disabled.returncode == 0, legacy_disabled.stderr
+    assert "  LEGACYONLY@EXAMPLE.NET (" in legacy_disabled.stdout
+    assert "  DIRONLY@example.com (" not in legacy_disabled.stdout
+
+    emails_backup = tmp_path / "contributors" / "emails.disabled"
+    emails.rename(emails_backup)
+    try:
+        directory_disabled = run_ci()
+    finally:
+        emails_backup.rename(emails)
+    assert directory_disabled.returncode == 0, directory_disabled.stderr
+    assert "  DIRONLY@example.com (" in directory_disabled.stdout
+    assert "  LEGACYONLY@EXAMPLE.NET (" not in directory_disabled.stdout
+
+
+def test_attribution_audit_rejects_email_named_directory(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"
+    emails = tmp_path / "contributors" / "emails"
+    scripts.mkdir()
+    emails.mkdir(parents=True)
+    (emails / "not-a-mapping@example.com").mkdir()
+    (emails / "real-mapping@example.com").write_text("real-user\n", encoding="utf-8")
+    (scripts / "release.py").write_text("AUTHOR_MAP = {}\n", encoding="utf-8")
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+
+    assert not audit.is_mapped("NOT-A-MAPPING@example.com")
+    assert audit.is_mapped("REAL-MAPPING@example.com")
+
+
+def test_resolve_author_matches_mapping_email_case_insensitively(monkeypatch):
+    monkeypatch.setattr(release, "AUTHOR_MAP", {"agent@Agents-Mac-mini.local": "momomojo"})
+
+    assert release.resolve_author("Agent", "agent@agents-Mac-mini.local") == "@momomojo"
+
+
+def test_attribution_audit_matches_legacy_email_case_insensitively(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (tmp_path / "contributors" / "emails").mkdir(parents=True)
+    (scripts / "release.py").write_text(
+        'AUTHOR_MAP = {"DECLANBATESMITH@OUTLOOK.COM": "cat-thats-fat"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    assert audit.is_mapped("declanbatesmith@outlook.com")
+
+
+def test_attribution_audit_rejects_unmapped_literal_controls(tmp_path, monkeypatch):
+    scripts = tmp_path / "scripts"
+    emails = tmp_path / "contributors" / "emails"
+    scripts.mkdir()
+    emails.mkdir(parents=True)
+    (scripts / "release.py").write_text("AUTHOR_MAP = {}\n", encoding="utf-8")
+    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    for email in ("literal*gmail@example.com", "literal[gmail@example.com", "ordinary@example.com"):
+        assert not audit.is_mapped(email)
+
+
+def test_ci_lookup_controls_are_literal_and_case_insensitive():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "contributor-check.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "grep -Fxi -- \"$email\"" in workflow
+    assert "grep -iFq -- \"\\\"${email}\\\"\"" in workflow
+    assert "find contributors/emails -iname \"$email\"" not in workflow
+
+
+@pytest.mark.parametrize("email", ["literal*gmail@example.com", "literal[gmail@example.com"])
+def test_lookup_author_map_treats_email_as_literal(monkeypatch, email):
+    monkeypatch.setattr(release, "AUTHOR_MAP", {email: "mapped-user"})
+
+    assert release.resolve_author("Author", email.upper()) == "@mapped-user"
 
 
 
