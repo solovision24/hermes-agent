@@ -7,8 +7,24 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from hermes_cli import kanban_pr_acceptance as acceptance
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
+
+
+def test_paginated_gh_output_works_without_slurp(monkeypatch):
+    calls = []
+
+    class Result:
+        stdout = '[{"id": 1}]\n[{"id": 2}]\n'
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return Result()
+
+    monkeypatch.setattr(acceptance.subprocess, "run", run)
+    assert acceptance._api("repos/acme/repo/statuses", paginate=True) == [[{"id": 1}], [{"id": 2}]]
+    assert "--slurp" not in calls[0]
 
 
 @pytest.fixture
