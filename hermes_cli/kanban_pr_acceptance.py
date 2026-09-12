@@ -27,10 +27,39 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False):
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
-        command += ["--paginate", "--slurp"]
+        # gh 2.45 supports --paginate but not the newer --slurp flag.  REST
+        # pagination writes one JSON document per page, so decode all of the
+        # documents ourselves and preserve the page-oriented contract below.
+        command += ["--paginate"]
     result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                             text=True, timeout=30, check=True)
-    value = json.loads(result.stdout)
+    if paginate:
+        decoder = json.JSONDecoder()
+        documents = []
+        position = 0
+        while position < len(result.stdout):
+            while position < len(result.stdout) and result.stdout[position].isspace():
+                position += 1
+            if position == len(result.stdout):
+                break
+            value, end = decoder.raw_decode(result.stdout, position)
+            documents.append(value)
+            position = end
+        if not documents:
+            raise ValueError("GitHub returned no pagination evidence")
+        if len(documents) == 1:
+            value = documents[0]
+            # Compatibility with the former --slurp shape used by tests and
+            # by any wrapper that already returns a list of pages.
+            if isinstance(value, list) and value and (
+                all(isinstance(page, list) for page in value)
+                or all(isinstance(page, dict) and "check_runs" in page for page in value)
+            ):
+                return value
+            return [value]
+        value = documents
+    else:
+        value = json.loads(result.stdout)
     if isinstance(value, dict) and value.get("errors"):
         raise ValueError("GitHub returned incomplete GraphQL evidence")
     return value
