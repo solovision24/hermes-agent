@@ -478,6 +478,165 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_changes_requested_reentry_respawns_ready_lane_despite_pr_comment(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RCA t_821a9951: a reviewer's ``changes_requested`` handoff back to the
+    implementer must re-spawn the ready lane even though the card's comments
+    carry the PR URL.
+
+    The active-PR guard reads comment TEXT, so without a re-entry exemption
+    every remediation round on a PR-bearing card is held for the full 24 h
+    window — the reviewer had to hand-run the dispatch sequence
+    (claim/_resolve_worktree_workspace/_default_spawn/_set_worker_pid) to
+    continue the loop.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    spawned: list[str] = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="remediate me", assignee="implementer")
+        implementation = kb.claim_task(conn, tid)
+        assert implementation is not None
+        kb.add_comment(
+            conn, tid, author="implementer",
+            body="Opened https://github.com/example/repo/pull/321 for review.",
+        )
+        assert kb.request_review(
+            conn, tid, summary="PR ready",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="missing regression test",
+            expected_run_id=review.current_run_id,
+        )
+        assert ok and implementer == "implementer"
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert (task.status, task.assignee) == ("ready", "implementer")
+
+        # The re-entry is NEWER than the PR comment -> remediation, not duplicate
+        # work: no guard, and the very next tick spawns the implementer.
+        assert kbd.check_respawn_guard(conn, tid) is None
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert spawned == [tid]
+    assert tid in [s[0] for s in result.spawned]
+    assert result.respawn_guarded == []
+
+
+def test_active_pr_guard_still_fires_without_reviewer_reentry(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Duplicate-work protection survives the re-entry exemption.
+
+    The guard consults no live PR state, so a PR URL comment with no NEWER
+    reviewer re-entry (a merged/closed PR, or a branch whose head already
+    carries the pushed work) must stay deferred instead of blind-spawning a
+    duplicate. A re-entry OLDER than the newest PR comment is not an exemption
+    either: the work that comment describes is still in flight.
+    """
+    import time as _time
+
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    with kbc.connect() as conn:
+        merged = kb.create_task(conn, title="already merged", assignee="implementer")
+        kb.add_comment(
+            conn, merged, author="implementer",
+            body="Merged: https://github.com/example/repo/pull/321",
+        )
+        assert kbd.check_respawn_guard(conn, merged) == "active_pr"
+
+        in_flight = kb.create_task(conn, title="round in flight", assignee="implementer")
+        kb.add_comment(
+            conn, in_flight, author="implementer",
+            body="pushed to https://github.com/example/repo/pull/654",
+        )
+        now = int(_time.time())
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn, in_flight, "changes_requested",
+                {"reason": "earlier round", "implementer": "implementer"},
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = ? "
+                "WHERE task_id = ? AND kind = 'changes_requested'",
+                (now - 120, in_flight),
+            )
+        assert kbd.check_respawn_guard(conn, in_flight) == "active_pr"
+
+        result = kbd.dispatch_once(conn, dry_run=True)
+
+    guarded = dict(result.respawn_guarded)
+    assert guarded.get(merged) == "active_pr"
+    assert guarded.get(in_flight) == "active_pr"
+    assert not [s for s in result.spawned if s[0] in {merged, in_flight}]
+
+
+def test_active_pr_guard_releases_after_bounded_guarded_ticks(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The comment-text guard may DELAY a spawn but never pin the card.
+
+    After ``_RESPAWN_GUARD_MAX_GUARD_TICKS`` consecutive ``active_pr`` guards
+    the ready lane gets one spawn attempt — the bound that makes t_821a9951's
+    multi-hour (up to 24 h) stranding impossible for a stale or false-positive
+    PR reference.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    spawned: list[str] = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale pr reference", assignee="implementer")
+        kb.add_comment(
+            conn, tid, author="implementer",
+            body="see https://github.com/example/repo/pull/9",
+        )
+        for _ in range(kbd._RESPAWN_GUARD_MAX_GUARD_TICKS):
+            assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+            # Exactly what the dispatcher records when the guard fires.
+            with kb.write_txn(conn):
+                kb._append_event(conn, tid, "respawn_guarded", {"reason": "active_pr"})
+
+        assert kbd.check_respawn_guard(conn, tid) is None
+        result = kbd.dispatch_once(conn, spawn_fn=spawn)
+
+    assert spawned == [tid]
+    assert tid in [s[0] for s in result.spawned]
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
