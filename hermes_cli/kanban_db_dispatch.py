@@ -87,6 +87,21 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Event kinds that PROVE a card moved on from the PR a comment references: an
+# operator reassign (filtered to a real profile change by ``_is_handoff_event``)
+# or a reviewer re-entering the IMPLEMENTER lane on the same branch/PR. The
+# latter two are an explicit "same work, more of it", the review-loop analogue of
+# rule 3's requeue exemption: a card carrying one of these NEWER than its newest
+# PR-URL comment is being remediated, never duplicated.
+_HANDOFF_EVENT_KINDS = ("assigned", "changes_requested", "review_reopened")
+
+# Fail-open bound for the ready-lane PR guard. That rule scans comment TEXT and
+# consults no live PR state, so a stale or false-positive reference must never
+# pin a card indefinitely: after this many consecutive ``respawn_guarded
+# {reason: active_pr}`` ticks the ready lane gets one spawn attempt anyway, and
+# the guard re-arms on the next tick when it was right.
+_RESPAWN_GUARD_MAX_GUARD_TICKS = 2
+
 
 @dataclass
 class DispatchResult:
@@ -140,7 +155,9 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment — a
+    deferral, re-armed each tick but bounded by
+    ``_RESPAWN_GUARD_MAX_GUARD_TICKS``)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1488,6 +1505,27 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _consecutive_guard_ticks(
+    conn: sqlite3.Connection, task_id: str, reason: str,
+) -> int:
+    """Consecutive ``respawn_guarded {reason}`` events since the last dispatch
+    attempt on ``task_id`` (newest-first; a different guard reason or a real
+    ``spawned``/``claimed`` event ends the run)."""
+    count = 0
+    for row in conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('respawn_guarded', 'spawned', 'claimed') "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _RESPAWN_GUARD_MAX_GUARD_TICKS),
+    ).fetchall():
+        if row["kind"] != "respawn_guarded":
+            break
+        if _kb._json_dict(row["payload"]).get("reason") != reason:
+            break
+        count += 1
+    return count
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1505,9 +1543,12 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
-    passes own those.
+    PR, or a reviewer's ``changes_requested``/``review_reopened`` re-entry onto
+    the same branch/PR arrived after it. The guard is also fail-open: after
+    ``_RESPAWN_GUARD_MAX_GUARD_TICKS`` consecutive ``active_pr`` ticks the ready
+    lane gets one spawn attempt). The review lane skips the last two: they are
+    the *inputs* to a review handoff. Stale / dead claim locks are NOT a guard
+    reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1585,13 +1626,22 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    # 4. GitHub PR URL in a recent comment — a prior worker already opened a PR,
+    #    so a blind re-spawn risks a duplicate. This rule reads comment TEXT and
+    #    consults no live PR state, so it carries two exemptions:
+    #    (a) a handoff/review re-entry AFTER the newest PR comment (operator
+    #        reassign to a DIFFERENT profile, ``changes_requested``,
+    #        ``review_reopened``) is the next round, not duplicate work — the
+    #        review-loop analogue of rule 3's requeue exemption. Without it every
+    #        review loop on a PR-bearing card is stranded for the whole window
+    #        and the reviewer has to hand-run the dispatch sequence to continue
+    #        (t_821a9951).
+    #    (b) the fail-open bound: after _RESPAWN_GUARD_MAX_GUARD_TICKS
+    #        consecutive ``active_pr`` guards the ready lane gets one spawn
+    #        attempt, so a stale/false-positive PR reference can never pin a card
+    #        for 24 h. The guard re-arms on the next tick when it was right.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    pr_url_seen = False
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
@@ -1600,15 +1650,20 @@ def check_respawn_guard(
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
+        pr_url_seen = True
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            "AND kind IN (" + ", ".join("?" for _ in _HANDOFF_EVENT_KINDS) + ")",
+            (task_id, int(c["created_at"] or 0), *_HANDOFF_EVENT_KINDS),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
+    if pr_url_seen and (
+        _consecutive_guard_ticks(conn, task_id, "active_pr")
+        < _RESPAWN_GUARD_MAX_GUARD_TICKS
+    ):
         return "active_pr"
 
     return None
