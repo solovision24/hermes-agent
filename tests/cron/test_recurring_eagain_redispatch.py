@@ -21,6 +21,17 @@ new recovery path.
 This file drives the REAL `tick()` end-to-end against a throwaway HERMES_HOME:
   tick 1 -> script EAGAINs (subprocess.run raises OSError 11) -> failed exec row
   tick 2 -> substrate recovered (script runs clean) -> job MUST fire again
+
+ISOLATION NOTE (t_3119ae96): `tick()` also starts cron's throttled background
+worktree-maintenance daemon (`cron.scheduler._maybe_run_worktree_maintenance`
+-> `cli._prune_stale_worktrees` -> `git rev-parse --is-shallow-repository`) via
+the GLOBAL `subprocess` module. On a checkout that has a `.worktrees/` dir
+(the live install does; a fresh `git worktree` does not) that thread raced the
+scripted first Popen and consumed the injected EAGAIN, so the job's own script
+spawn succeeded and the row read `completed` instead of `failed` — flaky by
+machine timing. The `wedge_env` fixture therefore no-ops that background entry
+point, and the EAGAIN stub is scoped to the job's own script spawn, so no
+in-process thread can steal the injected failure.
 """
 from __future__ import annotations
 
@@ -68,15 +79,29 @@ def wedge_env(tmp_path, monkeypatch):
     script = hermes_home / "scripts" / "probe.py"
     script.write_text("print('ok')\n")
 
+    # Test isolation (t_3119ae96): `tick()` fires cron's throttled background
+    # worktree-maintenance daemon on its own thread, and that thread shells out
+    # through the GLOBAL `subprocess` module — the same module the EAGAIN stub
+    # below replaces. On a checkout with a `.worktrees/` dir it raced the test
+    # for Popen call #1 and stole the injected EAGAIN (job's script then ran
+    # clean -> row `completed`, test red). No-op the entry point: this file
+    # tests dispatch/re-dispatch, not worktree GC.
+    import cron.scheduler as _sched_mod
+    monkeypatch.setattr(_sched_mod, "_maybe_run_worktree_maintenance", lambda: None)
+
     return {"home": hermes_home, "job_id": job["id"]}
 
 
 class TestEAGAINRecurringRedispatches:
     def _make_script_eagain(self, env, monkeypatch):
-        """Make the next subprocess.Popen raise EAGAIN once, then pass.
+        """Make the next JOB-SCRIPT subprocess.Popen raise EAGAIN once, then pass.
 
         The script runner spawns via Popen (polling loop for cancel/timeout),
         so the substrate-failure injection point is the Popen constructor.
+        The stub is scoped to the job's own script spawn (argv carrying the
+        probe script): the patched attribute is the GLOBAL ``subprocess.Popen``,
+        so an unrelated in-process caller (a background scheduler thread) would
+        otherwise be able to consume the single injected EAGAIN.
         """
         import cron.scheduler as sched_mod
         state = {"n": 0}
@@ -94,7 +119,17 @@ class TestEAGAINRecurringRedispatches:
             def wait(self, timeout=None):
                 return 0
 
+        def _is_job_script_spawn(argv) -> bool:
+            if isinstance(argv, (str, bytes)):
+                return "probe.py" in str(argv)
+            try:
+                return any("probe.py" in str(part) for part in argv)
+            except TypeError:
+                return False
+
         def fake_popen(argv, **kwargs):
+            if not _is_job_script_spawn(argv):
+                return _OkProc(argv, **kwargs)
             state["n"] += 1
             if state["n"] == 1:
                 raise OSError(11, "Resource temporarily unavailable")
