@@ -335,3 +335,117 @@ def test_cli_list_and_ack(monkeypatch, tmp_path, capsys):
         incident_action="ack", state=None, incident_id=None
     )
     assert cron_incidents(missing_args) == 1
+
+
+# ── Delivery-failure incidents (completed run, failed notice) ──────────────
+
+
+def _tick_completed_with_failed_delivery(job, tmp_path, delivery_error):
+    """One ``run_one_job`` tick whose RUN succeeds but whose DELIVERY returns an error.
+
+    This is the dark-lane path: the execution ledger records ``delivery_outcome='failed'`` while
+    the run itself completed fine, so before the delivery incident existed nothing durable said the
+    lane was dark. Returns the list of delivery attempts (notice texts).
+    """
+    attempts = []
+
+    def fake_deliver(jb, content, adapters=None, loop=None, **kwargs):
+        attempts.append(content)
+        return delivery_error
+
+    fake_db = MagicMock()
+    with cron_jobs.use_cron_store(tmp_path), \
+         patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state_registry.acquire", return_value=fake_db), \
+         patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
+         patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               return_value={
+                   "api_key": "test-key",
+                   "base_url": "https://example.invalid/v1",
+                   "provider": "openrouter",
+                   "api_mode": "chat_completions",
+               }), \
+         patch.object(sched, "run_job", return_value=(True, "run output", "watchdog output", None)), \
+         patch.object(sched, "_deliver_result", side_effect=fake_deliver):
+        sched.run_one_job(dict(job))
+    return attempts
+
+
+_DELIVERY_ERROR = (
+    "operational Telegram delivery failed: Telegram sendMessage failed with HTTP 400: "
+    '{"ok":false,"error_code":400,"description":"Bad Request: message is too long"}'
+)
+
+
+def test_completed_run_with_failed_delivery_mints_delivery_incident(monkeypatch, tmp_path):
+    """A run that COMPLETES but whose delivery fails must leave a durable incident behind."""
+    import cron.executions as executions
+
+    inc = _point_db(monkeypatch, tmp_path)
+    job = _job(deliver="telegram:8148316720")
+    with cron_jobs.use_cron_store(tmp_path):
+        cron_jobs.save_jobs([job])
+        assert _tick_completed_with_failed_delivery(job, tmp_path, _DELIVERY_ERROR)
+        # The run itself completed; only its notice failed (the job record says so too).
+        stored = cron_jobs.get_job(job["id"])
+        assert stored is not None
+        assert stored["last_status"] == "delivery_failed"
+
+    record = executions.latest_execution(job["id"])
+    assert record is not None
+    assert record["status"] == "completed"
+    assert record["delivery_outcome"] == "failed"
+
+    rows = inc.list_incidents()
+    assert len(rows) == 1, "the failed delivery must mint exactly one incident"
+    row = rows[0]
+    assert row["job_id"] == job["id"]
+    assert row["failure_type"] == "delivery"
+    # Nothing left the process, so nothing was alerted — but the incident is visible.
+    assert row["state"] == "detected"
+    assert row["error"].startswith(f"{sched.DELIVERY_FAILURE_SIGNATURE}: ")
+    assert "HTTP 400" in row["error"]
+
+
+def test_acked_delivery_signature_suppresses_the_repeat(monkeypatch, tmp_path):
+    """Acking the delivery incident silences the same failure: one row, refreshed, never re-opened."""
+    inc = _point_db(monkeypatch, tmp_path)
+    job = _job(deliver="telegram:8148316720")
+    with cron_jobs.use_cron_store(tmp_path):
+        cron_jobs.save_jobs([job])
+        _tick_completed_with_failed_delivery(job, tmp_path, _DELIVERY_ERROR)
+        rows = inc.list_incidents()
+        assert len(rows) == 1
+        inc_id = rows[0]["id"]
+        first_seen, last_seen = rows[0]["first_seen_at"], rows[0]["last_seen_at"]
+        assert inc.ack_incident(inc_id) is True
+
+        _tick_completed_with_failed_delivery(job, tmp_path, _DELIVERY_ERROR)
+
+    rows = inc.list_incidents()
+    assert len(rows) == 1, "an acked signature must not mint a second incident"
+    row = rows[0]
+    assert row["id"] == inc_id
+    assert row["state"] == "closed"
+    assert row["first_seen_at"] == first_seen
+    assert row["last_seen_at"] >= last_seen
+
+
+def test_delivery_incident_store_failure_does_not_break_the_run(monkeypatch, tmp_path):
+    """Best-effort: an incident-store error must never change the run's terminal bookkeeping."""
+    import cron.executions as executions
+
+    _point_db(monkeypatch, tmp_path)
+    job = _job(deliver="telegram:8148316720")
+    with cron_jobs.use_cron_store(tmp_path), \
+         patch("cron.incidents.upsert_incident", side_effect=RuntimeError("db locked")):
+        cron_jobs.save_jobs([job])
+        _tick_completed_with_failed_delivery(job, tmp_path, _DELIVERY_ERROR)
+
+    record = executions.latest_execution(job["id"])
+    assert record is not None
+    assert record["status"] == "completed"
+    assert record["delivery_outcome"] == "failed"

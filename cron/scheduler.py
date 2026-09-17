@@ -327,16 +327,20 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
 
 
 def _upsert_incident_for_failure(
-    job: dict, error: str, *, output_file: Optional[Any] = None
+    job: dict, error: str, *, output_file: Optional[Any] = None,
+    failure_type: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Record a durable failure incident (grouped by job + error signature). Returns
     ``(acked, incident_id)``; acked=True when the signature's incident is already ``closed`` ->
-    suppress the per-run ping. Store errors log at debug; the caller delivers as if none existed."""
+    suppress the per-run ping. Store errors log at debug; the caller delivers as if none existed.
+    ``failure_type`` overrides the store's keyword classification when the caller already knows the
+    fault class (e.g. a failed DELIVERY rather than a failed run)."""
     try:
         from cron.incidents import get_incident, upsert_incident
 
         incident_id, _is_new = upsert_incident(
-            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
+            job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
+            failure_type=failure_type)
         incident = get_incident(incident_id)
         acked = bool(incident and incident.get("state") == "closed")
         return acked, incident_id
@@ -357,6 +361,33 @@ def _mark_incident_alerted(incident_id: Optional[str]) -> None:
         set_incident_state(incident_id, "alerted")
     except Exception as exc:
         logger.debug("Failed marking incident %s alerted: %s", incident_id, exc)
+
+
+DELIVERY_FAILURE_SIGNATURE = "cron delivery failed"
+
+
+def _record_delivery_failure_incident(job: dict, delivery_error: Optional[str]) -> Optional[str]:
+    """Durable incident for a run that COMPLETED but whose DELIVERY failed.
+
+    The run-failure paths already leave a ``detected`` incident behind when their own notice cannot
+    leave; a completed run whose notice failed used to leave nothing but ``last_status=
+    'delivery_failed'`` + ``last_delivery_error`` on the job record, which no incident reader (cron
+    watchdogs, board maintenance) can see — a dark lane can stay dark for hours. Signature is
+    ``"cron delivery failed: <delivery_error>"`` so repeats dedup onto one incident.
+
+    State deliberately stays ``detected``: nothing left the process, so nothing was alerted, and
+    ``_mark_incident_alerted`` is never called from here. An acked (``closed``) signature keeps
+    suppressing the repeat through the store's per-signature dedup, exactly like the run-failure
+    path. Best-effort: a store failure never changes the run's terminal bookkeeping.
+    """
+    err = str(delivery_error or "").strip() or "unknown delivery error"
+    acked, incident_id = _upsert_incident_for_failure(
+        job, f"{DELIVERY_FAILURE_SIGNATURE}: {err}", failure_type="delivery")
+    if acked:
+        logger.debug(
+            "Job '%s': delivery failure incident %s already acked — repeat suppressed",
+            job["id"], incident_id)
+    return incident_id
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -2793,6 +2824,12 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
+    if delivery_outcome == "failed":
+        # A completed run whose DELIVERY failed is otherwise invisible to incident readers (only
+        # run failures mint incidents): mint/refresh the job's 'delivery' incident so a dark lane
+        # surfaces on the board and to watchdogs. Nothing left the process on this path, so no
+        # 'alerted' transition happens here — see _record_delivery_failure_incident.
+        _record_delivery_failure_incident(job, d.delivery_error)
     finish_execution(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
     return True
