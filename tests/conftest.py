@@ -286,6 +286,13 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
     "HERMES_CRON_SESSION",
+    # ``hermes chat -q`` exports this marker (cli.py, single-query branch) and
+    # the kanban dispatcher spawns every worker that way, so a pytest run
+    # launched from a worker session inherits it.  Left set, the approval gate
+    # (tools/approval.py::check_execute_code_guard) resolves the single-query
+    # unattended context and denies the real execute_code child, so tests that
+    # drive that path fail with status "error" instead of "success".
+    "HERMES_SINGLE_QUERY_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",
     "HERMES_MODEL",
