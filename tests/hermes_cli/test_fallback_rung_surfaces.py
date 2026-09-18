@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermes_cli.config import validate_config_structure
+from hermes_cli.config import print_config_warnings, validate_config_structure
 from hermes_cli.fallback_cmd import cmd_fallback_list
 
 
@@ -35,22 +35,33 @@ def _write_config(home: Path, data: dict) -> None:
         yaml.safe_dump(data), encoding="utf-8")
 
 
-class TestValidateConfigStructureSurfaces:
-    def test_dead_rung_produces_warning_with_reason(self, isolated_home):
-        issues = validate_config_structure({
+class TestStartupConfigWarnings:
+    """print_config_warnings is the config-validation surface operators see at
+    startup (CLI + gateway). Rung diagnostics must ride there, and
+    validate_config_structure must stay purely structural."""
+
+    def test_dead_rung_produces_warning_with_reason(self, isolated_home, capsys):
+        _write_config(isolated_home, {
             "fallback_providers": [{"provider": "moa", "model": "default"}],
         })
-        rung_warnings = [
-            i for i in issues
-            if i.severity == "warning" and "fallback_providers[0]" in i.message
-        ]
-        assert len(rung_warnings) == 1
-        assert "virtual_moa_without_preset" in rung_warnings[0].message
+        print_config_warnings(None)
+        err = capsys.readouterr().err
+        assert "fallback_providers[0]" in err
+        assert "virtual_moa_without_preset" in err
 
-    def test_healthy_chain_produces_no_rung_warning(self, isolated_home, monkeypatch):
+    def test_healthy_chain_produces_no_output(self, isolated_home, capsys, monkeypatch):
         monkeypatch.setenv("GLM_API_KEY", "test-key-0001")
-        issues = validate_config_structure({
+        _write_config(isolated_home, {
             "fallback_providers": [{"provider": "zai", "model": "glm-4.7"}],
+        })
+        print_config_warnings(None)
+        assert capsys.readouterr().err == ""
+
+    def test_structural_validation_does_not_probe_credentials(self, isolated_home):
+        """validate_config_structure stays structural: no rung diagnostics and
+        no credential I/O, so hot callers (model switch, auth) keep its cost."""
+        issues = validate_config_structure({
+            "fallback_providers": [{"provider": "moa", "model": "default"}],
         })
         assert not [i for i in issues if "fallback_providers[" in i.message]
 
@@ -58,16 +69,25 @@ class TestValidateConfigStructureSurfaces:
         issues = validate_config_structure({"custom_providers": {"name": "x"}})
         assert any(i.severity == "error" for i in issues)
 
-    def test_diagnostics_never_break_validation(self, isolated_home, monkeypatch):
-        """A hostile chain shape must not raise out of config validation."""
-        issues = validate_config_structure({
+    def test_diagnostics_never_break_startup(self, isolated_home, capsys):
+        """Hostile chain shapes must not raise out of the startup writer.
+
+        Malformed entries are dropped upstream by get_fallback_chain; the
+        surviving unreachable rung must still be reported and nothing may
+        raise.
+        """
+        _write_config(isolated_home, {
             "fallback_providers": [
                 "not-a-dict",
                 {"provider": "", "model": ""},
-                {"provider": "moa"},
+                {"provider": "moa"},                       # dropped: no model
+                {"provider": "moa", "model": "default"},   # kept: unreachable
             ],
         })
-        assert isinstance(issues, list)
+        print_config_warnings(None)  # must not raise
+        err = capsys.readouterr().err
+        assert "fallback_providers" in err
+        assert "virtual_moa_without_preset" in err
 
 
 class TestFallbackListSurfaces:

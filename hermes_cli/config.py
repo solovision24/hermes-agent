@@ -2049,12 +2049,27 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
-    # ── Fallback rung resolvability (presence checks only) ───────────────
-    # A rung that can never serve (virtual moa with no preset, provider with
-    # no reachable credential, pool stuck in cooldown/relogin) converts a
-    # recoverable provider problem into a misleading setup error at 2am.
-    # Surface it where operators already look. Warning-only: this never
-    # reorders or prunes the chain — see hermes_cli.fallback_diagnostics.
+    return issues
+
+
+def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
+    """Print config structure warnings to stderr at startup.
+
+    Called early in CLI and gateway init so users see problems before
+    they hit cryptic "Unknown provider" errors.  Prints nothing if
+    config is healthy.
+
+    Also surfaces unreachable fallback rungs (see
+    ``hermes_cli.fallback_diagnostics``): a rung that can never resolve in
+    this profile's credential scope otherwise turns a recoverable provider
+    problem into a misleading config error at 2am. Warning-only, and a
+    healthy chain still prints nothing.
+    """
+    issues: List["ConfigIssue"] = []
+    try:
+        issues.extend(validate_config_structure(config))
+    except Exception:
+        pass
     try:
         from hermes_cli.fallback_diagnostics import diagnose_fallback_chain
 
@@ -2068,21 +2083,6 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     except Exception:
         # Diagnostics must never break config loading or startup.
         pass
-
-    return issues
-
-
-def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
-    """Print config structure warnings to stderr at startup.
-
-    Called early in CLI and gateway init so users see problems before
-    they hit cryptic "Unknown provider" errors.  Prints nothing if
-    config is healthy.
-    """
-    try:
-        issues = validate_config_structure(config)
-    except Exception:
-        return
     if not issues:
         return
 
