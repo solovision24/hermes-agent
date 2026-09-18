@@ -3157,12 +3157,61 @@ def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
+# Dedupe-key shape owned by the installed GitHub webhook adapter
+# (~/.hermes/scripts/github_pr_native_ingest.py):
+# ``github-pr:<owner/repo>:<pr number>:<40-hex head sha>``.
+_EXTERNAL_INTAKE_CREATOR = "github-webhook"
+_EXTERNAL_INTAKE_KEY_RE = re.compile(
+    r"github-pr:(?P<repository>[^/\s:]+/[^/\s:]+):(?P<number>[0-9]+):(?P<head_sha>[0-9a-fA-F]{40})"
+)
+
+
+def _external_intake_provenance(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Deduplicated external GitHub PR intake provenance, or ``None``.
+
+    A GitHub-webhook Review card has no board implementer: the adapter creates
+    it unassigned (``created_by='github-webhook'``) under its per-PR-head dedupe
+    key, so ``review_requested`` records ``implementer: null``. Only that exact
+    shape is eligible for the DEV fallback in :func:`request_changes`; every
+    other card (or a malformed/forged key) keeps the provenance guard.
+    """
+    row = conn.execute(
+        "SELECT created_by, idempotency_key FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if (_nonblank_str(_row_get(row, "created_by")) or "").casefold() != _EXTERNAL_INTAKE_CREATOR:
+        return None
+    key = _nonblank_str(_row_get(row, "idempotency_key"))
+    match = _EXTERNAL_INTAKE_KEY_RE.fullmatch(key) if key else None
+    if match is None:
+        return None
+    number = int(match.group("number"))
+    if number <= 0:
+        return None
+    repository = match.group("repository")
+    return {
+        "repository": repository,
+        "number": number,
+        "head_sha": match.group("head_sha").casefold(),
+        "url": f"https://github.com/{repository}/pull/{number}",
+    }
+
+
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    A deduplicated external GitHub PR intake card (see
+    :func:`_external_intake_provenance`) has no board implementer, so its
+    reviewer verdict falls back to the canonical DEV profile on the same card —
+    same PR, branch, reviewer, and run closure. Board-originated handoffs keep
+    their existing provenance behaviour: a missing or blank implementer is still
+    refused.
+    """
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3185,11 +3234,21 @@ def request_changes(
             return False, "active run was not claimed from review"
 
         requested_event = _latest_event(conn, task_id, "review_requested")
+        # External GitHub intake has no board implementer to route to; the
+        # canonical DEV profile owns remediation on the SAME card.
+        external_provenance = _external_intake_provenance(conn, task_id)
+        dev_fallback = False
         if requested_event is None:
-            return False, "no prior review_requested event"
-        implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
+            if external_provenance is None:
+                return False, "no prior review_requested event"
+            implementer = None
+        else:
+            implementer = _nonblank_str(_json_dict(requested_event["payload"]).get("implementer"))
         if implementer is None:
-            return False, "review handoff has no valid implementer provenance"
+            if external_provenance is None:
+                return False, "review handoff has no valid implementer provenance"
+            dev_fallback = True
+            implementer = _canonical_assignee("dev") or "dev"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
@@ -3221,6 +3280,15 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                **(
+                    {
+                        "provenance": "github_pr_external_intake",
+                        "github_pr": external_provenance,
+                        **(external_provenance or {}),
+                    }
+                    if dev_fallback
+                    else {}
+                ),
             },
             run_id=run_id,
         )

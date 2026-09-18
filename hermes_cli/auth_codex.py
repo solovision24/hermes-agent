@@ -74,11 +74,12 @@ def _codex_runtime_result(
 
 def _load_auth_store_maybe_locked(lock: bool) -> Dict[str, Any]:
     """Load the auth store, taking the cross-process lock unless the caller already holds it."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store
+    from hermes_cli.auth import _auth_store_lock, _codex_auth_file_path, _load_auth_store
+    auth_path = _codex_auth_file_path()
     if lock:
-        with _auth_store_lock():
-            return _load_auth_store()
-    return _load_auth_store()
+        with _auth_store_lock(target_path=auth_path):
+            return _load_auth_store(auth_path)
+    return _load_auth_store(auth_path)
 
 
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
@@ -454,7 +455,7 @@ def resolve_codex_runtime_credentials(
     credential. See issue #32992.
     """
     from hermes_cli.auth import (
-        _auth_store_lock, _codex_access_token_is_expiring, _probe_codex_quota_restored,
+        _auth_store_lock, _codex_access_token_is_expiring, _codex_auth_file_path, _probe_codex_quota_restored,
         _read_codex_tokens)
     read_error: Optional[AuthError] = None
     data = None
@@ -503,7 +504,7 @@ def resolve_codex_runtime_credentials(
     if _should_refresh(access_token):
         # Re-read under lock to avoid racing with other Hermes processes
         lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)
-        with _auth_store_lock(timeout_seconds=lock_timeout):
+        with _auth_store_lock(timeout_seconds=lock_timeout, target_path=_codex_auth_file_path()):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             if _should_refresh(_stripped(tokens.get("access_token"))):
