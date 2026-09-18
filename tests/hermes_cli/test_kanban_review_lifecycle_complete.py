@@ -715,3 +715,226 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+# ---------------------------------------------------------------------------
+# Deduplicated external GitHub PR intake (no board implementer)
+# ---------------------------------------------------------------------------
+
+_INTAKE_SHA = "6544b13c24d52a2269a5c16030071d95b018ee76"
+_INTAKE_KEY = f"github-pr:solovisionllc/solo-skills:90:{_INTAKE_SHA}"
+_INTAKE_PROVENANCE = {
+    "repository": "solovisionllc/solo-skills",
+    "number": 90,
+    "head_sha": _INTAKE_SHA,
+    "url": "https://github.com/solovisionllc/solo-skills/pull/90",
+}
+
+
+def _intake_review(
+    conn,
+    *,
+    key: str = _INTAKE_KEY,
+    created_by: str | None = "github-webhook",
+    drop_requested: bool = False,
+):
+    """Card shaped exactly like the GitHub webhook adapter's intake.
+
+    Created unassigned under the adapter's per-PR-head dedupe key, so
+    ``review_requested`` records ``implementer: null`` exactly like the live
+    card, then claimed from Review as a reviewer run.
+    """
+    task_id = kb.create_task(
+        conn,
+        title="Review PR #90: external intake",
+        created_by=created_by,
+        idempotency_key=key,
+    )
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary=f"GitHub PR delivery: SoLoVisionLLC/solo-skills#90 head {_INTAKE_SHA}",
+        reviewer="reviewer",
+    )
+    if drop_requested:
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_events WHERE task_id = ? AND kind = 'review_requested'",
+                (task_id,),
+            )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    return task_id, review
+
+
+def _assert_dev_fallback(task_id: str, conn) -> None:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert (task.status, task.assignee) == ("ready", "dev")
+    events = kb.list_events(conn, task_id)
+    changes = _event(events, "changes_requested")
+    assert changes.payload["implementer"] == "dev"
+    assert changes.payload["reviewer"] == "reviewer"
+    assert changes.payload["provenance"] == "github_pr_external_intake"
+    assert changes.payload["github_pr"] == _INTAKE_PROVENANCE
+    # The intake identity is also flattened onto the event for reviewers.
+    assert changes.payload["repository"] == _INTAKE_PROVENANCE["repository"]
+    assert changes.payload["number"] == _INTAKE_PROVENANCE["number"]
+    assert changes.payload["head_sha"] == _INTAKE_SHA
+    assert _run(kb.list_runs(conn, task_id), "changes_requested") is not None
+
+
+def test_external_intake_without_review_event_routes_changes_to_dev(conn):
+    """Guard (a): intake card with no ``review_requested`` event at all."""
+    task_id, review = _intake_review(conn, drop_requested=True)
+    assert [e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"] == []
+
+    ok, detail = kb.request_changes(
+        conn,
+        task_id,
+        reason="Route the external intake verdict to DEV.",
+        expected_run_id=review.current_run_id,
+    )
+
+    assert (ok, detail) == (True, "dev")
+    _assert_dev_fallback(task_id, conn)
+    # No synthetic handoff event was manufactured.
+    assert [e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"] == []
+
+
+def test_external_intake_null_implementer_routes_changes_to_dev(conn):
+    """Guard (b): the live GitHub-webhook shape — handoff with implementer null."""
+    task_id, review = _intake_review(conn)
+    requested = _event(kb.list_events(conn, task_id), "review_requested")
+    assert requested.payload["implementer"] is None
+    assert requested.payload["reviewer"] == "reviewer"
+
+    ok, detail = kb.request_changes(
+        conn,
+        task_id,
+        reason="Route the external intake verdict to DEV.",
+        expected_run_id=review.current_run_id,
+    )
+
+    assert (ok, detail) == (True, "dev")
+    _assert_dev_fallback(task_id, conn)
+    # The original handoff event is untouched and not duplicated.
+    assert len([e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"]) == 1
+
+
+def test_external_intake_changes_re_gate_on_reopened_parent(conn):
+    parent = kb.create_task(conn, title="Upstream work", assignee="builder")
+    assert kb.claim_task(conn, parent, claimer="builder:1") is not None
+    assert kb.complete_task(conn, parent, summary="shipped")
+
+    task_id = kb.create_task(
+        conn,
+        title="Review PR #91: external intake",
+        parents=[parent],
+        created_by="github-webhook",
+        idempotency_key="github-pr:solovisionllc/solo-skills:91:" + "a" * 40,
+    )
+    assert kb.get_task(conn, task_id).status == "ready"
+    assert kb.request_review(conn, task_id, summary="intake", reviewer="reviewer")
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+            (parent,),
+        )
+
+    ok, detail = kb.request_changes(
+        conn, task_id, reason="parent reopened", expected_run_id=review.current_run_id,
+    )
+
+    assert (ok, detail) == (True, "dev")
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.assignee) == ("todo", "dev")
+
+
+def test_internal_handoff_changes_payload_keeps_its_existing_shape(conn):
+    task_id = kb.create_task(conn, title="Internal change", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="ready",
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+
+    ok, detail = kb.request_changes(
+        conn, task_id, reason="internal round", expected_run_id=review.current_run_id,
+    )
+
+    assert (ok, detail) == (True, "builder")
+    changes = _event(kb.list_events(conn, task_id), "changes_requested")
+    assert set(changes.payload) == {"reason", "implementer", "reviewer", "status"}
+    assert kb.get_task(conn, task_id).assignee == "builder"
+
+
+@pytest.mark.parametrize(
+    "created_by,key",
+    [
+        ("github-webhook", "manual-key"),
+        ("github-webhook", "github-pr:solovisionllc/solo-skills:90:" + _INTAKE_SHA[:-1]),
+        ("github-webhook", "github-pr:solovisionllc/solo-skills:0:" + _INTAKE_SHA),
+        ("github-webhook", "github-pr:solo-skills:90:" + _INTAKE_SHA),
+        ("github-webhook", _INTAKE_KEY.upper()),
+        ("builder", _INTAKE_KEY),
+        (None, _INTAKE_KEY),
+    ],
+)
+def test_request_changes_keeps_failing_closed_without_exact_intake_provenance(
+    conn,
+    created_by: str | None,
+    key: str,
+):
+    task_id = kb.create_task(
+        conn, title="Not a deduplicated intake", created_by=created_by, idempotency_key=key,
+    )
+    assert kb.request_review(conn, task_id, summary="no implementer", reviewer="reviewer")
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+
+    ok, detail = kb.request_changes(
+        conn, task_id, reason="must stay refused", expected_run_id=review.current_run_id,
+    )
+
+    assert ok is False
+    assert "implementer provenance" in (detail or "")
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.assignee, task.current_run_id) == (
+        "running", "reviewer", review.current_run_id,
+    )
+    assert [e for e in kb.list_events(conn, task_id) if e.kind == "changes_requested"] == []
+
+
+def test_request_changes_no_event_still_fails_closed_for_internal_card(conn):
+    task_id = kb.create_task(conn, title="Internal, no handoff event", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:1")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        summary="ready",
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id = ? AND kind = 'review_requested'",
+            (task_id,),
+        )
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+
+    ok, detail = kb.request_changes(
+        conn, task_id, reason="no event", expected_run_id=review.current_run_id,
+    )
+
+    assert (ok, detail) == (False, "no prior review_requested event")
