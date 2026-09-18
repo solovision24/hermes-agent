@@ -2049,6 +2049,26 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
+    # ── Fallback rung resolvability (presence checks only) ───────────────
+    # A rung that can never serve (virtual moa with no preset, provider with
+    # no reachable credential, pool stuck in cooldown/relogin) converts a
+    # recoverable provider problem into a misleading setup error at 2am.
+    # Surface it where operators already look. Warning-only: this never
+    # reorders or prunes the chain — see hermes_cli.fallback_diagnostics.
+    try:
+        from hermes_cli.fallback_diagnostics import diagnose_fallback_chain
+
+        for rung in diagnose_fallback_chain(config):
+            issues.append(ConfigIssue(
+                "warning",
+                f"fallback_providers[{rung.rung_index}] "
+                f"{rung.provider} ({rung.model}): unreachable ({rung.reason})",
+                rung.detail,
+            ))
+    except Exception:
+        # Diagnostics must never break config loading or startup.
+        pass
+
     return issues
 
 
