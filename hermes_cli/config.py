@@ -2058,11 +2058,31 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     Called early in CLI and gateway init so users see problems before
     they hit cryptic "Unknown provider" errors.  Prints nothing if
     config is healthy.
+
+    Also surfaces unreachable fallback rungs (see
+    ``hermes_cli.fallback_diagnostics``): a rung that can never resolve in
+    this profile's credential scope otherwise turns a recoverable provider
+    problem into a misleading config error at 2am. Warning-only, and a
+    healthy chain still prints nothing.
     """
+    issues: List["ConfigIssue"] = []
     try:
-        issues = validate_config_structure(config)
+        issues.extend(validate_config_structure(config))
     except Exception:
-        return
+        pass
+    try:
+        from hermes_cli.fallback_diagnostics import diagnose_fallback_chain
+
+        for rung in diagnose_fallback_chain(config):
+            issues.append(ConfigIssue(
+                "warning",
+                f"fallback_providers[{rung.rung_index}] "
+                f"{rung.provider} ({rung.model}): unreachable ({rung.reason})",
+                rung.detail,
+            ))
+    except Exception:
+        # Diagnostics must never break config loading or startup.
+        pass
     if not issues:
         return
 

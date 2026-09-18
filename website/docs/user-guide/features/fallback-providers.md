@@ -181,6 +181,39 @@ fallback_providers:
 There are no environment variables for the primary fallback chain — configure it exclusively through `config.yaml` or `hermes fallback`. This is intentional: fallback configuration is a deliberate choice, not something a stale shell export should override.
 :::
 
+### Unreachable Rungs
+
+A rung that can never serve a turn is worse than no rung at all: the ladder lands on it, its provider fails, and the error you see points at something you never configured. Hermes warns about those rungs **where you already look**, without changing ladder order or removing anything:
+
+- `hermes doctor` — a `Fallback Chain` section listing each unreachable rung
+- `hermes fallback list` — a `⚠` line under the chain
+- Startup config warnings (CLI and gateway), via the same config validator
+
+Each warning names the rung and carries a machine-readable reason:
+
+| Reason | Meaning | Fix |
+|--------|---------|-----|
+| `virtual_moa_without_preset` | A `moa` rung with no `moa:` preset of your own. It resolves through the built-in default preset, whose aggregator is hard-wired to `openrouter` — so the rung silently depends on `OPENROUTER_API_KEY`. | Declare a `moa:` preset whose aggregator you have credentials for, or replace the rung with the aggregator provider directly |
+| `no_credential_in_scope` | No reachable API key, OAuth login, or credential-pool entry **in this profile's scope** — a rung can be configured in YAML and still be unresolvable, because named profiles resolve credentials from their own `$HERMES_HOME/.env` and `auth.json` | Add the credential to *this* profile, or remove the rung |
+| `credential_in_quota_cooldown` | The only usable credentials are pool entries in a temporary exhaustion cooldown. The warning includes the reset time — the rung serves again on its own | Wait for the reset, or add a second credential |
+| `relogin_required` | The stored credential is terminally invalid (revoked/invalidated token); retrying cannot fix it | Re-authenticate (`hermes auth`, `hermes login --provider …`) |
+
+Warnings are advisory only — the chain keeps its order and keeps trying each rung. A fully healthy chain produces no output, so a clean `hermes doctor` stays clean.
+
+### Honest Errors When a Rung Fails
+
+When an auxiliary task (compression, vision, titles, MoA aggregation) cannot build a provider *because a fallback rung selected it*, the error now says so:
+
+```text
+task=moa_aggregator provider=openrouter has no usable provider — the session's MoA
+runtime (preset 'default') derives this call from its aggregator slot:
+openrouter (anthropic/claude-opus-4.8). The operator did not configure this
+(task, provider) pair directly; the fallback chain / MoA runtime selected it.
+Repair the rung (`hermes fallback list`, `hermes moa list`) or its credentials.
+```
+
+Previously this surfaced as `No LLM provider configured for task=… provider=… Run: hermes setup` — a setup message for a provider you never chose, which sent operators hunting in the wrong place (and, in cron, got recorded as a config failure that suppressed the real signal). The error now names the originating rung or MoA runtime; the `Run: hermes setup` hint is reserved for providers you genuinely configured.
+
 ---
 
 ## Auxiliary Task Fallback

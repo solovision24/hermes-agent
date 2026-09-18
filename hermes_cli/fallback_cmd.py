@@ -126,10 +126,37 @@ def cmd_fallback_list(args) -> None:  # noqa: ARG001
     print(f"  Fallback chain ({len(chain)} {'entry' if len(chain) == 1 else 'entries'}):")
     for i, entry in enumerate(chain, 1):
         print(f"    {i}. {_format_entry(entry)}")
+    _print_rung_warnings(chain, config)
     print()
     print("  Tried in order when the primary fails (rate-limit, 5xx, connection errors).")
     print("  Docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/fallback-providers")
     print()
+
+
+def _print_rung_warnings(
+    chain: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> None:
+    """Print one warning line per unreachable rung (best-effort, never raises).
+
+    Presence checks only — credential values are never read or printed.
+    """
+    try:
+        from hermes_cli.fallback_diagnostics import (
+            diagnose_fallback_chain,
+            format_rung_issue,
+        )
+
+        issues = diagnose_fallback_chain(config)
+    except Exception:
+        return
+    if not issues:
+        return
+    for issue in issues:
+        entry = chain[issue.rung_index] if 0 <= issue.rung_index < len(chain) else None
+        print(f"       ⚠ {format_rung_issue(issue)}")
+        if entry is not None:
+            print("         (warning only — the chain still tries this rung in order)")
 
 
 def _describe_primary(config: Dict[str, Any]) -> Optional[str]:

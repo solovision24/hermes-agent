@@ -1328,6 +1328,35 @@ def run_doctor(args):
         except Exception:
             pass
 
+        # Fallback rung resolvability (presence checks only, warning-only).
+        # A rung that can never serve turns a recoverable provider problem
+        # into a misleading setup error; name the rung + machine-readable
+        # reason where operators already look. validate_config_structure()
+        # stays purely structural, so this section is the only place doctor
+        # renders rung diagnostics — no duplication.
+        try:
+            from hermes_cli.fallback_diagnostics import (
+                diagnose_fallback_chain,
+                format_rung_issue,
+            )
+
+            rung_issues = diagnose_fallback_chain()
+            if rung_issues:
+                _section("Fallback Chain")
+                check_warn(
+                    f"{len(rung_issues)} fallback rung"
+                    f"{'s are' if len(rung_issues) != 1 else ' is'} unreachable "
+                    "(warning only — ladder order unchanged)"
+                )
+                for rung in rung_issues:
+                    check_info(format_rung_issue(rung))
+                issues.append(
+                    f"Unreachable fallback rungs: "
+                    f"{', '.join(f'{r.provider}[{r.rung_index}]:{r.reason}' for r in rung_issues)}"
+                )
+        except Exception:
+            pass
+
     if not config_path.exists():
         # No config.yaml — still surface deprecated env vars from .env.
         try:

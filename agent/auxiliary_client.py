@@ -5180,6 +5180,7 @@ def _try_configured_fallback_chain(
             fb_client, resolved_model = None, None
 
         if fb_client is not None:
+            _set_client_rung_provenance(fb_client, f"{task}.fallback_chain", i, entry)
             if min_ctx is not None and resolved_model:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -5241,6 +5242,150 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     from hermes_cli.fallback_config import resolve_entry_api_key
 
     return resolve_entry_api_key(entry)
+
+
+def _rung_provenance_label(
+    source: Optional[str],
+    index: Any,
+    entry: Any,
+) -> str:
+    """Human/machine-readable provenance for a client that came from a rung.
+
+    ``source`` is ``"fallback_providers"`` (top-level main chain), a task
+    name (per-task ``auxiliary.<task>.fallback_chain``), or any other chain
+    origin label. Renders e.g. ``fallback_providers[2](moa/default)`` —
+    the same shape the ladder logs use — or ``""`` for non-chain clients.
+    """
+    if not source:
+        return ""
+    provider = str((entry or {}).get("provider") or "").strip() if isinstance(entry, dict) else ""
+    model = str((entry or {}).get("model") or "").strip() if isinstance(entry, dict) else ""
+    rung = f"{provider or '?'}"
+    if model:
+        rung += f"/{model}"
+    try:
+        idx = int(index)
+    except (TypeError, ValueError):
+        idx = -1
+    return f"{source}[{idx}]({rung})"
+
+
+def _set_client_rung_provenance(
+    client: Any,
+    source: str,
+    index: Any,
+    entry: Dict[str, Any],
+) -> None:
+    """Stamp a chain-resolved client with where it came from (best-effort)."""
+    if client is None:
+        return
+    try:
+        client._hermes_rung_source = str(source)
+        client._hermes_rung_index = int(index)
+        client._hermes_rung_entry = {
+            "provider": str(entry.get("provider") or "").strip(),
+            "model": str(entry.get("model") or "").strip(),
+            "base_url": str(entry.get("base_url") or "").strip(),
+        }
+        client._hermes_rung_provenance = _rung_provenance_label(source, index, entry)
+    except Exception:
+        # Provenance is diagnostic metadata only — never fail resolution.
+        pass
+
+
+def _client_rung_provenance(client: Any) -> str:
+    """Read the provenance stamped on a chain-resolved client, if any."""
+    if client is None:
+        return ""
+    return str(getattr(client, "_hermes_rung_provenance", "") or "")
+
+
+def _moa_runtime_rung_context(
+    task: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
+) -> str:
+    """Return a rung-context label when the live session rides the MoA virtual
+    runtime, else ``""``.
+
+    A virtual ``moa`` rung in the fallback chain (or a user-selected MoA main)
+    makes the session's main provider ``moa``; every ``moa_reference`` /
+    ``moa_aggregator`` aux call then resolves to the preset's *aggregator*
+    provider — a (task, provider) pair the operator never configured directly.
+    When that aggregator has no credentials, the error must name the MoA
+    runtime + preset and the derived provider instead of presenting a setup
+    error for a phantom pair.
+    """
+    runtime = _normalize_main_runtime(main_runtime)
+    if (task or "").startswith("moa_") and (
+        str(runtime.get("provider") or "") == "moa"
+        or str(runtime.get("requested_provider") or "") == "moa"
+    ):
+        preset = str(runtime.get("model") or "").strip() or "default"
+        agg_provider, agg_model = _resolve_moa_aggregator(preset)
+        derived = f"{agg_provider} ({agg_model})" if agg_provider and agg_model else "an unresolvable preset"
+        return (
+            f"the session's MoA runtime (preset '{preset}') derives this call "
+            f"from its aggregator slot: {derived}"
+        )
+    return ""
+
+
+def _no_provider_configured_error(
+    task: Optional[str],
+    provider: Optional[str],
+    client: Any = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> RuntimeError:
+    """Build the aux no-provider error, attributed to the real origin.
+
+    When the provider that failed came from a fallback-chain rung (stamped
+    by ``_set_client_rung_provenance``), or the session is riding the MoA
+    virtual runtime (so the provider was *derived* from a preset slot, not
+    configured for this task), the message names that origin — NOT ``Run:
+    hermes setup``, which sends operators hunting for a (task, provider)
+    pair they never configured.
+    """
+    provenance = _client_rung_provenance(client)
+    if not provenance:
+        provenance = _moa_runtime_rung_context(task, main_runtime)
+    if provenance:
+        return RuntimeError(
+            f"task={task} provider={provider} has no usable provider — "
+            f"{provenance}. The operator did not configure this (task, "
+            f"provider) pair directly; the fallback chain / MoA runtime "
+            f"selected it. Repair the rung (`hermes fallback list`, "
+            f"`hermes moa list`) or its credentials."
+        )
+    return RuntimeError(
+        f"No LLM provider configured for task={task} provider={provider}. "
+        f"Run: hermes setup"
+    )
+
+
+def _explicit_provider_missing_error(
+    task: Optional[str],
+    provider: str,
+    env_hint: str,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> RuntimeError:
+    """Build the explicit-provider-missing error, attributed when derived.
+
+    Plain case: the operator set ``provider`` in config and its key is gone
+    → the classic env-var hint. MoA-runtime case: the provider came from a
+    preset's aggregator slot, so ``is set in config.yaml`` would be a lie.
+    """
+    moa_ctx = _moa_runtime_rung_context(task, main_runtime)
+    if moa_ctx:
+        return RuntimeError(
+            f"task={task} provider={provider} has no usable provider — "
+            f"{moa_ctx}. Repair the preset's aggregator provider or its "
+            f"credentials."
+        )
+    return RuntimeError(
+        f"Provider '{provider}' is set in config.yaml but no API key "
+        f"was found. Set the {env_hint} environment "
+        f"variable, or switch to a different provider with `hermes model`."
+    )
 
 
 def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
@@ -5322,6 +5467,7 @@ def _try_main_fallback_chain(
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
+            _set_client_rung_provenance(fb_client, "fallback_providers", i, entry)
             if min_ctx is not None:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -5597,6 +5743,11 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         "api_key": sync_client.api_key,
         "base_url": str(sync_client.base_url),
     }
+    # Carry fallback-rung provenance onto the async counterpart so a later
+    # failure on this client still attributes the rung it came from.
+    _rung_source = getattr(sync_client, "_hermes_rung_source", None)
+    _rung_index = getattr(sync_client, "_hermes_rung_index", None)
+    _rung_entry = getattr(sync_client, "_hermes_rung_entry", None)
     sync_base_url = str(sync_client.base_url)
     if base_url_host_matches(sync_base_url, "openrouter.ai"):
         async_kwargs["default_headers"] = build_or_headers()
@@ -5638,7 +5789,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # See _create_openai_client: disable SDK-internal retries so Hermes owns
     # the auxiliary retry/timeout budget (issue #54465).
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    async_client = AsyncOpenAI(**async_kwargs)
+    if _rung_source:
+        _set_client_rung_provenance(
+            async_client, str(_rung_source), _rung_index, _rung_entry or {}
+        )
+    return async_client, model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -8667,10 +8823,7 @@ def _call_llm_impl(
                 main_runtime=main_runtime,
             )
         if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup"
-            )
+            raise _no_provider_configured_error(task, resolved_provider, main_runtime=main_runtime)
         resolved_provider = effective_provider or resolved_provider
     else:
         client, final_model = _get_cached_client(
@@ -8696,10 +8849,9 @@ def _call_llm_impl(
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
                 else:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key "
-                        f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                        f"variable, or switch to a different provider with `hermes model`."
+                    raise _explicit_provider_missing_error(
+                        task, _explicit, f"{_explicit.upper()}_API_KEY",
+                        main_runtime=main_runtime,
                     )
             # For auto/custom with no credentials, try the full auto chain
             # rather than hardcoding OpenRouter (which may be depleted).
@@ -8711,9 +8863,7 @@ def _call_llm_impl(
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
         if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup")
+            raise _no_provider_configured_error(task, resolved_provider, main_runtime=main_runtime)
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     _set_relay_auxiliary_route(
@@ -9433,10 +9583,7 @@ async def _async_call_llm_impl(
                 main_runtime=main_runtime,
             )
         if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup"
-            )
+            raise _no_provider_configured_error(task, resolved_provider, main_runtime=main_runtime)
         resolved_provider = effective_provider or resolved_provider
     else:
         client, final_model = _get_cached_client(
@@ -9460,19 +9607,16 @@ async def _async_call_llm_impl(
                     )
                     resolved_provider = fb_label or resolved_provider
                 else:
-                    raise RuntimeError(
-                        f"Provider '{_explicit}' is set in config.yaml but no API key "
-                        f"was found. Set the {_explicit.upper()}_API_KEY environment "
-                        f"variable, or switch to a different provider with `hermes model`."
+                    raise _explicit_provider_missing_error(
+                        task, _explicit, f"{_explicit.upper()}_API_KEY",
+                        main_runtime=main_runtime,
                     )
             if client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True, main_runtime=main_runtime, task=task)
         if client is None:
-            raise RuntimeError(
-                f"No LLM provider configured for task={task} provider={resolved_provider}. "
-                f"Run: hermes setup")
+            raise _no_provider_configured_error(task, resolved_provider, main_runtime=main_runtime)
 
     effective_timeout = _effective_aux_timeout(task, timeout)
     _set_relay_auxiliary_route(
