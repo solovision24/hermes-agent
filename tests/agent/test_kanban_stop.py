@@ -172,3 +172,76 @@ def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     # The nudge offers every worker exit, not just close-out; a card that must go
     # through review must never be steered to ``kanban_complete`` alone.
     assert "kanban_request_review" in nudge and "kanban_block" in nudge
+
+
+def _board_call_round_trip(tool_name: str):
+    """Minimal assistant tool_call + tool result pair for ``tool_name``."""
+    return [
+        {"role": "user", "content": "work kanban task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": "ok"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    ],
+)
+def test_every_terminal_transition_suppresses_the_nudge(clear_kanban_env, tool_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _board_call_round_trip(tool_name)
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages, attempts=0) is None
+    assert build_kanban_stop_nudge(messages=messages, attempts=1) is None
+
+
+def test_review_verdict_is_terminal(clear_kanban_env):
+    """Regression: a review run that ended with ``kanban_request_changes`` was
+    nudged twice to call ``kanban_complete``/``kanban_block`` for a task that
+    was already ``ready`` and requeued to its implementer."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_1a6fef16")
+    messages = _board_call_round_trip("kanban_request_changes")
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_nudge_offers_the_review_lane_transition(clear_kanban_env):
+    """A review worker that has not ended yet must be told about the rework
+    verdict, not only about ``kanban_complete``."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_1a6fef16")
+    messages = _board_call_round_trip("kanban_heartbeat")
+    nudge = build_kanban_stop_nudge(messages=messages, attempts=0)
+    assert nudge is not None
+    assert "kanban_request_changes" in nudge
+    assert "kanban_request_review" in nudge
+
+
+def test_terminal_set_matches_the_installed_kanban_surface():
+    """Drift guard: every recognised terminal tool must be a real installed
+    kanban tool, and the review-lane transitions must stay in the set."""
+    from agent.kanban_stop import _TERMINAL_KANBAN_TOOLS
+    from tools import kanban_tools as kt
+
+    registered = {name for name, _schema, _handler, _emoji in kt._TOOLS}
+    assert _TERMINAL_KANBAN_TOOLS <= registered
+    assert {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    } <= set(_TERMINAL_KANBAN_TOOLS)
