@@ -103,6 +103,40 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     return notify_metadata
 
 
+# Leading ``[TAG] ``-shaped prefix guard. Uppercase letters/digits inside
+# square brackets followed by a space marks an already-prefixed reply, so we
+# never double-prefix a specialist message that already identifies its agent.
+_PROFILE_PREFIX_ALREADY_PRESENT_RE = re.compile(r"^\[[A-Z][A-Z0-9]*\]\s")
+
+
+def _telegram_group_profile_prefix(source, text: str) -> str:
+    """Return *text* with a concise uppercase profile tag prepended.
+
+    Temporary fallback (shared ``@solo_hermes_bot`` name/avatar) so a
+    multiplexed gateway's specialist replies in Telegram GROUPS visibly
+    identify the agent that produced them. Scope is strictly Telegram group
+    outbound text: DMs, other platforms, and Mission Control are untouched.
+
+    - Only Telegram group (``chat_type == \"group\"``) replies are prefixed.
+    - The tag is the uppercase profile id (``orion`` -> ``[ORION] ``). The
+      default/Halo profile stays unprefixed.
+    - A reply that already begins with a ``[TAG] `` prefix is never
+      double-prefixed.
+    """
+    if not text or not text.strip():
+        return text
+    if _platform_name(getattr(source, "platform", None)) != "telegram":
+        return text
+    if getattr(source, "chat_type", None) != "group":
+        return text
+    profile = (getattr(source, "profile", None) or "").strip()
+    if not profile or profile.casefold() == "default":
+        return text
+    if _PROFILE_PREFIX_ALREADY_PRESENT_RE.match(text.lstrip()):
+        return text
+    return f"[{profile.upper()}] {text}"
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
@@ -6063,6 +6097,23 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
+                # Temporary Telegram group prefix fallback: a shared-bot gateway
+                # posts every specialist's reply under one name/avatar, so a
+                # profile-routed GROUP reply carries an uppercase profile tag
+                # (e.g. [ORION]) so the agent is identifiable. DMs, other
+                # platforms, and Mission Control are untouched; a reply that
+                # already starts with a [TAG] prefix is never double-prefixed.
+                #
+                # Applied AFTER the auto-TTS and caption blocks so speech
+                # synthesis (prepare_tts_text) and the 1024-char caption-
+                # eligibility check see the unprefixed reply — the tag must
+                # not be spoken aloud or push a boundary caption over the
+                # Telegram caption length limit.
+                if text_content and not _tts_caption_delivered:
+                    text_content = _telegram_group_profile_prefix(
+                        event.source, text_content,
+                    )
+
                 if text_content and not _tts_caption_delivered:
                     delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
