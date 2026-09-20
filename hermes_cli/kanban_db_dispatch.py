@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import os
 import re
 import signal
@@ -787,25 +788,60 @@ _WORKER_LOG_TAIL_CHARS = 1200     # hard cap on the metadata tail
 _WORKER_LOG_TAIL_LINE_CHARS = 200 # per-line cap so one giant line can't dominate
 _WORKER_LOG_TAIL_READ_BYTES = 64 * 1024  # read only the log's tail region
 
+# Set by ``_open_worker_log`` after rotation so the dispatch path can persist a
+# run-boundary offset even when the default spawn rotates the file mid-call.
+_WORKER_LOG_SPAWN_OFFSET: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "kanban_worker_log_spawn_offset", default=None,
+)
 
-def _display_safe_log_text(text: str) -> str:
-    """ANSI-strip + redact a log excerpt, best-effort.
 
-    Both helpers are imported lazily and defensively: a crash reclaim must never
-    fail (or leak raw terminal escapes / credentials into a durable error field)
-    because a display or redaction module is unavailable.
+def _display_safe_log_text(text: str) -> Optional[str]:
+    """ANSI-strip + force-redact a log excerpt for durable DB persistence.
+
+    Returns ``None`` when sanitization cannot be guaranteed (import or runtime
+    failure): callers must omit the tail rather than persist raw bytes.
+    ``force=True`` so a user display preference cannot leave secrets in the DB.
     """
     try:
         from tools.ansi_strip import strip_ansi
-        text = strip_ansi(text)
-    except Exception:
-        pass
-    try:
         from agent.redact import redact_sensitive_text
-        text = redact_sensitive_text(text)
+
+        return redact_sensitive_text(strip_ansi(text), force=True)
     except Exception:
-        pass
-    return text
+        _kb._log.debug(
+            "kanban: refusing unsanitized worker log tail",
+            exc_info=True,
+        )
+        return None
+
+
+def _worker_log_size(task_id: str, board: Optional[str] = None) -> int:
+    """Current byte size of ``<task>.log``, or 0 when the file is absent."""
+    if not task_id:
+        return 0
+    try:
+        return int((_kb.worker_logs_dir(board=board) / f"{task_id}.log").stat().st_size)
+    except OSError:
+        return 0
+
+
+def _read_worker_log_region(path: Path, from_offset: Optional[int]) -> str:
+    """Read a bounded UTF-8 region of ``path`` starting at ``from_offset``."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            if from_offset is not None:
+                start_bound = int(from_offset)
+                if start_bound >= size:
+                    return ""
+                start = max(start_bound, size - _WORKER_LOG_TAIL_READ_BYTES)
+            else:
+                start = max(0, size - _WORKER_LOG_TAIL_READ_BYTES)
+            fh.seek(start)
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _worker_log_tail(
@@ -814,6 +850,7 @@ def _worker_log_tail(
     *,
     max_lines: int = _WORKER_LOG_TAIL_LINES,
     max_chars: int = _WORKER_LOG_TAIL_CHARS,
+    from_offset: Optional[int] = None,
 ) -> str:
     """Last ``max_lines`` lines of a worker's own log, ANSI-stripped + redacted.
 
@@ -821,35 +858,67 @@ def _worker_log_tail(
     spawns it with ``stdout=stderr=<task>.log``), so this is what turns a liveness
     verdict back into a diagnosable failure. Strictly bounded and never raising:
     only the file's tail region is read, non-UTF8 bytes decode with replacement,
-    the rotated ``<task>.log.1`` is the fallback when the live file is empty, and
-    any failure returns ``""`` (callers then show the bare verdict).
+    and any failure returns ``""`` (callers then show the bare verdict).
+
+    ``from_offset`` (spawn-time byte offset for the current run) scopes the read
+    to this attempt so a silent re-run cannot inherit a prior attempt's cause.
+    The rotated ``<task>.log.1`` fallback is used only when no run boundary is
+    known; with an offset, an empty post-offset region stays empty (except the
+    safe mid-run rotation case where the live file shrank below the offset).
     """
     if not task_id:
         return ""
     try:
         log_path = _kb.worker_logs_dir(board=board) / f"{task_id}.log"
-        text = ""
-        for path in (log_path, log_path.with_name(log_path.name + ".1")):
-            try:
-                with open(path, "rb") as fh:
-                    fh.seek(0, os.SEEK_END)
-                    start = max(0, fh.tell() - _WORKER_LOG_TAIL_READ_BYTES)
-                    fh.seek(start)
-                    text = fh.read().decode("utf-8", errors="replace")
-            except OSError:
-                continue
-            if text.strip():
-                break
+        text = _read_worker_log_region(log_path, from_offset)
+        if not text.strip():
+            if from_offset is None:
+                # Legacy / no boundary: empty live file → rotated backup.
+                text = _read_worker_log_region(
+                    log_path.with_name(log_path.name + ".1"), None,
+                )
+            else:
+                # Mid-run rotation: live file was replaced and is smaller than
+                # the spawn offset, so its entire content belongs to this run.
+                try:
+                    live_size = log_path.stat().st_size
+                except OSError:
+                    live_size = 0
+                if 0 < live_size < int(from_offset):
+                    text = _read_worker_log_region(log_path, 0)
         if not text.strip():
             return ""
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()][-int(max_lines):]
-        cleaned = _display_safe_log_text("\n".join(ln[:_WORKER_LOG_TAIL_LINE_CHARS] for ln in lines))
+        cleaned = _display_safe_log_text(
+            "\n".join(ln[:_WORKER_LOG_TAIL_LINE_CHARS] for ln in lines),
+        )
+        if cleaned is None:
+            return ""
         return cleaned[: int(max_chars)]
     except Exception:
         _kb._log.debug(
             "kanban: worker log tail unavailable for %s", task_id, exc_info=True,
         )
         return ""
+
+
+def _current_run_log_offset(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Spawn-time ``worker_log_offset`` for the open run, or None if unset."""
+    run_id = _kb._current_run_id(conn, task_id)
+    if run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    raw = _kb._json_dict(row["metadata"]).get("worker_log_offset")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _compose_crash_error(prefix: str, tail: str, *, limit: int = _CRASH_ERROR_CHARS) -> str:
@@ -903,6 +972,7 @@ def _classify_dead_worker(
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    log_offset: Optional[int] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -912,6 +982,9 @@ def _classify_dead_worker(
     status — it is the last lines of ``<task>.log``. The prefix is byte-identical
     to the pre-tail text, so error fingerprints and their systemic-crash grouping
     are unaffected; the PID also stays in the run/event metadata.
+
+    ``log_offset`` scopes the tail to the current run's spawn-time byte offset so
+    a silent re-attempt cannot inherit a prior attempt's log cause.
     """
     kind, code = _classify_worker_exit(pid)
     if kind == "clean_exit":
@@ -950,7 +1023,9 @@ def _classify_dead_worker(
     # worker itself last reported so the error an operator reads on the board is
     # the real failure; the fuller tail rides in metadata (event payload + run
     # metadata) because the error field is truncated to 500 chars downstream.
-    tail = _worker_log_tail(task_id, board) if task_id else ""
+    tail = (
+        _worker_log_tail(task_id, board, from_offset=log_offset) if task_id else ""
+    )
     if tail:
         event_payload["worker_log_tail"] = tail
         error_text = _compose_crash_error(error_text, tail)
@@ -994,7 +1069,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, *, board: Optional[str] = No
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            log_offset = _current_run_log_offset(conn, row["id"])
+            dead = _classify_dead_worker(
+                pid, row["claim_lock"],
+                task_id=row["id"], board=board, log_offset=log_offset,
+            )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1270,13 +1349,34 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    log_offset: Optional[int] = None,
+) -> None:
+    """Record the spawned child's pid + emit a ``spawned`` event carrying it.
+
+    ``log_offset`` (optional) is the byte size of ``<task>.log`` at spawn time —
+    crash diagnosis reads only bytes after that offset so a silent re-run cannot
+    inherit a prior attempt's log tail.
+    """
     with _kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
         run_id = _kb._current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
+            if log_offset is not None:
+                row = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+                ).fetchone()
+                md = _kb._json_dict(row["metadata"] if row else None)
+                md["worker_log_offset"] = int(log_offset)
+                conn.execute(
+                    "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                    (_kb._json_or_null(md), run_id),
+                )
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
@@ -2002,23 +2102,40 @@ def _dispatch_lane_task(
             workspace, resolved_branch_name = _kbw._resolve_worktree_workspace(claimed, board=board)
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
-    except Exception as exc:
-        # A workspace/branch that cannot be resolved (e.g. `no workspace_path`) is
-        # a precondition failure too: retrying the same broken claim cannot fix it.
+    except ValueError as exc:
+        # Proven deterministic config failures only (missing/relative paths,
+        # unset board default_workdir, unknown workspace_kind). Retrying the
+        # same claim cannot fix these — fail once without burning the budget.
         reason = f"{_SPAWN_PRECONDITION_PREFIX}workspace: {exc}"
         _record_spawn_precondition_failure(
             conn, claimed.id, check="workspace", reason=reason, board=board,
         )
         result.spawn_precondition_failed.append((claimed.id, "workspace", reason))
         return False
+    except Exception as exc:
+        # Operational workspace/Git failures (lock contention, timeout,
+        # filesystem/resource errors) stay on the bounded spawn_failed retry path.
+        if _record_task_failure(
+            conn, claimed.id, str(exc),
+            outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+    pre_log_offset = _worker_log_size(claimed.id, board)
+    _WORKER_LOG_SPAWN_OFFSET.set(None)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            # Prefer the post-rotation offset stamped by ``_open_worker_log``;
+            # custom spawn stubs never open the log, so fall back to the
+            # pre-spawn size (correct for append-only test/log paths).
+            stamped = _WORKER_LOG_SPAWN_OFFSET.get()
+            log_offset = pre_log_offset if stamped is None else int(stamped)
+            _set_worker_pid(conn, claimed.id, int(pid), log_offset=log_offset)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2582,12 +2699,21 @@ def _open_worker_log(task: Task, board: Optional[str]):
     """Append-mode per-task log (a re-run on unblock appends, never overwrites),
     rotated first. Anchored at the board root (not the shared kanban root) so
     `hermes kanban log` reads its own file and boards sharing task ids don't
-    collide."""
+    collide.
+
+    Stamps :data:`_WORKER_LOG_SPAWN_OFFSET` with the post-rotation size so the
+    dispatch path can bound crash diagnosis to this run's bytes.
+    """
     log_dir = _kb.worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    try:
+        offset = int(log_path.stat().st_size)
+    except OSError:
+        offset = 0
+    _WORKER_LOG_SPAWN_OFFSET.set(offset)
     return open(log_path, "ab")
 
 

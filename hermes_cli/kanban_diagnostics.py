@@ -642,7 +642,14 @@ FAILURE_CLASSES: tuple[str, ...] = (
 
 # Success outcomes carry no failure verdict; counting them under ``other`` would
 # drown the signal, so they are excluded from the counts entirely.
-_SUCCESS_RUN_OUTCOMES = ("completed", "submitted_for_review", "review")
+# ``review_requested`` is the durable lifecycle outcome written by
+# ``request_review`` (``submitted_for_review`` / ``review`` are legacy aliases).
+_SUCCESS_RUN_OUTCOMES = (
+    "completed",
+    "review_requested",
+    "submitted_for_review",
+    "review",
+)
 # Outcomes that mean "the run ended in a crash-class way".
 _CRASH_RUN_OUTCOMES = ("crashed", "gave_up")
 _STALE_OUTCOMES = ("stale", "reclaimed", "superseded")

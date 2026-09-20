@@ -206,6 +206,55 @@ def test_worker_log_tail_is_ansi_stripped_redacted_and_bounded(kanban_home):
     assert len(full) <= kbd._WORKER_LOG_TAIL_CHARS
 
 
+def test_worker_log_tail_force_redacts_when_display_redaction_disabled(
+    kanban_home, monkeypatch,
+):
+    """Durable DB persistence must redact even when the user disables display redaction."""
+    monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")
+    token = "ghp_" + "a1b2c3d4e5" * 4
+    log = kb.worker_logs_dir() / "t_force_redact.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(f"leaked: {token}\n", encoding="utf-8")
+
+    assert token not in kbd._worker_log_tail("t_force_redact")
+    assert token not in (kbd._display_safe_log_text(f"leaked: {token}") or "")
+
+
+def test_worker_log_tail_omits_content_when_sanitizer_fails(kanban_home, monkeypatch):
+    """If strip/redact cannot be guaranteed, omit the tail rather than persist raw secrets."""
+    token = "ghp_" + "z9y8x7w6v5" * 4
+    log = kb.worker_logs_dir() / "t_sanitizer_fail.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(f"secret={token}\n", encoding="utf-8")
+
+    def _boom(text, *, force=False, **_kwargs):
+        raise RuntimeError("redactor offline")
+
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", _boom)
+    assert kbd._display_safe_log_text(f"secret={token}") is None
+    assert kbd._worker_log_tail("t_sanitizer_fail") == ""
+    assert token not in kbd._compose_crash_error("pid 1 not alive", kbd._worker_log_tail("t_sanitizer_fail"))
+
+
+def test_worker_log_tail_omits_content_when_redact_import_fails(kanban_home, monkeypatch):
+    token = "sk-ant-" + "a" * 40
+    log = kb.worker_logs_dir() / "t_import_fail.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(f"key={token}\n", encoding="utf-8")
+
+    import builtins
+    real_import = builtins.__import__
+
+    def _block_redact(name, *args, **kwargs):
+        if name == "agent.redact" or name.startswith("agent.redact."):
+            raise ImportError("simulated redact import failure")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block_redact)
+    assert kbd._worker_log_tail("t_import_fail") == ""
+    assert kbd._display_safe_log_text(f"key={token}") is None
+
+
 # --- vanished worker: propagate the real failure -----------------------------
 
 def test_vanished_worker_error_carries_log_tail_and_pid(conn, spawnable, dead_worker_pid):
@@ -357,6 +406,88 @@ def test_unresolvable_workspace_is_a_precondition_not_a_crash(conn, spawnable):
     assert [r["outcome"] for r in _runs(conn, tid)] == ["precondition_failed"]
 
 
+def test_relative_workspace_path_is_deterministic_precondition(conn, spawnable):
+    tid = kb.create_task(
+        conn, title="relative dir path", assignee=PROFILE,
+        workspace_kind="dir", workspace_path="relative/not/absolute",
+    )
+    calls, spawn = _recorder(None)
+    res = _tick(conn, spawn)
+
+    assert calls == []
+    assert [(t, check) for t, check, _ in res.spawn_precondition_failed] == [(tid, "workspace")]
+    row = _task(conn, tid)
+    assert row["status"] == "blocked" and row["consecutive_failures"] == 0
+    assert [r["outcome"] for r in _runs(conn, tid)] == ["precondition_failed"]
+    # Sticky: next tick must not re-burn or re-report.
+    assert _tick(conn, spawn).spawn_precondition_failed == []
+    assert len(_runs(conn, tid)) == 1
+
+
+def test_transient_workspace_error_uses_spawn_failed_retry_budget(
+    conn, spawnable, monkeypatch,
+):
+    """Git/FS operational failures must not sticky-block as spawn_precondition."""
+    tid = kb.create_task(conn, title="transient wt", assignee=PROFILE)
+    calls, spawn = _recorder(None)
+
+    def _boom(task, board=None):
+        raise RuntimeError("git worktree add failed: index.lock: File exists")
+
+    monkeypatch.setattr(kbd._kbw, "resolve_workspace", _boom)
+    res = _tick(conn, spawn, failure_limit=3)
+
+    assert calls == []
+    assert res.spawn_precondition_failed == []
+    row = _task(conn, tid)
+    assert row["status"] == "ready", "operational failure must stay retryable"
+    assert row["consecutive_failures"] == 1
+    assert "index.lock" in (row["last_failure_error"] or "")
+    assert [r["outcome"] for r in _runs(conn, tid)] == ["spawn_failed"]
+
+
+def test_empty_second_attempt_does_not_inherit_prior_log_tail(
+    conn, spawnable, dead_worker_pid,
+):
+    """Append-only worker logs + a silent re-run must not re-attribute the prior cause."""
+    tid = kb.create_task(conn, title="multi attempt log boundary", assignee=PROFILE)
+    log = kb.worker_logs_dir() / f"{tid}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+
+    # Attempt 1: worker wrote a real cause, then vanished.
+    pid1 = dead_worker_pid()
+    calls, spawn = _recorder(pid1)
+    _tick(conn, spawn)
+    assert calls == [tid]
+    _rewind(conn, tid)
+    prior_cause = "FATAL: provider stream closed on attempt-1"
+    log.write_text(f"session started\n{prior_cause}\n", encoding="utf-8")
+    os.kill(pid1, signal.SIGKILL)
+    assert _await_worker_dead(pid1)
+    assert kbd.detect_crashed_workers(conn) == [tid]
+    assert prior_cause in _runs(conn, tid)[0]["error"]
+
+    # Attempt 2: spawn again, write nothing, vanish — must not inherit attempt-1.
+    pid2 = dead_worker_pid()
+    calls2, spawn2 = _recorder(pid2)
+    _tick(conn, spawn2)
+    assert calls2 == [tid]
+    run_meta = json.loads(_runs(conn, tid)[-1]["metadata"] or "{}")
+    assert "worker_log_offset" in run_meta
+    assert int(run_meta["worker_log_offset"]) == log.stat().st_size
+    _rewind(conn, tid)
+    os.kill(pid2, signal.SIGKILL)
+    assert _await_worker_dead(pid2)
+    assert kbd.detect_crashed_workers(conn) == [tid]
+
+    second = _runs(conn, tid)[-1]
+    assert second["status"] == "crashed"
+    assert prior_cause not in (second["error"] or "")
+    assert "worker log tail" not in (second["error"] or "")
+    metadata = json.loads(second["metadata"] or "{}")
+    assert prior_cause not in (metadata.get("worker_log_tail") or "")
+
+
 # --- failure-class reporting -------------------------------------------------
 
 def _insert_run(conn, task_id, *, outcome, error=None, metadata=None, ended=True, offset=0):
@@ -407,3 +538,16 @@ def test_failure_classes_separate_the_four_churn_shapes(conn, spawnable):
     stats = kb.board_stats(conn)
     assert stats["failure_classes"]["worker_vanished"] == 1
     assert stats["failure_classes_recent"]["stale_lock"] == 1
+
+
+def test_lifecycle_terminal_success_outcomes_are_not_failures(conn, spawnable):
+    """Actual review-lane terminal successes must not land under ``other``."""
+    tid = kb.create_task(conn, title="success outcomes", assignee=PROFILE)
+    for outcome in ("completed", "review_requested", "submitted_for_review", "review"):
+        assert kdg.classify_run_failure(outcome, None) == "", outcome
+        _insert_run(conn, tid, outcome=outcome)
+
+    counts = kdg.failure_class_counts(conn, task_id=tid)
+    assert counts["other"] == 0
+    assert sum(counts.values()) == 0
+    assert "review_requested" in kdg._SUCCESS_RUN_OUTCOMES
