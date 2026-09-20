@@ -1,5 +1,6 @@
-"""Turn-end guard for kanban workers, which must end with ``kanban_complete`` or
-``kanban_block``. Some models narrate the next step and stop with no tool calls;
+"""Turn-end guard for kanban workers, which must end with a terminal board transition
+(``kanban_complete`` / ``kanban_request_review`` / ``kanban_request_changes`` / ``kanban_block``).
+Some models narrate the next step and stop with no tool calls;
 Hermes treats that as a clean exit → ``rc=0`` → dispatcher ``protocol_violation``.
 Policy-only: return a bounded synthetic nudge so the loop continues instead of exiting.
 """
@@ -10,7 +11,21 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+# Board transitions that END the worker's run — the kanban tools registered in
+# ``tools/kanban_tools.py``. ``kanban_request_review`` (implementer → Review handoff) and
+# ``kanban_request_changes`` (reviewer rework verdict: closes the review run and requeues the
+# card to its implementer) are terminal exactly like ``kanban_complete`` / ``kanban_block``.
+# Missing them fired a false "still ``running``" nudge at a review worker that had just returned
+# the card; obeying that nudge records a **false approval** (``kanban_complete``) of the work
+# being rejected, or a fabricated blocker on a card another profile already owns.
+_TERMINAL_KANBAN_TOOLS = frozenset(
+    {
+        "kanban_complete",
+        "kanban_block",
+        "kanban_request_review",
+        "kanban_request_changes",
+    }
+)
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -64,13 +79,21 @@ def build_kanban_stop_nudge(
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` is still `running`. Ending now without a board tool "
-        "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        f"This session has not ended Task `{tid}` with a board tool. Ending now "
+        "without one causes a protocol violation (clean exit with no "
+        "`kanban_complete` / `kanban_request_review` / `kanban_request_changes` "
+        "/ `kanban_block`).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
-        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "2. Call the terminal tool that matches your lane:\n"
+        "   - implementation done → `kanban_complete(summary=..., artifacts=[...])`\n"
+        "   - implementation ready for review → `kanban_request_review(summary=...)`\n"
+        "   - reviewer verdict, rework needed → "
+        "`kanban_request_changes(reason=...)`\n"
+        "   - genuinely blocked → `kanban_block(reason=..., kind=...)`\n\n"
+        "If you are the review worker, `kanban_request_changes` is the correct "
+        "terminal call for a rework verdict; calling `kanban_complete` on work "
+        "you are rejecting records a FALSE approval.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
