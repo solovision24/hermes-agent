@@ -101,6 +101,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "spawn_precondition_failed": [
+                {"task_id": tid, "check": check, "reason": reason}
+                for (tid, check, reason) in res.spawn_precondition_failed
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -154,6 +158,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
     if res.memory_pressure:
         print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
+    for tid, check, reason in res.spawn_precondition_failed:
+        print(f"Spawn precondition failed ({check}): {tid}\n  {reason}")
     return 0
 
 
