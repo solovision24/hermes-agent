@@ -203,6 +203,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
+_APPROVAL_CHANNEL_CLOSED = "requires approval but the approval channel closed before a decision arrived."
 
 
 def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
@@ -233,6 +234,29 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
         from tools.approval_prompt import prompt_dangerous_approval
     except Exception:
         return blocked.format(why=_APPROVAL_UNAVAILABLE)
+
+    # Parent-process approval IPC (Mission Control chat children): MC spawns the
+    # child with HERMES_APPROVAL_IPC_FD + binding env vars only when its runtime
+    # probe validates, so this surface is strictly opt-in; when present it is the
+    # authenticated surface the user is actually watching, so it wins over the
+    # gateway/CLI panels below (a non-MC process never carries the env, so those
+    # are untouched). One-operation only, fail-closed throughout.
+    try:
+        from hermes_cli import approval_ipc as _approval_ipc
+    except Exception:
+        _approval_ipc = None
+    if _approval_ipc is not None:
+        result = _approval_ipc.request_approval(label=display, description=description)
+        if result == _approval_ipc.RESULT_APPROVE:
+            return None
+        if result == _approval_ipc.RESULT_DENY:
+            return denied
+        if result == _approval_ipc.RESULT_TIMEOUT:
+            return timed_out
+        if result == _approval_ipc.RESULT_CLOSED:
+            return blocked.format(why=_APPROVAL_CHANNEL_CLOSED)
+        # RESULT_UNAVAILABLE: no parent channel in this process — fall through to
+        # the gateway/CLI surfaces below.
 
     # Gateway surface: block on the button round-trip when a notify callback
     # is registered for this session. One-operation only — no scope buttons.

@@ -3563,9 +3563,41 @@ def _usage_exit(usage: str, examples: List[str], extra: Optional[List[str]] = No
     sys.exit(1)
 
 
+def _warn_if_bridge_config_write() -> None:
+    """Surface Mission Control's throwaway bridge home on config WRITES.
+
+    MC chat children run with ``HERMES_HOME`` pointed at a per-chat temp bridge
+    dir (``/tmp/mission-control-hermes-bridge-*``) while ``HERMES_ROOT`` anchors
+    the canonical installation — the isolation of bridge config/plugins is
+    intentional (MC ``configure_hermes_chat_environment``), but a user-approved
+    ``hermes config set`` from such a child would silently write a throwaway
+    config.yaml and report success. Warn instead of letting it no-op silently.
+    Reads are intentionally NOT warned: the bridge view is the runtime's live
+    view, and warning on every ``config get`` would drown real output.
+    """
+    root = os.environ.get("HERMES_ROOT", "").strip()
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not root or not home:
+        return
+    try:
+        real_home = os.path.realpath(home)
+        real_root = os.path.realpath(root)
+    except OSError:
+        return
+    if real_home == real_root:
+        return
+    if os.path.commonpath((real_home, tempfile.gettempdir())) != os.path.realpath(tempfile.gettempdir()):
+        return  # a real named profile home (e.g. ~/.hermes/profiles/x) — writes there are real
+    print(color("⚠ Mission Control bridge home: this write lands in the throwaway bridge config,", Colors.YELLOW))
+    print(color(f"  not the canonical profile config the rest of Hermes reads ({real_root}/config.yaml).", Colors.YELLOW))
+    print(color("  It will vanish when the chat bridge is cleaned up. To change the real config,", Colors.YELLOW))
+    print(color(f"  run outside Mission Control (or: HERMES_HOME={real_root} hermes config set ...).", Colors.YELLOW))
+
+
 def _run_write_command(fn, *args) -> None:
     """Run a config writer, surfacing the fail-closed write guard's RuntimeError as a clean CLI
     error instead of a traceback."""
+    _warn_if_bridge_config_write()
     try:
         fn(*args)
     except RuntimeError as exc:
