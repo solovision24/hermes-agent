@@ -156,7 +156,7 @@ def main():
     parser.add_argument("fixtures", type=Path, help="JSON list of de-identified cases; never pass raw requests")
     parser.add_argument("--live", action="store_true", help="Explicit opt-in to send fixture summaries to TypeSafe")
     args = parser.parse_args()
-    cases = json.loads(args.fixtures.read_text())
+    cases = json.loads(args.fixtures.read_text(encoding="utf-8"))
     if isinstance(cases, dict) and isinstance(cases.get("cases"), list):
         defaults = cases.get("defaults", {})
         if not isinstance(defaults, dict):
