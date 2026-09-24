@@ -1,0 +1,21 @@
+# Jev routing and triage pilot (advisory only)
+
+Status: opt-in benchmark CLI, not connected to the Hermes agent loop, Kanban dispatcher, Mission Control, or model config. It never selects or changes a running model, assignee, approval, or safety rule. No deployment or automatic request forwarding.
+
+## Run and disable
+
+Run `python3 scripts/jev_routing_pilot.py tests/jev_historical_summaries.json` for a network-free policy baseline. Only `--live` makes HTTPS requests, and only when `TYPESAFE_API_KEY` is supplied in the *process environment*. Do not add a credential to the repo or copy one between profile `.env` files. Omit `--live` (or stop invoking the script) to disable all Jev calls. Never run with unredacted task descriptions; the historical fixture contains manually abstracted summaries.
+
+## Exact data boundary and decision contract
+
+For an eligible fixture, one `POST https://api.typesafe.ai/v1/systemone` sends `model: jev-1.13.0`, `state: {task: deidentified_summary}` plus `current_model` only when supplied and available. `questions.model_route` is a choice over exactly the intersection of `candidates` and `available_models`, with caller-provided rubric descriptions. `questions.task_triage` is a choice over caller-provided `triage_candidates` when present. `questions.escalate` is a yes/no choice only when an available current model is supplied. No task ID, original body, session history, user identity, raw private request, API key, approval details, or provider credential enters `state`. Bearer authentication is an HTTPS header only. The script does not auto-redact arbitrary text: input curation is the caller's responsibility.
+
+Before a call, a user-selected available model wins and skips Jev. An unavailable selected model, approval/safety hold, or unavailable fallback prevents a call and returns no recommended route. An eligible case has a mandatory available deterministic fallback; offline mode, absent/placeholder key, timeout, HTTP error, malformed response, or model-choice confidence below 0.80 returns that fallback. A valid choice must belong to the declared options, have exactly those probability keys with bounded numeric values summing within 0.03 of one, and have bounded confidence. All choices remain **recommendations**, never executable control flow. `current_model` and the escalation yes/no advice do not switch models mid-task; an operator would decide.
+
+The JSON output contains each choice's `probabilities` and `confidence` (including low-confidence diagnostics), its `accepted` threshold flag for triage/escalation, `source`, `reason`, latency, input token count, and estimated USD. `estimated_usd = input_tokens × $0.042 / 1,000,000` from the [TypeSafe model pricing](https://docs.typesafe.ai/models) on 2026-09-24; output tokens are free. This is an estimate, not a billing receipt. The benchmark compares each recommendation to `expected_model`/`expected_triage` when those labels exist; null accuracy means no labels, not zero accuracy. The triage metric counts only threshold-accepted correct choices across all labeled fixtures. Do not tune a production threshold on this tiny sample.
+
+## Historical pilot and limits
+
+`tests/jev_historical_summaries.json` contains ten manually abstracted completed Kanban task titles (historical assignee labels: dev/forge/chip). The board had 81 completed tasks and zero completed tasks with a `model_override` at extraction time. Therefore the model route has **no historical gold labels** and its accuracy/regression count cannot be measured from that board. `economy/general/advanced` are illustrative tiers, not real available provider/model IDs; never wire them into live routing. The sample is biased and insufficient to approve rollout. A future evaluation needs explicit model-label provenance, real per-profile available model catalog and capability/price metadata, privacy review of inputs, and a substantially larger held-out set before any integration proposal.
+
+The reproducible local test command is `python3 -m pytest tests/test_jev_routing_pilot.py -q -o addopts=`. No credentials are needed for tests; offline baseline has zero network cost. The live report is generated outside the repository in the Forge scratch area and must not be committed as a raw history payload.
