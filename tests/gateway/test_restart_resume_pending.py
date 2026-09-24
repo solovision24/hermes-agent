@@ -28,7 +28,7 @@ PRs #9850, #9934, #7536):
 import asyncio
 import time
 from datetime import datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -734,9 +734,11 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+async def test_restart_notifies_home_channel_even_without_active_sessions(monkeypatch):
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    sender = Mock(return_value={"ok": True, "result": {"message_id": 1}})
+    monkeypatch.setattr("tools.operational_sender.send_operational_message", sender)
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
         chat_id="home-42",
@@ -745,16 +747,20 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
+    sender.assert_called_once_with(
         "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+        "Send any message after restart and I'll try to resume where you left off.",
+        "home-42",
+    )
+    assert adapter.sent == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_home_channel_notification_not_deduped_across_threads(monkeypatch):
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
+    sender = Mock(return_value={"ok": True, "result": {"message_id": 2}})
+    monkeypatch.setattr("tools.operational_sender.send_operational_message", sender)
     session_key = "agent:main:telegram:group:999"
     runner.session_store._entries[session_key] = MagicMock(
         origin=SessionSource(
@@ -774,9 +780,9 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 2
+    assert len(adapter.sent) == 1
     assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    sender.assert_called_once_with(adapter.sent[0], "999")
 
 
 # ---------------------------------------------------------------------------
