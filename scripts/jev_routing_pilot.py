@@ -15,17 +15,44 @@ ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-1.13.0"
 PRICE_PER_MILLION_INPUT = 0.042  # https://docs.typesafe.ai/models (2026-09-24)
 CONFIDENCE_FLOOR = 0.80
+CODEX_CANDIDATES = {
+    "gpt-6-astra": "Codex GPT-6 Astra; assess task fit and quality",
+    "gpt-6-sol": "Codex GPT-6 Sol; assess task fit and quality",
+    "gpt-6-luna": "Codex GPT-6 Luna; assess task fit and quality",
+}
 
 
-def policy(case):
+def live_codex_models():
+    """Read only the account-scoped live catalog; no cache or synthetic IDs."""
+    import httpx
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+    from hermes_cli.codex_models import _extract_chatgpt_account_id
+
+    token = resolve_codex_runtime_credentials().get("api_key")
+    account = _extract_chatgpt_account_id(token) if token else None
+    if not account:
+        return []
+    response = httpx.get(
+        "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+        headers={"Authorization": f"Bearer {token}", "ChatGPT-Account-Id": account},
+        timeout=10,
+    )
+    response.raise_for_status()
+    data = response.json()
+    entries = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry["slug"] for entry in entries if isinstance(entry, dict)
+            and isinstance(entry.get("slug"), str)
+            and str(entry.get("visibility", "")).lower() not in {"hide", "hidden"}]
+
+
+def policy(case, catalog_models=None):
     """Hard constraints precede any remote judgment."""
-    candidates = case["candidates"]
-    if not isinstance(candidates, dict) or not candidates or any(
-        not isinstance(k, str) or not k or not isinstance(v, str) for k, v in candidates.items()
-    ):
-        raise ValueError("candidates must be a nonempty model-to-description map")
-    allowed = {name: desc for name, desc in candidates.items()
-               if name in case.get("available_models", list(candidates))}
+    available = case.get("available_models", []) if catalog_models is None else catalog_models
+    if not isinstance(available, (list, tuple, set)) or any(not isinstance(x, str) for x in available):
+        raise ValueError("available_models must be a list of model IDs")
+    allowed = {name: desc for name, desc in CODEX_CANDIDATES.items() if name in available}
     if case.get("approval_required") or case.get("safety_hold"):
         return allowed, None, "approval_or_safety_hold"
     selected = case.get("user_selected_model")
@@ -50,7 +77,7 @@ def payload(case, allowed):
     if current in allowed:
         state["current_model"] = current
     questions = {
-        "model_route": {"type": "choice", "instructions": "Select the least expensive capable model for this task. Consider complexity and required capabilities, not user identity.", "criteria": allowed},
+        "model_route": {"type": "choice", "instructions": "Choose the best-fit Codex GPT-6 model for task complexity and required capabilities, not user identity. Prices and measured model quality are not supplied; do not infer a cost ranking.", "criteria": allowed},
     }
     if current in allowed:
         questions["escalate"] = {"type": "choice", "instructions": "Does this task require escalation from its current model because of complexity, failure or safety uncertainty?", "criteria": {"yes": "Escalation is warranted; recommendation only", "no": "Current model is adequate"}}
@@ -84,8 +111,13 @@ def valid_choice(answers, question, options):
     return answer
 
 
-def decide(case, live=False, api_key=None, evaluator=evaluate):
-    allowed, fallback, reason = policy(case)
+def decide(case, live=False, api_key=None, evaluator=evaluate, catalog_models=None):
+    if live and catalog_models is None:
+        try:
+            catalog_models = live_codex_models()
+        except Exception:
+            catalog_models = []
+    allowed, fallback, reason = policy(case, catalog_models)
     row = {"id": case.get("id"), "route": fallback, "source": "policy", "reason": reason,
            "triage": None, "escalation_advice": None, "latency_ms": 0, "input_tokens": 0,
            "estimated_usd": 0, "confidence": None, "probabilities": None}
@@ -142,8 +174,14 @@ def decide(case, live=False, api_key=None, evaluator=evaluate):
     return row
 
 
-def benchmark(cases, live=False, api_key=None, evaluator=evaluate):
-    rows = [decide(case, live, api_key, evaluator) for case in cases]
+def benchmark(cases, live=False, api_key=None, evaluator=evaluate, catalog_fetcher=live_codex_models):
+    catalog_models = None
+    if live:
+        try:
+            catalog_models = catalog_fetcher()
+        except Exception:
+            catalog_models = []
+    rows = [decide(case, live, api_key, evaluator, catalog_models) for case in cases]
     labeled = [(case, row) for case, row in zip(cases, rows) if case.get("expected_model")]
     triage_labeled = [(case, row) for case, row in zip(cases, rows) if case.get("expected_triage")]
     return {"mode": "live_advisory" if live else "offline", "cases": len(rows),
