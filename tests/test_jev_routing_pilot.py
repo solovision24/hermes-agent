@@ -45,6 +45,26 @@ def test_user_pin_and_safety_hold_override_even_in_live_mode():
     assert pilot.decide(case(user_selected_model="missing"), True, "key", forbidden)["reason"] == "selected_unavailable"
 
 
+def test_hold_overrides_valid_user_pin_in_live_mode():
+    def forbidden(*_):
+        raise AssertionError("network called")
+    safety = pilot.decide(case(user_selected_model="small", safety_hold=True), True, "key", forbidden)
+    assert (safety["route"], safety["reason"]) == (None, "approval_or_safety_hold")
+    approval = pilot.decide(case(user_selected_model="small", approval_required=True), True, "key", forbidden)
+    assert (approval["route"], approval["reason"]) == (None, "approval_or_safety_hold")
+
+
+def test_malformed_live_input_fails_closed_without_network_call():
+    def forbidden(*_):
+        raise AssertionError("network called")
+    empty = pilot.decide(case(deidentified_summary="   "), True, "key", forbidden)
+    assert (empty["route"], empty["reason"]) == (None, "invalid_input")
+    overlong = pilot.decide(case(deidentified_summary="x" * 4001), True, "key", forbidden)
+    assert (overlong["route"], overlong["reason"]) == (None, "invalid_input")
+    bad_triage = pilot.decide(case(triage_candidates=["chip", "forge"]), True, "key", forbidden)
+    assert (bad_triage["route"], bad_triage["reason"]) == (None, "invalid_input")
+
+
 def test_payload_contains_only_declared_summary_and_available_candidates():
     c = case(available_models=["small"], private_data="must not leak")
     body = pilot.payload(c, pilot.policy(c)[0])

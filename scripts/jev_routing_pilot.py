@@ -26,11 +26,11 @@ def policy(case):
         raise ValueError("candidates must be a nonempty model-to-description map")
     allowed = {name: desc for name, desc in candidates.items()
                if name in case.get("available_models", list(candidates))}
+    if case.get("approval_required") or case.get("safety_hold"):
+        return allowed, None, "approval_or_safety_hold"
     selected = case.get("user_selected_model")
     if selected:
         return allowed, selected if selected in allowed else None, "user_selected" if selected in allowed else "selected_unavailable"
-    if case.get("approval_required") or case.get("safety_hold"):
-        return allowed, None, "approval_or_safety_hold"
     fallback = case.get("fallback_model")
     if fallback not in allowed:
         return allowed, None, "fallback_unavailable"
@@ -96,7 +96,12 @@ def decide(case, live=False, api_key=None, evaluator=evaluate):
     if not api_key or api_key.startswith("PASTE_"):
         row["reason"] = "missing_credential"
         return row
-    body = payload(case, allowed)
+    try:
+        body = payload(case, allowed)
+    except ValueError:
+        row["route"] = None
+        row["reason"] = "invalid_input"
+        return row
     try:
         result, elapsed = evaluator(body, api_key)
         row["latency_ms"] = round(elapsed, 2)
