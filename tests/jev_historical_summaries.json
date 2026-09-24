@@ -1,17 +1,16 @@
 {"defaults": {
-  "candidates": {"economy": "Low-cost model for small bounded fixes", "general": "General capable model for integrations and analysis", "advanced": "Premium model for complex multi-component work"},
-  "available_models": ["economy", "general", "advanced"],
-  "fallback_model": "general",
+  "available_models": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"],
+  "fallback_model": "gpt-6-sol",
   "triage_candidates": {"chip": "Small, bounded fixes", "forge": "Infrastructure, backend and CI", "dev": "Cross-component integration and coordination"}
 }, "cases": [
-  {"id":"history-01","deidentified_summary":"Diagnose chat API not-found and message loading across native sessions","expected_triage":"dev"},
-  {"id":"history-02","deidentified_summary":"Repair Windows companion scheduled task environment and authentication persistence","expected_triage":"dev"},
-  {"id":"history-03","deidentified_summary":"Remediate cross-repository route refresh clock skew in a pull request","expected_triage":"dev"},
-  {"id":"history-04","deidentified_summary":"Repair iOS release version metadata validation","expected_triage":"dev"},
-  {"id":"history-05","deidentified_summary":"Repair macOS Jenkins artifact handoff with a durable hash-bound relay","expected_triage":"forge"},
-  {"id":"history-06","deidentified_summary":"Configure CI pipeline and release readiness gates","expected_triage":"forge"},
-  {"id":"history-07","deidentified_summary":"Fix provider preflight validation for standard configurations","expected_triage":"chip"},
-  {"id":"history-08","deidentified_summary":"Resolve Windows Rust compiler type inference error in build lane","expected_triage":"chip"},
-  {"id":"history-09","deidentified_summary":"Fix CI archive validation SIGPIPE on Linux and macOS","expected_triage":"forge"},
-  {"id":"history-10","deidentified_summary":"Synthesize release audit and repair gates across components","expected_triage":"dev"}
+  {"id":"history-01","deidentified_summary":"Diagnose chat API not-found and message loading across native sessions","expected_model":"gpt-6-astra","expected_triage":"dev"},
+  {"id":"history-02","deidentified_summary":"Repair Windows companion scheduled task environment and authentication persistence","expected_model":"gpt-6-sol","expected_triage":"dev"},
+  {"id":"history-03","deidentified_summary":"Remediate cross-repository route refresh clock skew in a pull request","expected_model":"gpt-6-astra","expected_triage":"dev"},
+  {"id":"history-04","deidentified_summary":"Repair iOS release version metadata validation","expected_model":"gpt-6-luna","expected_triage":"dev"},
+  {"id":"history-05","deidentified_summary":"Repair macOS Jenkins artifact handoff with a durable hash-bound relay","expected_model":"gpt-6-astra","expected_triage":"forge"},
+  {"id":"history-06","deidentified_summary":"Configure CI pipeline and release readiness gates","expected_model":"gpt-6-sol","expected_triage":"forge"},
+  {"id":"history-07","deidentified_summary":"Fix provider preflight validation for standard configurations","expected_model":"gpt-6-luna","expected_triage":"chip"},
+  {"id":"history-08","deidentified_summary":"Resolve Windows Rust compiler type inference error in build lane","expected_model":"gpt-6-luna","expected_triage":"chip"},
+  {"id":"history-09","deidentified_summary":"Fix CI archive validation SIGPIPE on Linux and macOS","expected_model":"gpt-6-sol","expected_triage":"forge"},
+  {"id":"history-10","deidentified_summary":"Synthesize release audit and repair gates across components","expected_model":"gpt-6-astra","expected_triage":"dev"}
 ]}
