@@ -27,7 +27,8 @@ from hermes_cli.auth import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_probe_cache():
+def _clear_probe_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_ROOT", str(tmp_path / "hermes"))
     auth_mod._codex_quota_probe_cache.clear()
     yield
     auth_mod._codex_quota_probe_cache.clear()
@@ -242,6 +243,23 @@ def test_resolver_recovers_when_probe_confirms_reset(tmp_path, monkeypatch):
     entry = store["credential_pool"]["openai-codex"][0]
     assert entry["last_status"] is None
     assert entry["last_error_reset_at"] is None
+
+
+def test_profile_probe_clears_cooldown_in_root_store(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "orion"
+    profile.mkdir(parents=True)
+    _write_auth_store(root, _pool_only_rate_limited_store())
+    (profile / "auth.json").write_text(json.dumps({"providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(auth_mod, "_probe_codex_quota_restored", lambda token, **kw: True)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert resolved["api_key"] == "tok-quota"
+    root_entry = json.loads((root / "auth.json").read_text())["credential_pool"]["openai-codex"][0]
+    assert root_entry["last_error_reset_at"] is None
+    assert json.loads((profile / "auth.json").read_text()) == {"providers": {}}
 
 
 
