@@ -134,6 +134,87 @@ def test_profile_resolves_root_pool_when_singleton_has_only_identity(tmp_path, m
     assert resolved["api_key"] == "root-access"
 
 
+def test_profile_refreshes_expired_root_pool_and_persists_rotation(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "orion"
+    profile.mkdir(parents=True)
+    expired = _jwt_with_exp(int(time.time()) - 60)
+    fresh = _jwt_with_exp(int(time.time()) + 3600)
+    store = {
+        "providers": {"openai-codex": {"tokens": {"id_token": "identity-only"}}},
+        "credential_pool": {"openai-codex": [{
+            "source": "manual:device_code", "access_token": expired,
+            "refresh_token": "old-refresh", "last_status": "ok",
+        }]},
+    }
+    (root / "auth.json").write_text(json.dumps(store))
+    (profile / "auth.json").write_text(json.dumps({"providers": {}}))
+    monkeypatch.setenv("HERMES_ROOT", str(root))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+    calls = []
+
+    def refresh(access_token, refresh_token, **kwargs):
+        calls.append((access_token, refresh_token))
+        return {"access_token": fresh, "refresh_token": "rotated-refresh",
+                "last_refresh": "2026-09-24T23:00:00Z"}
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", refresh)
+    resolved = resolve_codex_runtime_credentials()
+    assert resolved["source"] == "credential_pool"
+    assert resolved["api_key"] == fresh
+    assert calls == [(expired, "old-refresh")]
+    entry = json.loads((root / "auth.json").read_text())["credential_pool"]["openai-codex"][0]
+    assert entry["access_token"] == fresh
+    assert entry["refresh_token"] == "rotated-refresh"
+    assert entry["last_refresh"] == "2026-09-24T23:00:00Z"
+    assert json.loads((profile / "auth.json").read_text()) == {"providers": {}}
+    assert resolve_codex_runtime_credentials()["api_key"] == fresh
+    assert len(calls) == 1
+
+
+def test_profile_expired_pool_without_refresh_token_does_not_return_stale_token(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "orion"
+    profile.mkdir(parents=True)
+    (root / "auth.json").write_text(json.dumps({
+        "credential_pool": {"openai-codex": [{
+            "access_token": _jwt_with_exp(int(time.time()) - 60),
+        }]},
+    }))
+    monkeypatch.setenv("HERMES_ROOT", str(root))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.code == "codex_auth_missing_refresh_token"
+
+
+def test_profile_pool_refresh_quota_error_preserves_grant_and_cooldown(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "orion"
+    profile.mkdir(parents=True)
+    expired = _jwt_with_exp(int(time.time()) - 60)
+    store = {"credential_pool": {"openai-codex": [{
+        "access_token": expired, "refresh_token": "old-refresh",
+        "last_status": "ok", "last_error_reset_at": None,
+    }]}}
+    (root / "auth.json").write_text(json.dumps(store))
+    monkeypatch.setenv("HERMES_ROOT", str(root))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+
+    def quota(*args, **kwargs):
+        raise AuthError("quota", provider="openai-codex", code="codex_rate_limited",
+                        relogin_required=False)
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", quota)
+    with pytest.raises(AuthError) as exc:
+        resolve_codex_runtime_credentials()
+    assert exc.value.relogin_required is False
+    assert json.loads((root / "auth.json").read_text()) == store
+
+
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
     """Re-auth must update the credential_pool device_code entry, not just providers.
 

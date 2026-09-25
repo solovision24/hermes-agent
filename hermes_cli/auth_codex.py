@@ -408,7 +408,9 @@ def resolve_codex_runtime_credentials(
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
     if data is None:
-        pool_token = _pool_codex_access_token()
+        pool_token = _pool_codex_access_token(
+            force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+            refresh_skew_seconds=refresh_skew_seconds)
         if pool_token:
             return _codex_runtime_result(pool_token, source="credential_pool", last_refresh=None)
         pool_rate_limit = _codex_pool_rate_limit_status()
@@ -421,7 +423,9 @@ def resolve_codex_runtime_credentials(
                 stale_token, base_url=pool_rate_limit.get("base_url")):
                 logger.info("Codex quota restored upstream — clearing stale pool cooldown(s).")
                 clear_codex_pool_quota_cooldowns()
-                pool_token = _pool_codex_access_token()
+                pool_token = _pool_codex_access_token(
+                    force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+                    refresh_skew_seconds=refresh_skew_seconds)
                 if pool_token:
                     return _codex_runtime_result(
                         pool_token, source="credential_pool", last_refresh=None)
@@ -618,18 +622,54 @@ def _pool_entries(auth_store: Dict[str, Any], provider_id: str) -> Optional[List
     return entries if isinstance(entries, list) else None
 
 
-def _pool_codex_access_token() -> str:
-    """First non-empty pool access_token not in an exhaustion cooldown window, else "".
+def _pool_codex_access_token(
+    *, force_refresh: bool = False, refresh_if_expiring: bool = True,
+    refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS) -> str:
+    """First usable pool token, refreshing expiring OAuth grants under the root lock.
 
     Fallback for ``resolve_codex_runtime_credentials`` when the singleton has no creds.
     """
-    from hermes_cli.auth import _nonempty_str
+    from hermes_cli.auth import (
+        _auth_store_lock, _codex_auth_file_path, _load_auth_store, _nonempty_str,
+        _save_auth_store, refresh_codex_oauth_pure)
+    auth_path = _codex_auth_file_path()
+    refresh_timeout = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+    lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout + 5.0)
     try:
-        for entry in _codex_pool_dicts(_read_codex_pool_entries()):
-            token, reset_at = entry.get("access_token"), entry.get("last_error_reset_at")
-            in_cooldown = isinstance(reset_at, (int, float)) and reset_at > time.time()
-            if _nonempty_str(token) and not in_cooldown:
-                return token.strip()
+        with _auth_store_lock(timeout_seconds=lock_timeout, target_path=auth_path):
+            store = _load_auth_store(auth_path)
+            for entry in _codex_pool_dicts(_pool_entries(store, "openai-codex")):
+                token, reset_at = entry.get("access_token"), entry.get("last_error_reset_at")
+                in_cooldown = isinstance(reset_at, (int, float)) and reset_at > time.time()
+                if not _nonempty_str(token) or in_cooldown:
+                    continue
+                token = token.strip()
+                should_refresh = force_refresh or (
+                    refresh_if_expiring and
+                    _codex_access_token_is_expiring(token, refresh_skew_seconds))
+                if should_refresh and _nonempty_str(entry.get("refresh_token")):
+                    try:
+                        updated = refresh_codex_oauth_pure(
+                            token, entry["refresh_token"], timeout_seconds=refresh_timeout)
+                    except AuthError:
+                        raise
+                    except Exception as exc:
+                        raise _codex_err(
+                            f"Codex pool token refresh failed: {exc}",
+                            "codex_refresh_failed", relogin=False) from exc
+                    entry.update(
+                        access_token=updated["access_token"],
+                        refresh_token=updated["refresh_token"],
+                        last_refresh=updated["last_refresh"])
+                    _save_auth_store(store, target_path=auth_path)
+                    return updated["access_token"]
+                if should_refresh and _codex_access_token_is_expiring(token, 0):
+                    raise _codex_err(
+                        _MISSING_REFRESH_TOKEN_MSG, "codex_auth_missing_refresh_token",
+                        relogin=True)
+                return token
+    except AuthError:
+        raise
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""
