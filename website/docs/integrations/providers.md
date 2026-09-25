@@ -92,6 +92,8 @@ Don't have a subscription yet? Get one at [portal.nousresearch.com/manage-subscr
 :::info Codex Note
 The OpenAI Codex provider authenticates via device code (open a URL, enter a code). Hermes stores the resulting credentials in its own auth store under `~/.hermes/auth.json` and can import existing Codex CLI credentials from `~/.codex/auth.json` when present. No Codex CLI installation is required.
 
+Named profiles use the same canonical root Codex OAuth pool. If the singleton token pair is absent but a valid pooled credential remains, chat resolves the root pool rather than the profile-local `auth.json`; quota cooldown clearing also writes to the root store. An identity-only singleton is not proof that the OAuth pool is empty.
+
 If a token refresh fails with a terminal error (HTTP 4xx, `invalid_grant`, revoked grant, etc.), Hermes marks the refresh token as dead and stops replaying it so you don't see a flood of identical auth failures. The next request surfaces a typed re-auth message instead. Run `hermes auth add openai-codex` (or `hermes model` → **ChatGPT or Codex Subscription**) to start a fresh device-code login; the quarantine clears on the next successful exchange.
 :::
 

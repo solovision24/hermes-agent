@@ -22,6 +22,12 @@ from hermes_cli.auth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_codex_root(tmp_path, monkeypatch):
+    # Canonical-root auth must never resolve to the real store under profile tests.
+    monkeypatch.setenv("HERMES_ROOT", str(tmp_path / "hermes"))
+
+
 def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
     """Write Codex tokens into the Hermes auth store."""
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -104,6 +110,28 @@ def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_emp
     assert resolved["base_url"]  # default codex backend URL
 
 
+
+
+def test_profile_resolves_root_pool_when_singleton_has_only_identity(tmp_path, monkeypatch):
+    """A profile-local empty pool must not hide the canonical root OAuth grant."""
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "orion"
+    profile.mkdir(parents=True)
+    (root / "auth.json").write_text(json.dumps({
+        "providers": {"openai-codex": {"tokens": {"id_token": "identity-only"}}},
+        "credential_pool": {"openai-codex": [{
+            "source": "manual:device_code", "access_token": "root-access",
+            "refresh_token": "root-refresh", "last_error_reset_at": None,
+        }]},
+    }))
+    (profile / "auth.json").write_text(json.dumps({"providers": {}}))
+    monkeypatch.setenv("HERMES_ROOT", str(root))
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+
+    resolved = resolve_codex_runtime_credentials()
+    assert resolved["source"] == "credential_pool"
+    assert resolved["api_key"] == "root-access"
 
 
 def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):

@@ -552,11 +552,12 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     rate-limited entry does (a redeemed banked reset restores the whole account; a still-exhausted
     entry just re-freezes with fresh metadata on its next 429).
     """
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+    from hermes_cli.auth import _auth_store_lock, _codex_auth_file_path, _load_auth_store, _save_auth_store
     cleared = 0
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        auth_path = _codex_auth_file_path()
+        with _auth_store_lock(target_path=auth_path):
+            auth_store = _load_auth_store(auth_path)
             entries = _pool_entries(auth_store, "openai-codex")
             if entries is None:
                 return 0
@@ -567,7 +568,7 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
                     _clear_pool_entry_status(entry)
                     cleared += 1
             if cleared:
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, target_path=auth_path)
     except Exception:
         logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
     return cleared
@@ -580,10 +581,11 @@ def _codex_pool_dicts(entries: Optional[List[Any]]) -> Iterator[Dict[str, Any]]:
 
 
 def _read_codex_pool_entries() -> Optional[List[Any]]:
-    """Locked read of ``credential_pool.openai-codex`` from auth.json (None when absent)."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    """Read the canonical root pool, not the active profile's empty auth store."""
+    from hermes_cli.auth import _auth_store_lock, _codex_auth_file_path, _load_auth_store
+    auth_path = _codex_auth_file_path()
+    with _auth_store_lock(target_path=auth_path):
+        auth_store = _load_auth_store(auth_path)
     return _pool_entries(auth_store, "openai-codex")
 
 
