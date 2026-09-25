@@ -16,7 +16,7 @@ import json
 import os
 import threading
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 from hermes_cli.auth_constants import (
@@ -597,9 +597,12 @@ def resolve_codex_runtime_credentials(
             if imported:
                 data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
     if data is None:
-        pool_token = _pool_codex_access_token()
+        pool_token = _pool_codex_access_token(
+            refresh_if_expiring=refresh_if_expiring and not read_only and not force_refresh,
+            refresh_skew_seconds=refresh_skew_seconds)
         if pool_token and force_refresh and not read_only:
-            # Pool-only setup: a forced refresh must rotate the pool entry, not resend its token.
+            # Preserve the runtime pool's force-refresh path (including its source-aware
+            # persistence and matching semantics) rather than rotating twice here.
             from agent.credential_pool import load_pool
             refreshed = load_pool("openai-codex").try_refresh_matching(api_key_hint=pool_token)
             pool_token = refreshed.runtime_api_key if refreshed is not None else ""
@@ -614,7 +617,9 @@ def resolve_codex_runtime_credentials(
             if not read_only and _probe_codex_pool_entry_quota_restored(pool_rate_limit):
                 logger.info("Codex quota restored upstream — clearing stale pool cooldown(s).")
                 clear_codex_pool_quota_cooldowns()
-                pool_token = _pool_codex_access_token()
+                pool_token = _pool_codex_access_token(
+                    force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+                    refresh_skew_seconds=refresh_skew_seconds)
                 if pool_token:
                     return _codex_runtime_result(
                         pool_token, source="credential_pool", last_refresh=None)
@@ -875,23 +880,50 @@ def _pool_entries(auth_store: Dict[str, Any], provider_id: str) -> Optional[List
     return entries if isinstance(entries, list) else None
 
 
-def _pool_codex_access_token() -> str:
-    """First non-empty pool access_token not in an exhaustion cooldown window, else "".
-
-    Fallback for ``resolve_codex_runtime_credentials`` when the singleton has no creds; reads
-    through ``read_credential_pool`` so a profile inherits the global-root pool (#34143).
-    """
-    from agent.credential_pool import _parse_absolute_timestamp
-    from hermes_cli.auth import _nonempty_str, read_credential_pool
+def _pool_codex_access_token(
+    *, force_refresh: bool = False, refresh_if_expiring: bool = False,
+    refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS) -> str:
+    """Try each eligible grant; rotate expiring pool-only grants at their source."""
+    from agent.credential_pool import _borrowed_single_use_pool_root, _parse_absolute_timestamp, _profile_owns_pool_provider
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _nonempty_str, _save_auth_store
+    target = None if _profile_owns_pool_provider("openai-codex") else _borrowed_single_use_pool_root()
+    timeout = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+    lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), timeout + 5.0)
+    first_error: Optional[AuthError] = None
     try:
-        for entry in _codex_pool_dicts(read_credential_pool("openai-codex")):
-            token = entry.get("access_token")
-            # Same normaliser as ``_codex_pool_rate_limit_status``: a millisecond epoch compared
-            # raw reads as far-future here and as elapsed there, hiding a usable entry (#103349).
-            reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
-            in_cooldown = reset_at is not None and reset_at > time.time()
-            if _nonempty_str(token) and not in_cooldown:
-                return token.strip()
+        # Diagnostics must not materialise auth.lock. Only the refresh path mutates the
+        # store; keep its read/rotate/write transaction locked across processes.
+        lock = (_auth_store_lock(timeout_seconds=lock_timeout, target_path=target)
+                if force_refresh or refresh_if_expiring else nullcontext())
+        with lock:
+            store = _load_auth_store(target)
+            for entry in _codex_pool_dicts(_pool_entries(store, "openai-codex")):
+                token = entry.get("access_token")
+                reset_at = _parse_absolute_timestamp(entry.get("last_error_reset_at"))
+                if not _nonempty_str(token) or (reset_at is not None and reset_at > time.time()):
+                    continue
+                token = str(token).strip()
+                needs_refresh = force_refresh or (
+                    refresh_if_expiring and _codex_access_token_is_expiring(token, refresh_skew_seconds))
+                if needs_refresh and _nonempty_str(entry.get("refresh_token")):
+                    try:
+                        updated = refresh_codex_oauth_pure(token, entry["refresh_token"], timeout_seconds=timeout)
+                    except AuthError as exc:
+                        first_error = first_error or exc
+                        continue
+                    entry.update(updated)
+                    _save_auth_store(store, target_path=target)
+                    return updated["access_token"]
+                if needs_refresh and _codex_access_token_is_expiring(token, 0):
+                    first_error = first_error or _codex_err(
+                        _MISSING_REFRESH_TOKEN_MSG.format(relogin=_codex_relogin_command()),
+                        "codex_auth_missing_refresh_token", relogin=True)
+                    continue
+                return token
+            if first_error is not None:
+                raise first_error
+    except AuthError:
+        raise
     except Exception:
         logger.debug("Codex pool fallback lookup failed", exc_info=True)
     return ""
