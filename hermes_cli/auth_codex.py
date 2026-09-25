@@ -635,6 +635,7 @@ def _pool_codex_access_token(
     auth_path = _codex_auth_file_path()
     refresh_timeout = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
     lock_timeout = max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout + 5.0)
+    first_error: Optional[AuthError] = None
     try:
         with _auth_store_lock(timeout_seconds=lock_timeout, target_path=auth_path):
             store = _load_auth_store(auth_path)
@@ -651,12 +652,17 @@ def _pool_codex_access_token(
                     try:
                         updated = refresh_codex_oauth_pure(
                             token, entry["refresh_token"], timeout_seconds=refresh_timeout)
-                    except AuthError:
-                        raise
+                    except AuthError as exc:
+                        # A broken grant must not mask another usable pooled account.
+                        if first_error is None:
+                            first_error = exc
+                        continue
                     except Exception as exc:
-                        raise _codex_err(
-                            f"Codex pool token refresh failed: {exc}",
-                            "codex_refresh_failed", relogin=False) from exc
+                        if first_error is None:
+                            first_error = _codex_err(
+                                f"Codex pool token refresh failed: {exc}",
+                                "codex_refresh_failed", relogin=False)
+                        continue
                     entry.update(
                         access_token=updated["access_token"],
                         refresh_token=updated["refresh_token"],
@@ -664,10 +670,14 @@ def _pool_codex_access_token(
                     _save_auth_store(store, target_path=auth_path)
                     return updated["access_token"]
                 if should_refresh and _codex_access_token_is_expiring(token, 0):
-                    raise _codex_err(
-                        _MISSING_REFRESH_TOKEN_MSG, "codex_auth_missing_refresh_token",
-                        relogin=True)
+                    if first_error is None:
+                        first_error = _codex_err(
+                            _MISSING_REFRESH_TOKEN_MSG, "codex_auth_missing_refresh_token",
+                            relogin=True)
+                    continue
                 return token
+            if first_error is not None:
+                raise first_error
     except AuthError:
         raise
     except Exception:
