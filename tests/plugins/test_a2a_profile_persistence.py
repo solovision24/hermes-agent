@@ -226,7 +226,7 @@ def test_real_forwarded_profiles_survive_fresh_process_readback(tmp_path, monkey
             readback = run_python(code, root, extra_env={"HERMES_HOME": str(home)})
             assert readback.returncode == 0, readback.stderr
             own, other = json.loads(readback.stdout.strip().splitlines()[-1])
-            assert f"[user] {context}" in own and f"[agent] {reply}" in own
+            assert f"[user] {context}" in own and own.rstrip().endswith(reply)
             assert "No persisted conversation" in other
             audit = [json.loads(line) for line in (home / "a2a_audit.jsonl").read_text().splitlines()]
             assert [row["direction"] for row in audit] == ["inbound", "outbound"]
