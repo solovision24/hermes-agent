@@ -3389,6 +3389,14 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            # A webhook replay may reuse its immutable-head card after the
+            # reviewer has assigned remediation. It is not a new intake: only
+            # the assigned worker can submit the next review round. Check the
+            # durable verdict, not the assignee alone (fresh intake is ready).
+            if (trow["status"] == "ready" and expected_run_id is None and not force
+                    and _external_intake_provenance(conn, task_id) is not None
+                    and _latest_event(conn, task_id, "changes_requested") is not None):
+                return _ret(False, "external PR remediation belongs to its assigned worker")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).

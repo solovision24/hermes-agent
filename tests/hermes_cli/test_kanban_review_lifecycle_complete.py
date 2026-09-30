@@ -975,8 +975,24 @@ def test_external_explicit_owner_resubmits_without_rewriting_origin(conn, remedi
         conn, task_id, reason="Fix existing PR", expected_run_id=review.current_run_id,
         remediation_assignee="dev",
     ) == (True, "dev")
-    work = kb.claim_task(conn, task_id, claimer="dev:1")
-    assert work is not None and work.assignee == "dev"
+    # A same-head replay reuses the card; the adapter's unowned request-review
+    # must not reclaim it from the explicitly assigned remediation lane.
+    before = kb.list_events(conn, task_id)
+    assert kb.create_task(
+        conn, title="Webhook replay after verdict", created_by="github-webhook",
+        idempotency_key=_INTAKE_KEY,
+    ) == task_id
+    assert kb.request_review(
+        conn, task_id, summary="GitHub PR delivery", reviewer="reviewer", with_reason=True,
+    ) == (False, "external PR remediation belongs to its assigned worker")
+    assert kb.list_events(conn, task_id) == before
+    assigned = kb.get_task(conn, task_id)
+    assert assigned is not None and (assigned.status, assigned.assignee) == ("ready", "dev")
+
+    dispatched = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 4242)
+    assert any(row[0] == task_id for row in dispatched.spawned)
+    work = kb.get_task(conn, task_id)
+    assert work is not None and (work.status, work.assignee) == ("running", "dev")
     assert kb.request_review(
         conn, task_id, summary="Fix submitted", expected_run_id=work.current_run_id,
     )

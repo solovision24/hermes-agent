@@ -989,6 +989,21 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
         [--log-retention-days N]
 ```
 
+External GitHub PR intake has no original Kanban implementer. The reviewer must
+choose an existing, independent remediation profile explicitly; the webhook's
+creator and the reviewer are not substitute implementers. Once changes are
+requested, a same-head webhook replay must not call `request-review` again on
+the ready remediation card: the assigned worker owns the next handoff. The
+native board refuses that unowned replay rather than stealing the assignment.
+Webhook adapters should read the idempotent `create --json` result and treat an
+already-existing ready card with a `changes_requested` verdict as a successful
+no-op (preserving its assignee); only a newly created ready intake is routed to
+Review. Verify this in the adapter's own integration tests before deployment.
+The host-local `github_pr_native_ingest.py` adapter is not part of this source
+tree; updating this package alone does not deploy that adapter or make its
+redeliveries return success. Until the adapter is governed and updated, its
+replay may report failure, but cannot overwrite the remediation owner.
+
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
