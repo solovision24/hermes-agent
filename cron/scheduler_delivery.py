@@ -652,7 +652,11 @@ def _resolve_single_delivery_target(
             platform_key, rest, pass_unresolved_references=True)
         if resolution_error:
             logger.warning("Invalid cron delivery target '%s': %s", deliver_value, resolution_error)
-            return None
+            if platform_key != "telegram":
+                return None
+            # Keep a refused Telegram target in mixed deliveries: dropping it
+            # here would let another platform's success hide the missing target.
+            chat_id, thread_id = "", None
         if (
             thread_id is None
             and platform_key == "slack"
@@ -685,7 +689,8 @@ def _resolve_single_delivery_target(
     if not _is_known_delivery_platform(platform_name):
         return None
     chat_id = _get_home_target_chat_id(platform_name)
-    return _home_target(platform_name, chat_id, home_provenance) if chat_id else None
+    return (_home_target(platform_name, chat_id, home_provenance)
+            if chat_id or platform_name.lower() == "telegram" else None)
 
 
 def _get_bot_chat_delivery_timeout() -> int:
@@ -1071,7 +1076,8 @@ def _delivery_lane_value(job: dict, *, for_failure: bool = False):
 def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[dict]:
     """Resolve auto-delivery targets from comma-separated ``deliver``; ``all`` expands to every
     platform with a home channel and combines with explicit targets. Dedup by (platform, chat_id,
-    thread_id). ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
+    thread_id), keeping explicit Telegram topics distinct from inherited ones so refusal survives.
+    ``for_failure=True`` (failure summaries, interrupted-run notices, drift/preflight
     alerts) resolves from ``failure_deliver`` INSTEAD when the job carries one —
     ``failure_deliver: local`` is the structural opt-out; absent, failures follow ``deliver``."""
     deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
@@ -1089,7 +1095,14 @@ def _resolve_delivery_targets(job: dict, *, for_failure: bool = False) -> List[d
             target = _resolve_single_delivery_target(job, part, from_broadcast=from_broadcast)
             if not target:
                 continue
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            # An explicitly requested Telegram topic must reach the refusal
+            # boundary, even beside an identical inherited topic we flatten.
+            explicit_telegram_topic = (
+                target["platform"].lower() == "telegram"
+                and target.get("_resolved_from") == "explicit"
+                and target.get("thread_id") is not None)
+            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"),
+                   explicit_telegram_topic)
             kept = seen.get(key)
             if kept is None:
                 seen[key] = target
@@ -1908,7 +1921,8 @@ def _deliver_result(
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
-    standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
+    standalone fallback. Telegram uses only the fork-local verified operational sender.
+    ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
@@ -2008,6 +2022,7 @@ def _deliver_result(
         return msg
 
     delivery_errors = []
+    operational_targets_seen = set()
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
     for target in targets:
         # A failure notice for a platform that hides warning notifications is a suppressed
@@ -2028,6 +2043,25 @@ def _deliver_result(
                     delivery_errors.append(bot_chat_error)
                 if receipt and receipt["status"] == "ambiguous":
                     unverified_targets.append(bot_chat_error)
+            continue
+
+        if target["platform"].lower() == "telegram":
+            from cron.operational_telegram import OperationalDeliveryError, send_cron_telegram
+
+            # Origin/home topics collapse to one DM; do not send it twice for
+            # origin,all. Explicit topics retain their key so refusal is not lost.
+            key = (str(target["chat_id"]), target.get("thread_id")
+                   if target.get("_resolved_from") == "explicit" else None)
+            if key in operational_targets_seen:
+                continue
+            operational_targets_seen.add(key)
+            try:
+                send_cron_telegram(target, cleaned_delivery_content, media_files, notify=notify_delivery)
+            except OperationalDeliveryError as exc:
+                _note_target_error(job, str(exc), delivery_errors)
+            except Exception:
+                # Unknown failures must also be terminal and credential-safe.
+                _note_target_error(job, "operational Telegram delivery failed", delivery_errors)
             continue
 
         t = _prepare_target_delivery(

@@ -1851,7 +1851,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
 
         loop = MagicMock()
         loop.is_running.return_value = True
@@ -1878,7 +1878,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         job = {
             "id": "timeout-job",
             "deliver": "origin",
-            "origin": {"platform": "telegram", "chat_id": "123"},
+            "origin": {"platform": "discord", "chat_id": "123"},
         }
 
         standalone_send = AsyncMock(return_value={"success": True})
@@ -1890,7 +1890,7 @@ class TestDeliverResultTimeoutCancelsFuture:
             result = _deliver_result(
                 job,
                 "Hello world",
-                adapters={Platform.TELEGRAM: adapter},
+                adapters={Platform.DISCORD: adapter},
                 loop=loop,
             )
 
@@ -1926,7 +1926,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
 
         loop = MagicMock()
         loop.is_running.return_value = True
@@ -1941,7 +1941,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         job = {
             "id": "unconfirmed-job",
             "deliver": "origin",
-            "origin": {"platform": "telegram", "chat_id": "123"},
+            "origin": {"platform": "discord", "chat_id": "123"},
         }
 
         standalone_send = AsyncMock(return_value={"success": True})
@@ -1953,7 +1953,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
             result = _deliver_result(
                 job,
                 "Hello world",
-                adapters={Platform.TELEGRAM: adapter},
+                adapters={Platform.DISCORD: adapter},
                 loop=loop,
             )
         return result, standalone_send
@@ -2142,7 +2142,7 @@ class TestCronDeliveryMirror:
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
@@ -2151,7 +2151,7 @@ class TestCronDeliveryMirror:
                 "id": "test-job",
                 "name": "daily-report",
                 "deliver": "origin",
-                "origin": {"platform": "telegram", "chat_id": "123"},
+                "origin": {"platform": "discord", "chat_id": "123"},
                 "attach_to_session": True,
             }
             _deliver_result(job, "Here is today's summary.")
