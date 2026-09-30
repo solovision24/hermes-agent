@@ -390,28 +390,32 @@ adapter-contract tests use Discord where they previously used cron Telegram.
 
 Review verification on 2026-09-29:
 
-- The unchanged router baseline passed 93 tests. Both new AI/script dispatch
-  regressions failed with the original delivery boundary and passed after the change.
-- Final affected subset: **287 passed, 1 existing skip**, across 16 files, including
-  all 59 cases in `tests/cron/test_operational_telegram.py`. The focused command is
-  `bash scripts/run_tests.sh tests/cron/test_operational_telegram.py tests/cron/test_scheduler.py -q`.
-- The wider run is **not green**: seven existing files reached the 300-second file
-  timeout. Each also stalled with the original delivery code in a 40-second
-  diagnostic run (`--file-timeout 40 -o faulthandler_timeout=15`):
-  `tests/cron/test_media_delivery_parity.py`,
-  `tests/cron/test_warning_transport_contract.py`,
-  `tests/gateway/test_telegram_error_redaction.py`,
-  `tests/gateway/test_telegram_send_path_health.py`,
-  `tests/gateway/test_telegram_thread_fallback.py`,
-  `tests/tools/test_send_message_tool.py`, and
-  `tests/tools/test_telegram_send_message_video_metadata.py`.
-  Captured stacks wait in existing asyncio/future paths; these are outstanding
-  independent-verification items, not passes.
-- The canonical runner initially collected no tests because its `/var/tmp` scratch
-  location was read-only. Validation used a temporary scratch-path substitution
-  to writable `/tmp`; the runner was restored afterward, with no sandbox change.
-  `git diff --check` passed. Optional Ruff validation was unavailable in the runtime
-  venv; no dependencies were installed.
+Final independent verification at implementation head
+`8952c64859d508998442865e7df6f2c317cb1a91` used the unmodified canonical runner:
+
+```bash
+bash scripts/run_tests.sh -j 4 tests/cron tests/tools/test_send_message_telegram_proxy.py tests/gateway/test_telegram_thread_fallback.py tests/gateway/test_telegram_error_redaction.py tests/gateway/test_telegram_send_path_health.py tests/tools/test_send_message_tool.py tests/tools/test_telegram_send_message_video_metadata.py -q
+```
+
+- `final-head-tests.log` records **144 files / 1510 passed / 1 failed / 2 skipped**;
+  the affected suite is not wholly green. Its only failure is
+  `tests/cron/test_cron_kanban_env_isolation.py::test_dispatcher_grants_only_the_assigned_worker_scope`,
+  a `FileNotFoundError` for `worker-result.json`.
+- The untouched-base comparison at `02788700079b5bdb6f0084e7912d10250a39d76c`
+  reproduced that same failure: `baseline-remediation-tests.log` records
+  **139 files / 1388 passed / 1 failed / 2 skipped**. There were **zero
+  candidate-only failures**; the failing test source was neither modified nor skipped.
+- All **59 operational cases** in `tests/cron/test_operational_telegram.py` passed.
+  The separate neighboring direct-message run passed **63 cases across 4 files**
+  with zero failures (`direct-message-regression-tests.log`). Both scopes are
+  included in the final affected-suite results, not additional totals.
+- The unchanged registered router verifier,
+  `bash scripts/run_tests.sh tests/cron/test_scheduler.py -q`, passed **93/93 tests
+  on both baseline and candidate** (`remediation-result.json`), with zero secret
+  scan findings. Its test scope also overlaps the affected suite.
+
+These results verify behavior using temporary homes and mocked external I/O;
+they do not prove actual Telegram message delivery or deployed routing.
 
 ### Target syntax
 
