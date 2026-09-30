@@ -41,13 +41,13 @@ class TestInterpreterShuttingDownHelper:
 
 
 class TestStandaloneDeliverySkipsDuringShutdown:
-    def _telegram_cfg(self):
+    def _discord_cfg(self):
         from gateway.config import Platform
 
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
-        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        mock_cfg.platforms = {Platform.DISCORD: pconfig}
         return mock_cfg
 
     def test_standalone_path_skips_without_scheduling(self):
@@ -61,10 +61,10 @@ class TestStandaloneDeliverySkipsDuringShutdown:
             "id": "gov-job",
             "name": "model-governor",
             "deliver": "origin",
-            "origin": {"platform": "telegram", "chat_id": "123"},
+            "origin": {"platform": "discord", "chat_id": "123"},
         }
         send_mock = AsyncMock(return_value={"success": True})
-        with patch("gateway.config.load_gateway_config", return_value=self._telegram_cfg()), \
+        with patch("gateway.config.load_gateway_config", return_value=self._discord_cfg()), \
              patch("tools.send_message_tool._send_to_platform", new=send_mock), \
              patch("sys.is_finalizing", return_value=True):
             result = _deliver_result(job, "daily report body")

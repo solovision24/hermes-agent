@@ -14,6 +14,8 @@ The cron subsystem provides scheduled task execution — from simple one-shot de
 |------|---------|
 | `cron/jobs.py` | Job model, storage, atomic read/write to `jobs.json` |
 | `cron/scheduler.py` | Scheduler loop — due-job detection, execution, repeat tracking |
+| `cron/scheduler_delivery.py` | Shared result delivery boundary, queue handoff and transport selection |
+| `cron/operational_telegram.py` | Fork-local verified SoLo operational Telegram delivery |
 | `tools/cronjob_tools.py` | Model-facing `cronjob_manage` tool registration and handler |
 | `gateway/run.py` | Gateway integration — cron ticking in the long-running loop |
 | `hermes_cli/cron.py` | CLI `hermes cron` subcommands |
@@ -329,7 +331,89 @@ This mirrors the gateway's behavior — without it, cron agents would fail on ra
 
 ## Delivery Model
 
-Cron job results can be delivered to any supported platform.
+Cron job results can be delivered to supported platforms, subject to the fork-local Telegram policy below.
+
+### SoLo fork policy — review-only change (t_e805dab0)
+
+This change is prepared against installed-runtime revision
+`02788700079b5bdb6f0084e7912d10250a39d76c` in an isolated worktree. It is **not an
+installation or rollout claim**. DEV owns independent verification, PR/release
+lineage and any later rollout. No live job, schedule, prompt, enabled state,
+profile configuration, gateway restart or deployment is part of this change.
+
+Both AI and `no_agent`/script results enter `scheduler_delivery._deliver_result`.
+After common text redaction and media extraction/path filtering, Telegram targets
+use only `operational_telegram.send_cron_telegram`, before any live, relay or
+standalone profile transport or conversation seed. `getMe` must prove bot
+`8611668567`, username `solo_hermes_bot`, and `is_bot=true`. Each sent message must
+prove that same sender, a message ID, and private chat `8148316720`, with no
+thread/topic, reply or business metadata. No continuable topic, session seed or
+transcript mirror is created for this separate bot, even with `attach_to_session`.
+
+The existing target resolver still decides whether delivery is Telegram, another
+platform, or local-only. A Telegram target must resolve to canonical DM
+`8148316720`; another chat or an explicitly addressed topic fails rather than
+being rerouted. Origin/home thread metadata on the canonical DM is ignored;
+duplicate inherited targets collapse to one send. Direct
+Telegram messaging keeps its profile-scoped adapter credentials, and non-Telegram
+delivery keeps its existing behavior.
+Missing Telegram destinations remain failures even in mixed-platform deliveries;
+deduplication cannot erase an explicitly requested topic's refusal.
+
+Only `SOLO_HERMES_BOT_TOKEN` from the default/root secret store is accepted. The
+sender uses `get_default_hermes_root()` (the profiles module's canonical root
+resolver) and `build_profile_secret_scope(root)`, including already-loaded root
+external-secret values. It reads the resulting mapping directly, with no process
+environment fallback, profile token lookup, environment mutation or `.env` write.
+This works when the daemon launches in a named profile and when scopes alternate
+under multiplexing. `TELEGRAM_BOT_TOKEN` is never used by this cron sender.
+
+Missing/invalid credentials, mismatched identity/destination, absent or mismatched
+send proof, API rejection, network failure and attachment failures become delivery
+errors. Diagnostics contain a fixed failure category and, for HTTP failures, the
+status code; they omit response bodies and token-bearing exception URLs. There is
+no profile-adapter fallback or automatic retry. A later-chunk or attachment failure
+may follow a partial send and must not be interpreted as proof that nothing arrived.
+
+Text is sent as plain text in lossless chunks bounded to 4096 UTF-16 units.
+Accepted attachments are uploaded unchanged as documents through the same verified
+bot; the path policy is rechecked at upload. Common path-policy drops are reported
+as failures. The external-worker durable queue, its at-most-once terminal receipts,
+warning suppression, `cron.delivery.notify` preference and `[SILENT]` behavior
+remain in force.
+
+Validation uses temporary homes, synthetic credentials and mocked external I/O.
+`tests/cron/test_operational_telegram.py` exercises real AI/script scheduler dispatch,
+queue drain/replay, A→B→A credential scopes, adapter bypass, proof failures,
+chunking, media and unchanged direct/profile and non-Telegram sending. Generic
+adapter-contract tests use Discord where they previously used cron Telegram.
+
+Review verification on 2026-09-29:
+
+- The unchanged router baseline passed 93 tests. Both new AI/script dispatch
+  regressions failed with the original delivery boundary and passed after the change.
+- Final affected subset: **287 passed, 1 existing skip**, across 16 files, including
+  all 59 cases in `tests/cron/test_operational_telegram.py`. The focused command is
+  `bash scripts/run_tests.sh tests/cron/test_operational_telegram.py tests/cron/test_scheduler.py -q`.
+- The wider run is **not green**: seven existing files reached the 300-second file
+  timeout. Each also stalled with the original delivery code in a 40-second
+  diagnostic run (`--file-timeout 40 -o faulthandler_timeout=15`):
+  `tests/cron/test_media_delivery_parity.py`,
+  `tests/cron/test_warning_transport_contract.py`,
+  `tests/gateway/test_telegram_error_redaction.py`,
+  `tests/gateway/test_telegram_send_path_health.py`,
+  `tests/gateway/test_telegram_thread_fallback.py`,
+  `tests/tools/test_send_message_tool.py`, and
+  `tests/tools/test_telegram_send_message_video_metadata.py`.
+  Captured stacks wait in existing asyncio/future paths; these are outstanding
+  independent-verification items, not passes.
+- The canonical runner initially collected no tests because its `/var/tmp` scratch
+  location was read-only. Validation used a temporary scratch-path substitution
+  to writable `/tmp`; the runner was restored afterward, with no sandbox change.
+  `git diff --check` passed. Optional Ruff validation was unavailable in the runtime
+  venv; no dependencies were installed.
+
+### Target syntax
 
 A bare platform name (`slack`, `telegram`, …) delivers to that platform's configured **home channel**. To target a **specific** destination instead, append a target after a colon: `platform:<target>`. The target is resolved at fire time (not when the job is created), so a job can name a destination on a platform that isn't connected yet and start delivering once it comes online.
 
@@ -339,7 +423,7 @@ Most platforms also accept an optional thread/topic as a third segment: `platfor
 |--------|--------|---------|
 | Origin chat | `origin` | Deliver to the chat where the job was created |
 | Local file | `local` | Save to `~/.hermes/cron/output/` |
-| Telegram | `telegram`, `telegram:<chat_id>`, `telegram:<chat_id>:<thread_id>`, `telegram:@username` | `telegram:-1001234567890:17585` |
+| Telegram (SoLo fork) | `telegram` or a target resolving to canonical DM; no explicit topic | `telegram:8148316720` |
 | Discord | `discord`, `discord:#channel`, `discord:<channel_id>`, `discord:<channel_id>:<thread_id>` | `discord:#engineering` |
 | Slack | `slack`, `slack:#channel`, `slack:<channel_id>`, `slack:<channel_id>:<thread_ts>` | `slack:#engineering` |
 | Matrix | `matrix`, `matrix:<!room_id:server>`, `matrix:<@user:server>` | `matrix:!abc123:example.org` |
@@ -361,7 +445,7 @@ Platforms in the first group have explicit, validated target syntax — named ch
 
 **Named channels** (`slack:#engineering`, `discord:#engineering`, or a friendly name like `slack:engineering`) are resolved against the channel directory the gateway builds from connected adapters, so the gateway must have discovered the channel for name resolution to succeed; raw IDs (`slack:C0123ABCD45`) always work.
 
-For **Telegram topics**, use `telegram:<chat_id>:<thread_id>` (e.g., `telegram:-1001234567890:17585`). For **Slack threads**, the third segment is the parent message's `thread_ts` (e.g., `slack:C0123ABCD45:1700000000.000100`), so it only applies when replying under an existing message.
+The resolver understands **Telegram topic** syntax, but the SoLo cron delivery boundary refuses explicit topics under the policy above. For **Slack threads**, the third segment is the parent message's `thread_ts` (e.g., `slack:C0123ABCD45:1700000000.000100`), so it only applies when replying under an existing message.
 
 **Bot Chat** (`bot-chat`, `bot-chat:<profile>`) is a machine-local pseudo-platform, not a gateway adapter. A mailbox-capable canonical live owner receives durable admission immediately (idle or busy); only that owner executes the incoming turn. `scheduler_delivery._deliver_to_bot_chat` resolves the target with `get_profile_dir` or the job's current `get_hermes_home`, derives the receipt ID from the source home, job ID, durable `execution_id`, and target home, and checks the receipt before discovering an owner. An existing receipt never permits CLI fallback. Without a mailbox owner it retains `hermes [-p <profile>] chat --in ~ -c "Bot Chat" --create-if-missing -Q --query-file <tmp>` and normal ownership fencing. Both lanes deliver a real inbound turn, not a transcript mirror. Queued/claimed receipts populate `last_delivery_queued` with receipt IDs. The delivery aggregator excludes admission notices from genuine errors and records execution `delivery_outcome=queued`; successful jobs use `last_status=delivery_queued`. Genuine errors on mixed targets take precedence as failed while retaining queued receipt metadata. The target profile’s durable receipt is authoritative for terminal completion. Queued is the historical admission outcome, not proof of delivery. Historical cron status does not automatically track later receipt completion. Bot-chat targets are excluded from `all` and credential preflight. Bot-chat-only external workers bypass the gateway delivery queue; mixed external-worker targets retain gateway handoff. `cron.bot_chat_delivery_timeout_seconds` (default 600) bounds only the legacy subprocess lane.
 

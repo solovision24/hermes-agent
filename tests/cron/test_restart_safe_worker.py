@@ -815,7 +815,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
             name="restart probe",
             script=probe.name,
             no_agent=True,
-            deliver="telegram:123",
+            deliver="discord:123",
         )
     payload = tmp_path / "job.json"
     launched = tmp_path / "launched.json"
@@ -831,7 +831,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
     adapter.send = send
     gateway_config = Mock()
     gateway_config.platforms = {
-        Platform.TELEGRAM: PlatformConfig(enabled=True),
+        Platform.DISCORD: PlatformConfig(enabled=True),
     }
     gateway_config.get_home_channel = lambda _platform: None
     monkeypatch.setattr(
@@ -893,7 +893,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
             row = delivery_queue.get_status(execution["id"])
             if row and row["status"] == "pending":
                 scheduler.drain_delivery_queue(
-                    {Platform.TELEGRAM: adapter}, replacement_loop
+                    {Platform.DISCORD: adapter}, replacement_loop
                 )
             current = executions.latest_execution(job["id"])
             if current and current["status"] == "completed":
