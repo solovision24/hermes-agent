@@ -960,7 +960,8 @@ hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
-hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
+hermes kanban request-changes <id> "<required changes>"               # active reviewer -> original implementer
+hermes kanban request-changes <id> "<required changes>" --remediation-assignee PROFILE  # external PR with no implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
 
 hermes kanban tail <id>                                # follow a single task's event stream
@@ -987,6 +988,23 @@ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-colu
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]
 ```
+
+External GitHub PR intake has no original Kanban implementer. The reviewer must
+choose an existing, independent remediation profile explicitly; the webhook's
+creator and the reviewer are not substitute implementers. Once changes are
+requested, a same-head webhook replay must not call `request-review` again on
+the ready remediation card: the assigned worker owns the next handoff. The
+native board refuses that unowned replay rather than stealing the assignment.
+The governed reference adapter is `scripts/github_pr_native_ingest.py`. It
+reads the idempotent `create --json` result and checks `show --json` for exact
+PR/head identity and an active `changes_requested` assignment before returning
+success without reclaiming Review. Missing or mismatched readback fails closed.
+`tests/scripts/test_github_pr_native_ingest.py` exercises that adapter against
+the actual CLI on an isolated board through dispatch and resubmission. This
+source file does not replace a configured host-local webhook script on merge:
+an operator must review and deploy it separately, with no live DB migration.
+Until then the installed adapter may report failure on same-head replay, but
+the native guard prevents it from stealing the remediation assignment.
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 

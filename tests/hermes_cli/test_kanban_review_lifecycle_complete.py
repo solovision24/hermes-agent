@@ -20,6 +20,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli import profiles
 
 
 @pytest.fixture
@@ -767,6 +768,11 @@ def _intake_review(
     return task_id, review
 
 
+@pytest.fixture
+def remediation_profiles(monkeypatch):
+    """Isolated roster; never depend on the host's profile directories."""
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"dev", "reviewer"})
+
 def _assert_dev_fallback(task_id: str, conn) -> None:
     task = kb.get_task(conn, task_id)
     assert task is not None
@@ -776,6 +782,7 @@ def _assert_dev_fallback(task_id: str, conn) -> None:
     assert changes.payload["implementer"] == "dev"
     assert changes.payload["reviewer"] == "reviewer"
     assert changes.payload["provenance"] == "github_pr_external_intake"
+    assert changes.payload["assignment"] == "explicit_reviewer_remediation_assignee"
     assert changes.payload["github_pr"] == _INTAKE_PROVENANCE
     # The intake identity is also flattened onto the event for reviewers.
     assert changes.payload["repository"] == _INTAKE_PROVENANCE["repository"]
@@ -784,7 +791,7 @@ def _assert_dev_fallback(task_id: str, conn) -> None:
     assert _run(kb.list_runs(conn, task_id), "changes_requested") is not None
 
 
-def test_external_intake_without_review_event_routes_changes_to_dev(conn):
+def test_external_intake_without_review_event_routes_changes_to_dev(conn, remediation_profiles):
     """Guard (a): intake card with no ``review_requested`` event at all."""
     task_id, review = _intake_review(conn, drop_requested=True)
     assert [e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"] == []
@@ -793,6 +800,7 @@ def test_external_intake_without_review_event_routes_changes_to_dev(conn):
         conn,
         task_id,
         reason="Route the external intake verdict to DEV.",
+        remediation_assignee="dev",
         expected_run_id=review.current_run_id,
     )
 
@@ -802,7 +810,7 @@ def test_external_intake_without_review_event_routes_changes_to_dev(conn):
     assert [e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"] == []
 
 
-def test_external_intake_null_implementer_routes_changes_to_dev(conn):
+def test_external_intake_null_implementer_routes_changes_to_dev(conn, remediation_profiles):
     """Guard (b): the live GitHub-webhook shape — handoff with implementer null."""
     task_id, review = _intake_review(conn)
     requested = _event(kb.list_events(conn, task_id), "review_requested")
@@ -813,6 +821,7 @@ def test_external_intake_null_implementer_routes_changes_to_dev(conn):
         conn,
         task_id,
         reason="Route the external intake verdict to DEV.",
+        remediation_assignee="dev",
         expected_run_id=review.current_run_id,
     )
 
@@ -822,7 +831,7 @@ def test_external_intake_null_implementer_routes_changes_to_dev(conn):
     assert len([e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"]) == 1
 
 
-def test_external_intake_changes_re_gate_on_reopened_parent(conn):
+def test_external_intake_changes_re_gate_on_reopened_parent(conn, remediation_profiles):
     parent = kb.create_task(conn, title="Upstream work", assignee="builder")
     assert kb.claim_task(conn, parent, claimer="builder:1") is not None
     assert kb.complete_task(conn, parent, summary="shipped")
@@ -846,6 +855,7 @@ def test_external_intake_changes_re_gate_on_reopened_parent(conn):
 
     ok, detail = kb.request_changes(
         conn, task_id, reason="parent reopened", expected_run_id=review.current_run_id,
+        remediation_assignee="dev",
     )
 
     assert (ok, detail) == (True, "dev")
@@ -938,3 +948,89 @@ def test_request_changes_no_event_still_fails_closed_for_internal_card(conn):
     )
 
     assert (ok, detail) == (False, "no prior review_requested event")
+
+
+@pytest.mark.parametrize("candidate", [None, "missing", "reviewer", " "])
+def test_external_intake_requires_valid_independent_explicit_owner(conn, remediation_profiles, candidate):
+    task_id, review = _intake_review(conn)
+    before = kb.list_events(conn, task_id)
+    ok, detail = kb.request_changes(
+        conn, task_id, reason="Fix this PR", expected_run_id=review.current_run_id,
+        remediation_assignee=candidate,
+    )
+    assert not ok and detail
+    assert kb.get_task(conn, task_id).status == "running"
+    assert kb.get_task(conn, task_id).assignee == "reviewer"
+    assert kb.get_task(conn, task_id).current_run_id == review.current_run_id
+    assert kb.list_events(conn, task_id) == before
+
+
+def test_external_explicit_owner_resubmits_without_rewriting_origin(conn, remediation_profiles):
+    task_id, review = _intake_review(conn)
+    assert kb.create_task(
+        conn, title="Webhook redelivery", created_by="github-webhook",
+        idempotency_key=_INTAKE_KEY,
+    ) == task_id
+    assert kb.request_changes(
+        conn, task_id, reason="Fix existing PR", expected_run_id=review.current_run_id,
+        remediation_assignee="dev",
+    ) == (True, "dev")
+    # A same-head replay reuses the card; the adapter's unowned request-review
+    # must not reclaim it from the explicitly assigned remediation lane.
+    before = kb.list_events(conn, task_id)
+    assert kb.create_task(
+        conn, title="Webhook replay after verdict", created_by="github-webhook",
+        idempotency_key=_INTAKE_KEY,
+    ) == task_id
+    assert kb.request_review(
+        conn, task_id, summary="GitHub PR delivery", reviewer="reviewer", with_reason=True,
+    ) == (False, "external PR remediation belongs to its assigned worker")
+    assert kb.list_events(conn, task_id) == before
+    assigned = kb.get_task(conn, task_id)
+    assert assigned is not None and (assigned.status, assigned.assignee) == ("ready", "dev")
+
+    dispatched = kbd.dispatch_once(conn, spawn_fn=lambda *args, **kwargs: 4242)
+    assert any(row[0] == task_id for row in dispatched.spawned)
+    work = kb.get_task(conn, task_id)
+    assert work is not None and (work.status, work.assignee) == ("running", "dev")
+    assert kb.request_review(
+        conn, task_id, summary="Fix submitted", expected_run_id=work.current_run_id,
+    )
+    reviews = [e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"]
+    assert reviews[0].payload["implementer"] is None
+    assert reviews[-1].payload["implementer"] == "dev"
+    assert reviews[-1].payload["reviewer"] == "reviewer"
+    rereview = kb.claim_review_task(conn, task_id, claimer="reviewer:2")
+    assert rereview is not None
+    assert kb.request_changes(
+        conn, task_id, reason="One more fix", expected_run_id=rereview.current_run_id,
+    ) == (True, "dev")
+
+
+def test_external_intake_dedupe_key_is_immutable_head_scoped(conn):
+    task_id, _review = _intake_review(conn)
+    other = kb.create_task(
+        conn, title="New head", created_by="github-webhook",
+        idempotency_key="github-pr:solovisionllc/solo-skills:90:" + "a" * 40,
+    )
+    other_repo = kb.create_task(
+        conn, title="Other repo", created_by="github-webhook",
+        idempotency_key="github-pr:solovisionllc/other:90:" + _INTAKE_SHA,
+    )
+    assert len({task_id, other, other_repo}) == 3
+
+
+def test_worker_provenance_cannot_be_reassigned_by_review_verdict(conn, remediation_profiles):
+    task_id = kb.create_task(conn, title="Worker implementation", assignee="dev")
+    work = kb.claim_task(conn, task_id, claimer="dev:1")
+    assert kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=work.current_run_id)
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:1")
+    assert review is not None
+    assert kb.request_changes(
+        conn, task_id, reason="Try redirect", expected_run_id=review.current_run_id,
+        remediation_assignee="reviewer",
+    )[0] is False
+    assert kb.get_task(conn, task_id).status == "running"
+    assert kb.request_changes(
+        conn, task_id, reason="Proper verdict", expected_run_id=review.current_run_id,
+    ) == (True, "dev")

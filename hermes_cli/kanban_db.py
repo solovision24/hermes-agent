@@ -3389,6 +3389,14 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            # A webhook replay may reuse its immutable-head card after the
+            # reviewer has assigned remediation. It is not a new intake: only
+            # the assigned worker can submit the next review round. Check the
+            # durable verdict, not the assignee alone (fresh intake is ready).
+            if (trow["status"] == "ready" and expected_run_id is None and not force
+                    and _external_intake_provenance(conn, task_id) is not None
+                    and _latest_event(conn, task_id, "changes_requested") is not None):
+                return _ret(False, "external PR remediation belongs to its assigned worker")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -3507,7 +3515,7 @@ def _external_intake_provenance(conn: sqlite3.Connection, task_id: str) -> Optio
     A GitHub-webhook Review card has no board implementer: the adapter creates
     it unassigned (``created_by='github-webhook'``) under its per-PR-head dedupe
     key, so ``review_requested`` records ``implementer: null``. Only that exact
-    shape is eligible for the DEV fallback in :func:`request_changes`; every
+    shape is eligible for explicit remediation assignment in :func:`request_changes`; every
     other card (or a malformed/forged key) keeps the provenance guard.
     """
     row = conn.execute(
@@ -3535,6 +3543,7 @@ def _external_intake_provenance(conn: sqlite3.Connection, task_id: str) -> Optio
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    remediation_assignee: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
@@ -3542,7 +3551,7 @@ def request_changes(
 
     A deduplicated external GitHub PR intake card (see
     :func:`_external_intake_provenance`) has no board implementer, so its
-    reviewer verdict falls back to the canonical DEV profile on the same card —
+    reviewer verdict requires an explicit, valid remediation profile on the same card —
     same PR, branch, reviewer, and run closure. Board-originated handoffs keep
     their existing provenance behaviour: a missing or blank implementer is still
     refused.
@@ -3550,6 +3559,8 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    if remediation_assignee is not None and not _nonblank_str(remediation_assignee):
+        return False, "remediation_assignee must be a nonblank profile"
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -3569,10 +3580,10 @@ def request_changes(
             return False, "active run was not claimed from review"
 
         requested_event = _latest_event(conn, task_id, "review_requested")
-        # External GitHub intake has no board implementer to route to; the
-        # canonical DEV profile owns remediation on the SAME card.
+        # External GitHub intake has no board implementer to route to. The
+        # reviewer must explicitly name who accepts remediation on this card.
         external_provenance = _external_intake_provenance(conn, task_id)
-        dev_fallback = False
+        explicit_assignment = False
         if requested_event is None:
             if external_provenance is None:
                 return False, "no prior review_requested event"
@@ -3582,9 +3593,25 @@ def request_changes(
         if implementer is None:
             if external_provenance is None:
                 return False, "review handoff has no valid implementer provenance"
-            dev_fallback = True
-            implementer = _canonical_assignee("dev") or "dev"
+            if not remediation_assignee:
+                return False, "external review has no implementer; pass remediation_assignee explicitly"
+            implementer = _canonical_assignee(remediation_assignee)
+            from hermes_cli.profiles import profile_exists
+            if not implementer or not profile_exists(implementer):
+                return False, "remediation_assignee must be an existing profile"
+            explicit_assignment = True
+        elif remediation_assignee is not None and _canonical_assignee(remediation_assignee) != _canonical_assignee(implementer):
+            return False, "remediation_assignee cannot override original implementer provenance"
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
+        if explicit_assignment:
+            review_run = conn.execute(
+                "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+                (int(current_run_id), task_id),
+            ).fetchone()
+            if not reviewer or review_run is None or _canonical_assignee(review_run["profile"]) != reviewer:
+                return False, "review run is no longer owned by its reviewer"
+            if implementer == reviewer:
+                return False, "remediation_assignee must differ from the reviewer"
 
         new_status = _landing_status_after_parents(conn, task_id)
         # consecutive_failures deliberately PRESERVED: a review transition is
@@ -3618,10 +3645,11 @@ def request_changes(
                 **(
                     {
                         "provenance": "github_pr_external_intake",
+                        "assignment": "explicit_reviewer_remediation_assignee",
                         "github_pr": external_provenance,
                         **(external_provenance or {}),
                     }
-                    if dev_fallback
+                    if explicit_assignment
                     else {}
                 ),
             },
