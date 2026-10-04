@@ -259,13 +259,20 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
         "implementer with concrete required changes. This closes the review "
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
-        "review column; use kanban_block only for a genuine external blocker."
+        "review column; for an external PR without an original implementer, "
+        "supply remediation_assignee explicitly. Use kanban_block only for a "
+        "genuine external blocker."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "reason": _prop("string", (
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
+        )),
+        "remediation_assignee": _prop("string", (
+            "Existing profile explicitly assigned to fix an imported external PR "
+            "when no original implementer exists. Cannot override worker "
+            "provenance or name the reviewer."
         )),
     },
     ["reason"],
