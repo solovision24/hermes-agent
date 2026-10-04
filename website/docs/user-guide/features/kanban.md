@@ -974,7 +974,8 @@ hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
 hermes kanban request-review <id> [--summary "..."] [--metadata JSON] [--reviewer PROFILE]
-hermes kanban request-changes <id> "<required changes>"               # active reviewer -> implementer
+hermes kanban request-changes <id> "<required changes>"               # active reviewer -> original implementer
+hermes kanban request-changes <id> "<required changes>" --remediation-assignee PROFILE  # external PR with no implementer
 hermes kanban reopen-review  <id>... [--reason "..."]                 # changes requested: 'review' -> ready/todo
 
 hermes kanban tail <id>                                # follow a single task's event stream
@@ -1001,6 +1002,17 @@ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-colu
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]                       #   (negative N is rejected; 0 disables that sweep)
 ```
+
+External GitHub PR intake has no original Kanban implementer. The reviewer must
+choose an existing, independent remediation profile explicitly; the webhook's
+creator and reviewer are not substitute implementers. A same-head webhook
+replay after changes are requested is a successful no-op and cannot reclaim
+Review or replace ready/running remediation ownership. The governed reference
+adapter is `scripts/github_pr_native_ingest.py`; it verifies exact PR/head
+identity before recognizing a replay and fails closed on mismatched readback.
+This source file does not replace a configured host-local webhook script on
+merge. Deployment is a separate, operator-authorized step with no live DB
+migration.
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
