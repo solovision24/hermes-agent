@@ -48,12 +48,13 @@ def _plan_limitation(endpoint: str) -> dict:
 
 
 def _affirmative_review_history(repo: str, number: int, verdict: dict) -> None:
-    pages = _api(f"repos/{repo}/pulls/{number}/reviews?per_page=100", paginate=True)
-    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-        raise ValueError("incomplete review history")
     latest = {}
     found = False
-    for page in pages:
+    # Explicit pages also work on owner machines with gh versions predating --slurp.
+    for page_number in range(1, 101):
+        page = _api(f"repos/{repo}/pulls/{number}/reviews?per_page=100&page={page_number}")
+        if not isinstance(page, list) or any(not isinstance(review, dict) for review in page):
+            raise ValueError("incomplete review history")
         for review in page:
             if review.get("id") == verdict["id"]:
                 found = review == verdict
@@ -64,6 +65,10 @@ def _affirmative_review_history(repo: str, number: int, verdict: dict) -> None:
                 raise ValueError("review history has missing identity")
             if uid not in latest or latest[uid]["id"] < review["id"]:
                 latest[uid] = review
+        if len(page) < 100:
+            break
+    else:
+        raise ValueError("review history exceeds bounded recovery policy; use normal acceptance")
     if (not found or latest.get(verdict["user"]["id"], {}).get("id") != verdict["id"]
             or any(review["state"] == "CHANGES_REQUESTED" for review in latest.values())):
         raise ValueError("review approval is superseded or has unresolved changes requested")
@@ -111,7 +116,7 @@ def _reconciliation_event(conn, task_id):
 
 
 def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, review_url: str) -> dict:
-    """Read real GitHub evidence, including the review comment's PR association.
+    """Read real GitHub evidence, including independent exact-head approval.
 
     API reads use the interactive owner's gh login. The accepting worker's login
     remains unchanged for ordinary completion. No network is held under a DB lock.

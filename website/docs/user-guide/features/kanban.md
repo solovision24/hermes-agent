@@ -142,9 +142,9 @@ An owner-approved correction to a goal-mode card's *review scope* is separate:
 <task-id> --expected-body-sha256 <original-body-hash> --amendment-file <utf8-json-file>
 --deferred-child <linked-child-id> --reason <owner-decision>`. The JSON must have
 exactly one key, `deferred_acceptance`, containing a nonempty list of unique,
-complete original body lines (at least 20 non-whitespace characters each).
+complete original body lines (at least 20 trimmed characters each).
 Freeform replacement bodies, substring matches, unrelated clauses and deferring
-half or more of the original non-whitespace text are refused. The child must be
+half or more of the original trimmed line text are refused. The child must be
 directly linked, assigned, unfinished and contain every deferred line verbatim
 in its own body. The generated operative body retains every non-deferred line
 unchanged, marks only the exact deferred clauses with the child ID, and records

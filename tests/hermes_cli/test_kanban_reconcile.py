@@ -67,10 +67,10 @@ def fake_github(monkeypatch, *, merged=True, head=HEAD, checks=0, status=None,
                     "user": {"id": reviewer_id, "login": reviewer_login, "type": review_type},
                     "state": review_state, "commit_id": review_head,
                     "submitted_at": "2026-10-27T19:00:00Z", "body": "Exact head approved"}
-        if endpoint == "repos/acme/repo/pulls/182/reviews?per_page=100":
+        if endpoint == "repos/acme/repo/pulls/182/reviews?per_page=100&page=1":
             verdict = api("repos/acme/repo/pulls/182/reviews/1234")
             later = [{**verdict, "id": 1235, "state": later_state}] if later_state else []
-            return [[verdict, *later]]
+            return [verdict, *later]
         if endpoint == "repos/acme/repo":
             return {"full_name": "acme/repo", "private": private, "permissions": {"admin": admin}}
         if endpoint.endswith("check-runs?per_page=100"):
@@ -355,3 +355,18 @@ def test_reconciled_policy_does_not_override_parent_completion_gate(board, monke
     assert not kb.complete_task(conn, task, summary="Exact PR independently approved and merged")
     assert kb.get_task(conn, task).status == "blocked"
     assert kb.get_task(conn, child).status == "todo"
+
+
+def test_later_page_negative_review_is_not_hidden_by_first_page_approval(monkeypatch):
+    verdict = {"id": 1234, "user": {"id": 2}, "state": "APPROVED"}
+    calls = []
+    def api(endpoint):
+        calls.append(endpoint)
+        if endpoint.endswith("page=1"):
+            return [verdict, *[{"id": n, "state": "COMMENTED"} for n in range(99)]]
+        assert endpoint.endswith("page=2")
+        return [{"id": 1235, "user": {"id": 3}, "state": "CHANGES_REQUESTED"}]
+    monkeypatch.setattr(rec, "_api", api)
+    with pytest.raises(ValueError, match="unresolved changes"):
+        rec._affirmative_review_history("acme/repo", 182, verdict)
+    assert len(calls) == 2
