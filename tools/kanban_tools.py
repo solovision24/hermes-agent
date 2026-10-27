@@ -472,7 +472,8 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
             verdict, reason, _, _, transport_failed = judge_goal(
-                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
+                goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip(),
+                goal_max_chars=24000 if "\n\nOwner-bounded review scope" in (task.body or "") else 2000)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

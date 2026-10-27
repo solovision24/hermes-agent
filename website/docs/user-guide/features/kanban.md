@@ -187,12 +187,69 @@ The entire original body, generated body, exact deferral, assignee and child-bod
 hash are retained in `review_scope_reconciled`. Repeated amendments are refused
 to prevent cumulative goal removal. Task claim/run/PID, child body/assignment/status
 and dependency link are rechecked under the write lock. `goal_mode`, dependencies,
-PR contract and status are unchanged. This conservative line-based operation
-does not support splitting a one-line goal or replacing prose wholesale.
+PR contract and status are unchanged. The original exact-line format remains
+available; a one-line goal can instead use the version-2 clause overlay below.
 Submit `kanban request-review --summary ... --reviewer
 <profile>` separately: its normal goal judge evaluates the *revised* acceptance
 body and can still reject. Do not use dashboard status PATCH as a substitute for
 this judge-mediated handoff.
+
+### Hash-bound clause overlay (one-line goals)
+
+The same owner-only command also accepts this alternative JSON shape:
+
+```json
+{
+  "version": 2,
+  "child_body_sha256": "<SHA256 of the full exact child body>",
+  "clause_deferrals": [{
+    "mode": "reference_subset",
+    "source": {"start": 0, "end": 13, "text": "acceptance §6", "sha256": "<SHA256 of exact text>"},
+    "child_criteria": [{"start": 0, "end": 70, "text": "<complete specific acceptance clause from child body>", "sha256": "<SHA256 of exact text>"}]
+  }]
+}
+```
+
+The offsets above are illustrative, not an executable MC1 payload. Compute actual
+zero-based, half-open Unicode code-point offsets against the original strings
+(Python `body[start:end]`), not UTF-8 byte offsets. No normalization is performed.
+Each span must match its exact text and SHA256. The child full-body hash prevents
+silently moving ownership evidence to a changed child contract. Unknown keys,
+replacement bodies, malformed/overlapping/duplicate spans, word fragments and
+missing child criteria fail closed. At most eight source mappings and four child
+criteria per mapping are accepted; total child evidence is capped at 2000 characters.
+Source selections must total strictly less than half of the original body text.
+
+`mode: clause` selects complete original sentence/semicolon clauses of at least
+20 characters; each child criterion must likewise be a complete, specific clause,
+but need not repeat the parent verbatim. `mode: reference_subset` selects only an
+exact `acceptance §<section>` cross-reference. It defers ONLY the corresponding
+acceptance explicitly described by the quoted child criteria, never the entire
+referenced section. For actual MC1, `acceptance §6` is such an anchor; the bridge's
+complete `Done: exercise a REAL producer update ...` sentence is specific ownership
+evidence. The reference does not literally spell out that producer requirement:
+the interactive owner must ratify the narrow correspondence using the recorded
+owner decision and referenced plan. Do not claim hashes establish semantic
+equivalence or treat all of §6 as deferred. Browser/native/customer acceptance,
+source authorization, isolation, fixtures, tests and release gates not specifically
+mapped remain required. No external plan file is rewritten or automatically resolved.
+
+The generated overlay appends to the ENTIRE original body, including whitespace;
+it never substitutes caller prose or deletes a nondeferred requirement. The audit
+stores both complete bodies, original and child hashes, exact spans, mapping hash,
+actor and reason. Parent claims, child assignment/body/status, existing amendment
+events and direct link are rechecked atomically. An already-amended child cannot
+be used to justify forwarding acceptance. The same original task may not receive
+a second amendment, even after a caller refreshes the body hash.
+
+Clause overlays exceeding 22000 characters are rejected. CLI and worker goal
+handoffs allow a 24000-character goal snippet for owner-bounded scopes, so the
+normal judge sees the actual scope evidence rather than silently truncating it
+at the previous 2000-character boundary. Goal mode, real judge verdict handling,
+independent native Review and PR acceptance are not bypassed. Tests use recorded
+MC1/bridge bodies on isolated boards and a fixture model transport to exercise
+real prompt construction, verdict parsing and both rejecting/accepting transitions;
+they are NOT an actual model verdict or proof of live MC1 review/delivery.
 
 These are local-owner CLI contracts, not dashboard REST or worker tool APIs.
 The Python policy functions live in `hermes_cli.kanban_reconcile`: PR reconciliation

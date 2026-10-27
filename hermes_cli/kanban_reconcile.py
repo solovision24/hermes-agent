@@ -282,28 +282,40 @@ def reconcile_review_scope(conn: sqlite3.Connection, task_id: str, *, operator: 
     if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='review_scope_reconciled'",
                     (task_id,)).fetchone():
         raise ValueError("goal scope already amended; cumulative goal removal is forbidden")
-    if not isinstance(amendment, dict) or set(amendment) != {"deferred_acceptance"}:
-        raise ValueError("amendment must contain only deferred_acceptance exact original lines")
-    deferred = amendment["deferred_acceptance"]
-    original = before["body"] or ""
-    lines = original.splitlines(keepends=True)
-    if (not isinstance(deferred, list) or not deferred
-            or any(not isinstance(item, str) or len(item.strip()) < 20 or "\n" in item or "\r" in item
-                   for item in deferred) or len(set(deferred)) != len(deferred)
-            or any(sum(line.rstrip("\r\n") == item for line in lines) != 1 for item in deferred)):
-        raise ValueError("deferred acceptance must be unique complete original lines")
-    retained = [line for line in lines if line.rstrip("\r\n") not in deferred]
-    if (sum(len(item.strip()) for item in deferred) >= sum(len(line.strip()) for line in retained)
-            or not any(len(line.strip()) >= 20 for line in retained)):
-        raise ValueError("blanket or majority goal removal is forbidden")
+    if not isinstance(amendment, dict):
+        raise ValueError("amendment must be a structured mapping")
     linked = conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (task_id, deferred_child)).fetchone()
     child = conn.execute("SELECT body, assignee, status FROM tasks WHERE id=?", (deferred_child,)).fetchone()
-    if (not linked or child is None or not child["assignee"] or child["status"] in {"done", "archived"}
-            or any(item not in (child["body"] or "").splitlines() for item in deferred)):
-        raise ValueError("assigned directly dependent child must own every exact deferred acceptance line")
-    revised_body = "".join(
-        f"[Deferred acceptance to {deferred_child}: {line.rstrip(chr(13) + chr(10))}]\n"
-        if line.rstrip("\r\n") in deferred else line for line in lines)
+    if not linked or child is None or not child["assignee"] or child["status"] in {"done", "archived"}:
+        raise ValueError("assigned directly dependent unfinished child is required")
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='review_scope_reconciled'",
+                    (deferred_child,)).fetchone():
+        raise ValueError("deferred child cannot itself defer acceptance onward")
+    original = before["body"] or ""
+    scope_evidence = {}
+    deferred = None
+    if "clause_deferrals" in amendment:
+        from hermes_cli.kanban_scope import clause_overlay
+        revised_body, scope_evidence = clause_overlay(original, child["body"] or "", amendment, deferred_child)
+    else:
+        if set(amendment) != {"deferred_acceptance"}:
+            raise ValueError("amendment must contain only deferred_acceptance exact original lines")
+        deferred = amendment["deferred_acceptance"]
+        lines = original.splitlines(keepends=True)
+        if (not isinstance(deferred, list) or not deferred
+                or any(not isinstance(item, str) or len(item.strip()) < 20 or "\n" in item or "\r" in item
+                       for item in deferred) or len(set(deferred)) != len(deferred)
+                or any(sum(line.rstrip("\r\n") == item for line in lines) != 1 for item in deferred)):
+            raise ValueError("deferred acceptance must be unique complete original lines")
+        retained = [line for line in lines if line.rstrip("\r\n") not in deferred]
+        if (sum(len(item.strip()) for item in deferred) >= sum(len(line.strip()) for line in retained)
+                or not any(len(line.strip()) >= 20 for line in retained)):
+            raise ValueError("blanket or majority goal removal is forbidden")
+        if any(item not in (child["body"] or "").splitlines() for item in deferred):
+            raise ValueError("assigned child must own every exact deferred acceptance line")
+        revised_body = "".join(
+            f"[Deferred acceptance to {deferred_child}: {line.rstrip(chr(13) + chr(10))}]\n"
+            if line.rstrip("\r\n") in deferred else line for line in lines)
     revised_body += (f"\n\nOwner-bounded review scope; original body SHA256: {expected_body_sha256}.\n"
                      "All non-deferred requirements above remain operative and unchanged. "
                      "Only the explicitly marked acceptance belongs to the assigned child; "
@@ -313,6 +325,9 @@ def reconcile_review_scope(conn: sqlite3.Connection, task_id: str, *, operator: 
     with write_txn(conn):
         if tuple(_snapshot(conn, task_id) or ()) != tuple(before):
             raise ValueError("goal task changed during amendment")
+        if conn.execute("SELECT 1 FROM task_events WHERE task_id IN (?,?) AND kind='review_scope_reconciled'",
+                        (task_id, deferred_child)).fetchone():
+            raise ValueError("goal scope already amended; cumulative or onward deferral is forbidden")
         current_child = conn.execute("SELECT body, assignee, status FROM tasks WHERE id=?", (deferred_child,)).fetchone()
         if (tuple(current_child or ()) != tuple(child) or not conn.execute(
                 "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (task_id, deferred_child)).fetchone()):
@@ -323,7 +338,8 @@ def reconcile_review_scope(conn: sqlite3.Connection, task_id: str, *, operator: 
             "original_body_sha256": expected_body_sha256, "revised_body": revised_body,
             "deferred_child": deferred_child, "goal_mode_preserved": True,
             "deferred_acceptance": deferred, "deferred_assignee": child["assignee"],
-            "child_body_sha256": hashlib.sha256(child["body"].encode()).hexdigest(),
+            "child_body_sha256": hashlib.sha256((child["body"] or "").encode()).hexdigest(),
+            **scope_evidence,
         })
     return {"changed": True, "body_sha256": hashlib.sha256(revised_body.encode()).hexdigest(),
             "status": _snapshot(conn, task_id)["status"]}

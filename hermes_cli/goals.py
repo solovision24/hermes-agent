@@ -894,6 +894,7 @@ def judge_goal(
     goal: str,
     last_response: str,
     *,
+    goal_max_chars: int = 2000,
     timeout: Optional[float] = None,
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
@@ -924,7 +925,7 @@ def judge_goal(
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=_truncate(goal, goal_max_chars),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),

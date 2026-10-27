@@ -359,7 +359,7 @@ _SPECS = [
         _TASK_ID,
         _arg("--operator", required=True), _arg("--confirm", required=True),
         _arg("--expected-body-sha256", required=True),
-        _arg("--amendment-file", required=True, help="UTF-8 JSON with deferred_acceptance exact original lines"),
+        _arg("--amendment-file", required=True, help="UTF-8 JSON: exact deferred_acceptance lines or v2 hash-bound clause_deferrals"),
         _arg("--deferred-child", required=True, help="Direct child owning deferred acceptance"),
         _arg("--reason", required=True, help="Owner's auditable scope decision"),
     ], help="Owner-only: audit a narrow goal-mode review amendment; normal judge still gates review"),
