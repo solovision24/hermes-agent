@@ -12,6 +12,7 @@ import os
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Callable, Optional
 
 from agent.redact import redact_sensitive_text
@@ -28,7 +29,7 @@ RECEIPT_RETENTION = timedelta(days=30)
 MAX_DEFERRAL = timedelta(days=7)
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 _PROCESS_ID = uuid.uuid4().hex
-_ACTIVE: set[tuple[str, str]] = set()
+_ACTIVE: set[tuple[str, str, str]] = set()
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
@@ -188,10 +189,11 @@ def _default_job_state(job_id: str) -> str:
     return "deleted" if job is None else "active" if job.get("enabled", True) else "paused"
 
 
-def recover_targets() -> int:
+def recover_targets(*, db_path: Optional[Path] = None) -> int:
     """A dead owner may have sent; mark only its claimed destination unknown."""
-    from cron.delivery_queue import _transaction
-    with _transaction() as conn:
+    from cron.delivery_queue import _transaction, queue_path
+    path = db_path if db_path is not None else queue_path()
+    with _transaction(path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute("""SELECT execution_id,target_key,owner_process_id,owner_pid,owner_started_at
             FROM target_deliveries WHERE status='delivering'""").fetchall()
@@ -199,7 +201,7 @@ def recover_targets() -> int:
         for row in rows:
             pid = row["owner_pid"]
             same_process = row["owner_process_id"] == _PROCESS_ID
-            if same_process and (row["execution_id"], row["target_key"]) in _ACTIVE:
+            if same_process and (str(path), row["execution_id"], row["target_key"]) in _ACTIVE:
                 continue
             if not same_process and pid is not None and _owner_is_live(int(pid), row["owner_started_at"]):
                 continue
@@ -222,12 +224,13 @@ def release_targets(send: Callable[[dict, str, bool], tuple[str, Optional[str]]]
     Paused jobs remain pending; deleted jobs are suppressed without sending.
     A pause racing after claim cannot retract an already-started send.
     """
-    from cron.delivery_queue import _transaction
-    recover_targets()
+    from cron.delivery_queue import _transaction, queue_path
+    path = queue_path()
+    recover_targets(db_path=path)
     processed = 0
     for _ in range(max(0, limit)):
         state = "paused"
-        with _transaction() as conn:
+        with _transaction(path) as conn:
             conn.execute("BEGIN IMMEDIATE")
             now = _iso(_now())
             candidates = conn.execute("""SELECT * FROM target_deliveries WHERE status='pending'
@@ -246,9 +249,11 @@ def release_targets(send: Callable[[dict, str, bool], tuple[str, Optional[str]]]
                 if state == "deleted" or row["expires_at"] <= now:
                     status = "suppressed" if state == "deleted" else "failed"
                     error = "job deleted before delivery" if state == "deleted" else "target delivery expired before send"
-                    conn.execute("""UPDATE target_deliveries SET status=?,finished_at=?,error=?
+                    conn.execute("""UPDATE target_deliveries SET status=?,finished_at=?,error=?,
+                        content='',target_json='{}'
                         WHERE execution_id=? AND target_key=? AND status='pending'""",
                         (status, now, error, row["execution_id"], row["target_key"]))
+                    _prune(conn, _now())
                 else:
                     conn.execute("""UPDATE target_deliveries SET status='delivering',
                         owner_process_id=?,owner_pid=?,owner_started_at=?
@@ -256,7 +261,7 @@ def release_targets(send: Callable[[dict, str, bool], tuple[str, Optional[str]]]
                         AND status='pending'""",
                         (_PROCESS_ID, os.getpid(), _process_start_time(os.getpid()),
                          row["execution_id"], row["target_key"]))
-                    _ACTIVE.add((row["execution_id"], row["target_key"]))
+                    _ACTIVE.add((str(path), row["execution_id"], row["target_key"]))
                 break
             if selected is None:
                 break
@@ -273,7 +278,7 @@ def release_targets(send: Callable[[dict, str, bool], tuple[str, Optional[str]]]
             try:
                 safe_error = (redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
                               if error else None)
-                with _transaction() as conn:
+                with _transaction(path) as conn:
                     conn.execute("""UPDATE target_deliveries SET status=?,error=?,finished_at=?
                         WHERE execution_id=? AND target_key=? AND status='delivering'
                         AND owner_process_id=? AND owner_pid=?""",
@@ -281,6 +286,6 @@ def release_targets(send: Callable[[dict, str, bool], tuple[str, Optional[str]]]
                          selected["target_key"], _PROCESS_ID, os.getpid()))
                     _prune(conn, _now())
             finally:
-                _ACTIVE.discard((selected["execution_id"], selected["target_key"]))
+                _ACTIVE.discard((str(path), selected["execution_id"], selected["target_key"]))
         processed += 1
     return processed

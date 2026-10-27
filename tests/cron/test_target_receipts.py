@@ -72,11 +72,63 @@ def test_pause_delete_and_expiry(store, monkeypatch):
     state["job"] = "deleted"
     assert receipts.release_targets(send, job_state=lambda _: state["job"]) == 2
     send.assert_not_called()
-    assert {r["status"] for r in receipts.get_target_receipts("paused")} == {"suppressed"}
+    deleted = receipts.get_target_receipts("paused")[0]
+    assert deleted["status"] == "suppressed"
+    assert deleted["content"] == "" and deleted["target_json"] == "{}"
+    assert receipts.get_target_receipts("deleted")[0]["target_json"] == "{}"
     add("expired", [HUMAN])
     monkeypatch.setattr(receipts, "_now", lambda: NOW + timedelta(days=2))
     assert receipts.release_targets(send, job_state=lambda _: "paused") == 1
+    expired = receipts.get_target_receipts("expired")[0]
+    assert expired["status"] == "failed"
+    assert expired["content"] == "" and expired["target_json"] == "{}"
+
+
+def test_suppressed_and_expired_receipts_obey_terminal_bound(store, monkeypatch):
+    monkeypatch.setattr(receipts, "MAX_TERMINAL_TARGETS", 0)
+    add("deleted", [HUMAN])
+    add("expired", [MACHINE])
+    assert receipts.release_targets(Mock(), job_state=lambda _: "deleted", limit=1) == 1
+    monkeypatch.setattr(receipts, "_now", lambda: NOW + timedelta(days=2))
+    assert receipts.release_targets(Mock(), job_state=lambda _: "paused") == 1
+    assert receipts.get_target_receipts("deleted")[0]["status"] == "suppressed"
     assert receipts.get_target_receipts("expired")[0]["status"] == "failed"
+    with queue._transaction() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM target_deliveries").fetchone()[0] == 0
+
+
+def test_active_claim_is_profile_scoped_and_release_uses_claimed_home(store, monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", None)
+    a, b = tmp_path / "a", tmp_path / "b"
+    home_a = set_hermes_home_override(a)
+    try:
+        add("shared", [HUMAN])
+        home_b = set_hermes_home_override(b)
+        try:
+            add("shared", [HUMAN])
+            with queue._transaction() as conn:
+                conn.execute("""UPDATE target_deliveries SET status='delivering',
+                    owner_process_id=?,owner_pid=?""", (receipts._PROCESS_ID, 999999))
+        finally:
+            reset_hermes_home_override(home_b)
+
+        def send(*_):
+            # One gateway sends A while its served B has an abandoned identical key.
+            switched = set_hermes_home_override(b)
+            try:
+                assert receipts.recover_targets() == 1
+                assert receipts.get_target_receipts("shared")[0]["status"] == "unknown"
+            finally:
+                reset_hermes_home_override(switched)
+            return "delivered", None
+
+        assert receipts.release_targets(send, job_state=lambda _: "active") == 1
+        assert receipts.get_target_receipts("shared")[0]["status"] == "delivered"
+        assert receipts._ACTIVE == set()
+    finally:
+        reset_hermes_home_override(home_a)
 
 
 def test_profile_isolation(store, monkeypatch, tmp_path):
