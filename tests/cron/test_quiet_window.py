@@ -77,6 +77,8 @@ def test_live_multitarget_deferral_restart_and_one_release(tmp_path, monkeypatch
     assert scheduler_delivery._deliver_result(job, "brief", adapters={}, loop=None) is None
     assert sent == ["machine", "machine"]
     targets[0]["chat_id"] = "changed"
+    monkeypatch.setattr("cron.scheduler_delivery._sched.load_config",
+                        lambda: cfg("UTC", "00:00", "01:00"))
     monkeypatch.setattr(target_receipts, "_PROCESS_ID", "replacement")
     clock[0] += timedelta(hours=8)
     assert scheduler.drain_delivery_queue({}, None) == 1
@@ -124,3 +126,23 @@ def test_completed_one_shot_releases_but_paused_and_deleted_do_not(tmp_path, mon
     states["pause"]["enabled"] = True
     assert target_receipts.release_targets(send) == 1
     assert target_receipts.get_target_receipts("pause")[0]["status"] == "delivered"
+
+
+def test_corrupt_delivery_store_does_not_send_human(tmp_path, monkeypatch):
+    from gateway import config as gateway_config
+    from gateway import media_policy
+    db = tmp_path / "deliveries.db"
+    db.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", db)
+    monkeypatch.setattr("cron.scheduler_delivery._sched.load_config", lambda: cfg())
+    monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: object())
+    monkeypatch.setattr(media_policy, "apply_media_policy_env", lambda _: None)
+    monkeypatch.setattr(scheduler_delivery, "_resolve_delivery_targets", lambda *_a, **_k:
+                        [{"platform": "telegram", "chat_id": "human"}])
+    monkeypatch.setattr("hermes_time.now", lambda: at(2026, 10, 28, 3))
+    send = Mock()
+    monkeypatch.setattr(scheduler_delivery, "_prepare_target_delivery", send)
+    error = scheduler_delivery._deliver_result({"id": "job", "execution_id": "run"},
+                                                "brief", adapters={})
+    assert "persistence failed" in error
+    send.assert_not_called()
