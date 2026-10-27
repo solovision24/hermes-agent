@@ -1638,9 +1638,17 @@ def _deliver_standalone(
         enabled=t.mirror_this_target)
 
 
+def _handle_live_miss(t: _TargetDelivery, content: str, media_files: list,
+                      target_errors: list, delivery_errors: list, quiet_release: bool) -> None:
+    """A claimed receipt cannot fall back to an unverified or replayable sender."""
+    if quiet_release:
+        delivery_errors.extend(target_errors or [f"live adapter unavailable for {t.where}"])
+    else:
+        _deliver_standalone(t, content, media_files, target_errors, delivery_errors)
+
 def _prepare_target_delivery(
     job: dict, target: dict, *, adapters, loop, config, notify_delivery: bool, mirror_enabled: bool,
-    mirror_text: str, delivery_errors: list,
+    mirror_text: str, delivery_errors: list, quiet_release: bool = False,
 ) -> Optional[_TargetDelivery]:
     """Per-target prologue of ``_deliver_result``: origin/mirror/in_channel gates, transport
     resolution, continuable-thread open. None (error noted in ``delivery_errors``) if unservable."""
@@ -1662,7 +1670,7 @@ def _prepare_target_delivery(
 
     # Mirror: origin, origin-less home fallback, user-written home, or explicit-target opt-in.
     origin_target = _target_matches_origin(origin, platform_name, chat_id, thread_id)
-    mirror_this_target = mirror_enabled and _target_mirror_eligible(
+    mirror_this_target = not quiet_release and mirror_enabled and _target_mirror_eligible(
         job, target, global_mirror=mirror_enabled, origin_match=origin_target)
     # Resolved for ANY origin match (not just mirror-enabled): the in_channel seed needs it too.
     origin_user_id = origin.get("user_id") if origin_target else None
@@ -1675,8 +1683,8 @@ def _prepare_target_delivery(
     # in_channel gate shared by thread-flatten and flat seed — they MUST match or brief and
     # session land in different places. Origin qualifies unconditionally; others only when the
     # seed can create a resolvable session (_inchannel_seed_allowed).
-    inchannel_continuable = origin_target or (
-        mirror_this_target and _inchannel_seed_allowed(is_dm=is_dm_target, user_id=origin_user_id))
+    inchannel_continuable = not quiet_release and (origin_target or (
+        mirror_this_target and _inchannel_seed_allowed(is_dm=is_dm_target, user_id=origin_user_id)))
 
     # Plugin platform names create dynamic members via Platform._missing_().
     try:
@@ -1703,7 +1711,10 @@ def _prepare_target_delivery(
     # Continuable surface (D1/D2/D6) from platform config ``extra``; default "thread".
     # ``in_channel`` delivers FLAT so a plain channel reply continues via the shared session
     # ``(platform, chat_id, None)``. Unsupported adapters fail SAFE to thread.
-    in_channel_surface = _resolve_cron_surface_mode(pconfig, platform_name) == "in_channel"
+    # A deferred receipt owns the concrete conversation captured at enqueue. Never let a
+    # later surface/mirror setting flatten its thread or create a new one at release.
+    in_channel_surface = (not quiet_release and
+                          _resolve_cron_surface_mode(pconfig, platform_name) == "in_channel")
     if (
         in_channel_surface
         and runtime_adapter is not None
@@ -1916,7 +1927,8 @@ def _deliver_result(
         t = _prepare_target_delivery(
             job, target, adapters=adapters, loop=loop, config=config,
             notify_delivery=notify_delivery,
-            mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
+            mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors,
+            quiet_release=_quiet_release)
         if t is None:
             continue
         target_errors: list = []
@@ -1925,11 +1937,11 @@ def _deliver_result(
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
+        if not delivered:
+            _handle_live_miss(t, cleaned_delivery_content, media_files, target_errors,
+                              delivery_errors, _quiet_release)
         receipt_evidence.append(bool(delivered and t.where not in unverified_targets
                                      and not target_errors and not delivery_errors))
-        if not delivered:
-            _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.

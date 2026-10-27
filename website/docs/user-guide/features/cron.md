@@ -72,7 +72,11 @@ Only human chat destinations are deferred; routing resolves at completion and
 the concrete chat/topic is saved so later home-channel changes cannot redirect
 an old result. Each target has its own bounded receipt in the profile's existing
 `cron/deliveries.db` (100 pending, 32 per execution, 64 KiB payload, at most one
-day after release before expiry). No digest or urgent-prompt bypass exists.
+day after release before expiry). Release uses the saved chat/topic, without
+creating a new continuation thread, flattening a topic under a changed
+`in_channel` setting, or mirroring into a session. A missing live gateway
+transport fails the receipt rather than attempting an unverified standalone send
+or queuing a second reconnect delivery. No digest or urgent-prompt bypass exists.
 `hermes cron list` shows a job's latest deferred receipt status and release UTC
 instant. A paused job holds pending results until resumed or expired; deleting
 the job suppresses pending results, while a completed one-shot releases normally.
