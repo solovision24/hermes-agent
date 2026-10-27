@@ -5,3 +5,4 @@ Use -p tests.hermes_cli.scope_preload with the canonical test runner.
 """
 import sysconfig  # noqa: F401
 import zoneinfo  # noqa: F401
+import fastapi  # noqa: F401  (preload Pydantic distribution discovery before guard)

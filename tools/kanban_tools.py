@@ -471,9 +471,12 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
+            scope_kwargs: dict = {}
+            if "\n\nOwner-bounded review scope" in (task.body or ""):
+                scope_kwargs["goal_max_chars"] = 24000
             verdict, reason, _, _, transport_failed = judge_goal(
                 goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip(),
-                goal_max_chars=24000 if "\n\nOwner-bounded review scope" in (task.body or "") else 2000)
+                **scope_kwargs)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

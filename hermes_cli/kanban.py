@@ -857,10 +857,12 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
+            scope_kwargs: dict = {}
+            if "\n\nOwner-bounded review scope" in (task.body or ""):
+                scope_kwargs["goal_max_chars"] = 24000
             verdict, reason, _, _, transport_failed = judge_goal(
                 goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                last_response=evidence.strip(),
-                goal_max_chars=24000 if "\n\nOwner-bounded review scope" in (task.body or "") else 2000)
+                last_response=evidence.strip(), **scope_kwargs)
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)

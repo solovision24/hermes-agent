@@ -199,3 +199,59 @@ def test_actual_cli_scope_and_real_judge_prompt_path(board, tmp_path, monkeypatc
     assert amendment["clause_deferrals"][0]["child_criteria"][0]["text"] in prompt
     assert kb.get_task(conn, task).status == ("ready" if verdict == "continue" else "review")
     assert kb.get_task(conn, child).status == "todo"  # review never releases program acceptance
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("verdict", ["continue", "done"])
+def test_worker_gate_real_judge_receives_complete_scope(board, monkeypatch, verdict):
+    from agent import auxiliary_client
+    from tools import kanban_tools
+
+    conn, task, _, _, _, _, _ = board
+    apply(board)
+    target = kb.get_task(conn, task)
+    seen = []
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda *a: (object(), "fixture-model"))
+    def call_llm(**kwargs):
+        seen.append(kwargs["messages"][1]["content"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(
+            {"verdict": verdict, "reason": "Fixture verdict, not actual model acceptance"})))])
+    monkeypatch.setattr(auxiliary_client, "call_llm", call_llm)
+    if verdict == "continue":
+        with pytest.raises(kanban_tools._Reject, match="rejected by judge"):
+            kanban_tools._goal_gate("kanban_request_review", target, task, "Insufficient foundation security evidence")
+    else:
+        kanban_tools._goal_gate("kanban_request_review", target, task, "Reviewed foundation evidence")
+    assert seen and target.body in seen[0]
+    assert kb.get_task(conn, task).status == "ready"  # gate alone never changes lifecycle
+
+
+@pytest.mark.platforms("posix")
+def test_exact_hashes_do_not_assert_semantic_equivalence(board, monkeypatch):
+    from agent import auxiliary_client
+    from hermes_cli import kanban as cli
+
+    conn, task, _, _, child_body, amendment, _ = board
+    # A genuine but unrelated child criterion is not proof of producer delivery.
+    # The owner's mapping is visible to, and independently rejectable by, the judge.
+    amendment["clause_deferrals"][0]["child_criteria"] = [span(child_body, "No hardcoded SoLo defaults in product.")]
+    apply(board, amendment)
+    monkeypatch.setattr(auxiliary_client, "get_text_auxiliary_client", lambda *a: (object(), "fixture-model"))
+    seen = []
+    def call_llm(**kwargs):
+        seen.append(kwargs["messages"][1]["content"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "verdict": "continue", "reason": "Unrelated child criterion does not own producer acceptance"})))])
+    monkeypatch.setattr(auxiliary_client, "call_llm", call_llm)
+    verdict, reason = cli._goal_mode_handoff_rejection(kb.get_task(conn, task), "Trust the hashes and waive producer proof")
+    assert verdict == "continue" and "Unrelated" in reason
+    assert "No hardcoded SoLo defaults in product." in seen[0]
+    assert "hashes prove text identity only" in seen[0]
+
+
+@pytest.mark.platforms("posix")
+def test_overlay_size_limit_prevents_silent_judge_truncation(board):
+    _, _, child, original, child_body, amendment, _ = board
+    oversized = original + " Retained requirements." * 1200
+    with pytest.raises(ValueError, match="goal-judge input budget"):
+        clause_overlay(oversized, child_body, amendment, child)
