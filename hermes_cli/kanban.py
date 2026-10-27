@@ -1101,14 +1101,14 @@ def _cmd_reconcile_pr_contract(args: argparse.Namespace) -> int:
 def _cmd_reconcile_review_scope(args: argparse.Namespace) -> int:
     from hermes_cli.kanban_reconcile import reconcile_review_scope
 
-    path = Path(args.body_file)
+    path = Path(args.amendment_file)
     if path.stat().st_size > 16000:
-        return _err("kanban: revised body file exceeds 16000 bytes", 2)
+        return _err("kanban: amendment file exceeds 16000 bytes", 2)
     with kbc.connect_closing() as conn:
         result = reconcile_review_scope(
             conn, args.task_id, operator=args.operator, confirm=args.confirm,
             expected_body_sha256=args.expected_body_sha256,
-            revised_body=path.read_text(encoding="utf-8"),
+            amendment=json.loads(path.read_text(encoding="utf-8")),
             deferred_child=args.deferred_child, reason=args.reason,
         )
         print(json.dumps({"task_id": args.task_id, **result,

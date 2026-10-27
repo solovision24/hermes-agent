@@ -15,7 +15,7 @@ from hermes_cli.kanban_db_connect import connect
 PR = "https://github.com/acme/repo/pull/182"
 HEAD = "a" * 40
 MERGE = "b" * 40
-REVIEW = PR + "#issuecomment-1234"
+REVIEW = PR + "#pullrequestreview-1234"
 
 
 @pytest.fixture
@@ -37,33 +37,56 @@ def options(task, operator):
                 merge_sha=MERGE, review_url=REVIEW, reason="Owner reviewed exact merged PR; private hosted policy inaccessible")
 
 
+def scope_fixture(conn, task, child):
+    deferred = "Verify authenticated live producer ingestion end to end."
+    original = ("Implement and independently review the transactional ledger with authenticated principal isolation.\n"
+                "Prove persistence, deduplication and restart recovery with real integration tests on the exact PR.\n"
+                + deferred + "\n")
+    conn.execute("UPDATE tasks SET goal_mode=1, body=? WHERE id=?", (original, task))
+    conn.execute("UPDATE tasks SET body=?, assignee='chip' WHERE id=?", (deferred, child))
+    return original, {"deferred_acceptance": [deferred]}
+
+
 def fake_github(monkeypatch, *, merged=True, head=HEAD, checks=0, status=None,
-                review_head=HEAD, private=True, rules_unavailable=True):
-    from hermes_cli.kanban_pr_acceptance import _GateAuthError
+                review_head=HEAD, private=True, rules_unavailable=True,
+                review_state="APPROVED", reviewer_id=2, reviewer_login="independent",
+                plan_message=rec._PLAN_MESSAGE, admin=True, review_type="User", later_state=None):
 
     calls = []
-    def api(endpoint):
+    def api(endpoint, **kwargs):
         calls.append(endpoint)
         if endpoint == "repos/acme/repo/pulls/182":
             return {"html_url": PR, "head": {"sha": head}, "merge_commit_sha": MERGE,
                     "merged": merged, "merged_at": "2026-10-27T20:00:00Z" if merged else None,
                     "state": "closed" if merged else "open",
+                    "user": {"id": 1, "login": "implementer", "type": "User"},
                     "base": {"ref": "main", "repo": {"full_name": "acme/repo"}}}
-        if endpoint == "repos/acme/repo/issues/comments/1234":
-            return {"issue_url": "https://api.github.com/repos/acme/repo/issues/182",
-                    "body": "Independent review of exact head " + review_head}
+        if endpoint == "repos/acme/repo/pulls/182/reviews/1234":
+            return {"id": 1234, "html_url": REVIEW,
+                    "pull_request_url": "https://api.github.com/repos/acme/repo/pulls/182",
+                    "user": {"id": reviewer_id, "login": reviewer_login, "type": review_type},
+                    "state": review_state, "commit_id": review_head,
+                    "submitted_at": "2026-10-27T19:00:00Z", "body": "Exact head approved"}
+        if endpoint == "repos/acme/repo/pulls/182/reviews?per_page=100":
+            verdict = api("repos/acme/repo/pulls/182/reviews/1234")
+            later = [{**verdict, "id": 1235, "state": later_state}] if later_state else []
+            return [[verdict, *later]]
         if endpoint == "repos/acme/repo":
-            return {"full_name": "acme/repo", "private": private}
+            return {"full_name": "acme/repo", "private": private, "permissions": {"admin": admin}}
         if endpoint.endswith("check-runs?per_page=100"):
             return {"total_count": checks}
         if endpoint.endswith("statuses?per_page=100"):
             return status or []
-        if endpoint.endswith("rules/branches/main?per_page=100"):
-            if rules_unavailable:
-                raise _GateAuthError("HTTP 403 on private rules")
-            return []
         raise AssertionError(endpoint)
+    def probe(command, **kwargs):
+        endpoint = command[2]
+        calls.append(endpoint)
+        assert endpoint in {"repos/acme/repo/rules/branches/main?per_page=100",
+                            "repos/acme/repo/branches/main/protection"}
+        return SimpleNamespace(returncode=1 if rules_unavailable else 0,
+            stdout=json.dumps({"status": "403", "message": plan_message}) if rules_unavailable else "[]")
     monkeypatch.setattr(rec, "_api", api)
+    monkeypatch.setattr(rec.subprocess, "run", probe)
     return calls
 
 
@@ -86,7 +109,7 @@ def test_authorization_refuses_wrong_account_confirmation_worker_and_noninteract
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize("fault", ["wrong-pr", "wrong-head", "wrong-merge", "not-merged", "missing-review", "hosted-check", "rules-readable"])
+@pytest.mark.parametrize("fault", ["wrong-pr", "wrong-head", "wrong-merge", "not-merged", "missing-review", "hosted-check", "rules-readable", "self-review", "same-login", "negative-review", "irrelevant-review", "issue-comment", "permission-403", "not-admin", "bot-review", "missing-identity", "later-negative", "dismissed-review"])
 def test_mismatched_or_missing_evidence_never_changes_contract(board, monkeypatch, fault):
     conn, task, _, actor = board
     opts = options(task, actor)
@@ -98,6 +121,17 @@ def test_mismatched_or_missing_evidence_never_changes_contract(board, monkeypatc
     if fault == "missing-review": settings["review_head"] = "c" * 40
     if fault == "hosted-check": settings["checks"] = 1
     if fault == "rules-readable": settings["rules_unavailable"] = False
+    if fault == "self-review": settings["reviewer_id"] = 1
+    if fault == "same-login": settings["reviewer_login"] = "IMPLEMENTER"
+    if fault == "negative-review": settings["review_state"] = "CHANGES_REQUESTED"
+    if fault == "irrelevant-review": settings["review_state"] = "COMMENTED"
+    if fault == "issue-comment": opts["review_url"] = PR + "#issuecomment-1234"
+    if fault == "permission-403": settings["plan_message"] = "Resource not accessible by personal access token"
+    if fault == "not-admin": settings["admin"] = False
+    if fault == "bot-review": settings["review_type"] = "Bot"
+    if fault == "missing-identity": settings["reviewer_id"] = None
+    if fault == "later-negative": settings["later_state"] = "CHANGES_REQUESTED"
+    if fault == "dismissed-review": settings["review_state"] = "DISMISSED"
     fake_github(monkeypatch, **settings)
     with pytest.raises(ValueError):
         rec.reconcile_pr_contract(conn, task, **opts)
@@ -114,6 +148,10 @@ def test_exact_merge_idempotence_and_normal_completion_promotes_child(board, mon
     first = rec.reconcile_pr_contract(conn, task, **args)
     assert first["changed"] and first["event"]["hosted_ci_accepted"] is False
     assert first["event"]["original_contract"] == PR
+    assert first["event"]["review"]["user"]["id"] == 2
+    assert first["event"]["review"]["state"] == "APPROVED"
+    assert first["event"]["review"]["commit_id"] == HEAD
+    assert first["event"]["review_sha256"] == hashlib.sha256(json.dumps(first["event"]["review"], sort_keys=True).encode()).hexdigest()
     assert not rec.reconcile_pr_contract(conn, task, **args)["changed"]
     assert kb.get_task(conn, task).body == before
     assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_contract_reconciled'", (task,)).fetchone()[0] == 1
@@ -128,17 +166,16 @@ def test_exact_merge_idempotence_and_normal_completion_promotes_child(board, mon
 @pytest.mark.platforms("posix")
 def test_review_scope_keeps_original_goal_and_judge_path(board, monkeypatch):
     conn, task, child, actor = board
-    # A goal-mode foundation card with a direct producer child.
-    conn.execute("UPDATE tasks SET goal_mode=1, body=? WHERE id=?", ("Original full-scope task: live producer and ledger", task))
-    original = kb.get_task(conn, task).body
-    revised = ("Review only the bounded transactional ledger and authenticated principal foundation "
-               "on the current exact PR. Live producer ingestion is deferred to child " + child +
-               "; the final program acceptance still requires a trusted live producer proof. "
-               "Do not claim app delivery, disable the goal judge, or alter the existing PR contract.")
+    original, amendment = scope_fixture(conn, task, child)
     result = rec.reconcile_review_scope(conn, task, operator=actor, confirm=task,
         expected_body_sha256=hashlib.sha256(original.encode()).hexdigest(),
-        revised_body=revised, deferred_child=child, reason="Owner scoped foundation review, not release")
-    assert result["changed"] and kb.get_task(conn, task).body == revised
+        amendment=amendment, deferred_child=child, reason="Owner scoped foundation review, not release")
+    revised = kb.get_task(conn, task).body
+    assert result["changed"]
+    assert original.splitlines()[0] in revised
+    assert original.splitlines()[1] in revised
+    assert child in revised
+    assert hashlib.sha256(original.encode()).hexdigest() in revised
     assert kb.get_task(conn, task).goal_mode
     assert kb.get_task(conn, task).completion_contract == PR
     event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_scope_reconciled'", (task,)).fetchone()
@@ -146,7 +183,7 @@ def test_review_scope_keeps_original_goal_and_judge_path(board, monkeypatch):
     with pytest.raises(ValueError, match="hash mismatch"):
         rec.reconcile_review_scope(conn, task, operator=actor, confirm=task,
             expected_body_sha256=hashlib.sha256(original.encode()).hexdigest(),
-            revised_body=revised, deferred_child=child, reason="retry")
+            amendment=amendment, deferred_child=child, reason="retry")
 
 
 @pytest.mark.platforms("posix")
@@ -154,13 +191,11 @@ def test_cli_review_handoff_still_calls_goal_judge_on_revised_scope(board, monke
     from hermes_cli import kanban as cli
 
     conn, task, child, actor = board
-    conn.execute("UPDATE tasks SET goal_mode=1 WHERE id=?", (task,))
-    body = "Review bounded ledger foundation; the producer acceptance remains on linked child " + child
-    body += ". Do not claim a full release. The PR and live producer must be checked in later integration."
-    original = kb.get_task(conn, task).body
+    original, amendment = scope_fixture(conn, task, child)
     rec.reconcile_review_scope(conn, task, operator=actor, confirm=task,
         expected_body_sha256=hashlib.sha256(original.encode()).hexdigest(),
-        revised_body=body, deferred_child=child, reason="Owner-declared split")
+        amendment=amendment, deferred_child=child, reason="Owner-declared split")
+    body = kb.get_task(conn, task).body
 
     seen = []
     def judge(t, evidence):
@@ -200,3 +235,123 @@ def test_cli_exact_target_and_downstream_readback(board, monkeypatch, capsys):
     assert kb.get_task(conn, child).status == "ready"
     assert cli.kanban_command(args) == 0
     assert json.loads(capsys.readouterr().out)["changed"] is False
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("fault", ["freeform", "unknown-field", "all-goal", "majority-goal",
+    "partial-line", "foreign-line", "unassigned-child", "unowned-criterion", "not-linked",
+    "claim-lock", "worker-pid", "repeated-amendment"])
+def test_scope_amendment_rejects_unbounded_or_unowned_deferral(board, fault):
+    conn, task, child, actor = board
+    original, amendment = scope_fixture(conn, task, child)
+    if fault == "freeform": amendment = "Review unrelated prose " * 10 + child
+    if fault == "unknown-field": amendment["revised_body"] = "Remove all goals"
+    if fault == "all-goal": amendment["deferred_acceptance"] = original.splitlines()
+    if fault == "majority-goal": amendment["deferred_acceptance"] = original.splitlines()[:2]
+    if fault == "partial-line": amendment["deferred_acceptance"] = [original.splitlines()[0][2:]]
+    if fault == "foreign-line": amendment["deferred_acceptance"] = ["Something unrelated to original acceptance"]
+    if fault == "unassigned-child": conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (child,))
+    if fault == "unowned-criterion": conn.execute("UPDATE tasks SET body='Other unrelated work' WHERE id=?", (child,))
+    if fault == "not-linked": conn.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (task, child))
+    if fault == "claim-lock": conn.execute("UPDATE tasks SET claim_lock='owner:123' WHERE id=?", (task,))
+    if fault == "worker-pid": conn.execute("UPDATE tasks SET worker_pid=123 WHERE id=?", (task,))
+    kwargs = dict(operator=actor, confirm=task, expected_body_sha256=hashlib.sha256(original.encode()).hexdigest(),
+                  amendment=amendment, deferred_child=child, reason="Bounded owner review scope")
+    if fault == "repeated-amendment":
+        rec.reconcile_review_scope(conn, task, **kwargs)
+        original = kb.get_task(conn, task).body
+        kwargs["expected_body_sha256"] = hashlib.sha256(original.encode()).hexdigest()
+    with pytest.raises(ValueError):
+        rec.reconcile_review_scope(conn, task, **kwargs)
+    assert kb.get_task(conn, task).body == original
+
+
+@pytest.mark.platforms("posix")
+def test_scope_cli_structured_contract_readback(board, tmp_path, capsys):
+    from hermes_cli import kanban as cli
+    from hermes_cli.kanban_parser import build_parser
+    import argparse
+
+    conn, task, child, actor = board
+    original, amendment = scope_fixture(conn, task, child)
+    path = tmp_path / "amendment.json"
+    path.write_text(json.dumps(amendment), encoding="utf-8")
+    wrapper = argparse.ArgumentParser()
+    parser = build_parser(wrapper.add_subparsers(dest="top"))
+    args = parser.parse_args(["reconcile-review-scope", task, "--operator", actor,
+        "--confirm", task, "--expected-body-sha256", hashlib.sha256(original.encode()).hexdigest(),
+        "--amendment-file", str(path), "--deferred-child", child, "--reason", "Owner bounded deferral"])
+    assert cli.kanban_command(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    target = kb.get_task(conn, task)
+    assert result["body_sha256"] == hashlib.sha256(target.body.encode()).hexdigest()
+    assert result["status"] == target.status == "ready"
+    assert target.goal_mode and target.completion_contract == PR
+    assert kb.get_task(conn, child).status == "todo"
+
+
+@pytest.mark.platforms("posix")
+def test_plan_probe_fails_closed_on_unknown_malformed_or_classic_permission_response(monkeypatch):
+    for stdout, code in [("not-json", 1), ("[]", 0),
+            (json.dumps({"status": "403", "message": "Resource not accessible by integration"}), 1),
+            (json.dumps({"status": "401", "message": rec._PLAN_MESSAGE}), 1)]:
+        monkeypatch.setattr(rec.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout=stdout, returncode=code))
+        with pytest.raises(ValueError):
+            rec._plan_limitation("repos/acme/repo/branches/main/protection")
+
+
+@pytest.mark.platforms("posix")
+def test_claim_race_during_evidence_cannot_write_contract(board, monkeypatch):
+    conn, task, _, actor = board
+    fake_github(monkeypatch)
+    collect = rec.collect_merged_pr_evidence
+    def claim_during_collection(*args):
+        evidence = collect(*args)
+        conn.execute("UPDATE tasks SET claim_lock='new-owner:123' WHERE id=?", (task,))
+        return evidence
+    monkeypatch.setattr(rec, "collect_merged_pr_evidence", claim_during_collection)
+    with pytest.raises(ValueError, match="changed during evidence"):
+        rec.reconcile_pr_contract(conn, task, **options(task, actor))
+    assert kb.get_task(conn, task).completion_contract == PR
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mutation", ["claim", "child-body", "child-assignee", "unlink"])
+def test_scope_transaction_rechecks_claim_and_exact_child(board, monkeypatch, mutation):
+    from contextlib import contextmanager
+
+    conn, task, child, actor = board
+    original, amendment = scope_fixture(conn, task, child)
+    transaction = rec.write_txn
+    @contextmanager
+    def concurrent_edit(connection):
+        # A second real connection commits between validation and the write lock.
+        db_path = connection.execute("PRAGMA database_list").fetchone()[2]
+        import sqlite3
+        with sqlite3.connect(db_path) as other:
+            if mutation == "claim": other.execute("UPDATE tasks SET claim_lock='other:123' WHERE id=?", (task,))
+            if mutation == "child-body": other.execute("UPDATE tasks SET body='unrelated work' WHERE id=?", (child,))
+            if mutation == "child-assignee": other.execute("UPDATE tasks SET assignee='someone-else' WHERE id=?", (child,))
+            if mutation == "unlink": other.execute("DELETE FROM task_links WHERE parent_id=? AND child_id=?", (task, child))
+        with transaction(connection):
+            yield
+    monkeypatch.setattr(rec, "write_txn", concurrent_edit)
+    with pytest.raises(ValueError, match="changed during amendment"):
+        rec.reconcile_review_scope(conn, task, operator=actor, confirm=task,
+            expected_body_sha256=hashlib.sha256(original.encode()).hexdigest(),
+            amendment=amendment, deferred_child=child, reason="Bounded owner deferral")
+    assert kb.get_task(conn, task).body == original
+    assert not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='review_scope_reconciled'", (task,)).fetchone()
+
+
+@pytest.mark.platforms("posix")
+def test_reconciled_policy_does_not_override_parent_completion_gate(board, monkeypatch):
+    conn, task, child, actor = board
+    parent = kb.create_task(conn, title="Unfinished acceptance prerequisite")
+    kb.link_tasks(conn, parent, task)
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (task,))
+    fake_github(monkeypatch)
+    rec.reconcile_pr_contract(conn, task, **options(task, actor))
+    assert not kb.complete_task(conn, task, summary="Exact PR independently approved and merged")
+    assert kb.get_task(conn, task).status == "blocked"
+    assert kb.get_task(conn, child).status == "todo"

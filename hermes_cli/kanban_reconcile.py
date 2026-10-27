@@ -12,14 +12,61 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
+from urllib.parse import quote
 
 from hermes_cli.kanban_pr_acceptance import _PR, _api
 from hermes_cli.kanban_db_connect import write_txn
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_POLICY = "private-merged-exact-pr-no-hosted-evidence-v1"
+_POLICY = "private-merged-exact-pr-no-hosted-evidence-v2"
+_PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
+
+
+def _plan_limitation(endpoint: str) -> dict:
+    """Accept only GitHub's explicit plan response, never a generic permission 403.
+
+    The ordinary acceptance reader deliberately redacts error messages. Keep this
+    narrow policy probe separate; persist only the allowlisted message, not stderr.
+    """
+    from hermes_cli.kanban_pr_acceptance import _gh_env
+    result = subprocess.run(
+        ["gh", "api", endpoint, "--hostname", "github.com"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=30, env=_gh_env(None),
+    )
+    try:
+        response = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        raise ValueError("rules plan limitation is not verifiable") from None
+    if (result.returncode == 0 or not isinstance(response, dict)
+            or response.get("status") != "403" or response.get("message") != _PLAN_MESSAGE):
+        raise ValueError("permission failure or readable rules are not a plan limitation")
+    return {"endpoint": endpoint, "status": 403, "message": _PLAN_MESSAGE}
+
+
+def _affirmative_review_history(repo: str, number: int, verdict: dict) -> None:
+    pages = _api(f"repos/{repo}/pulls/{number}/reviews?per_page=100", paginate=True)
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise ValueError("incomplete review history")
+    latest = {}
+    found = False
+    for page in pages:
+        for review in page:
+            if review.get("id") == verdict["id"]:
+                found = review == verdict
+            if review.get("state") not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+                continue
+            uid = (review.get("user") or {}).get("id")
+            if not isinstance(uid, int) or not isinstance(review.get("id"), int):
+                raise ValueError("review history has missing identity")
+            if uid not in latest or latest[uid]["id"] < review["id"]:
+                latest[uid] = review
+    if (not found or latest.get(verdict["user"]["id"], {}).get("id") != verdict["id"]
+            or any(review["state"] == "CHANGES_REQUESTED" for review in latest.values())):
+        raise ValueError("review approval is superseded or has unresolved changes requested")
 
 
 def authorize_local_owner(conn: sqlite3.Connection, operator: str, task_id: str, confirm: str) -> str:
@@ -73,9 +120,9 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
     if not match or not _SHA.fullmatch(head_sha) or not _SHA.fullmatch(merge_sha):
         raise ValueError("exact GitHub PR URL and full lower-case head/merge SHAs are required")
     repo, number = match[1], int(match[2])
-    review = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{number}#issuecomment-([1-9][0-9]*)", review_url)
+    review = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{number}#pullrequestreview-([1-9][0-9]*)", review_url)
     if not review:
-        raise ValueError("review evidence must be an exact PR issue-comment URL")
+        raise ValueError("review evidence must be an exact affirmative PR review URL, not an issue comment")
     pr = _api(f"repos/{repo}/pulls/{number}")
     if (pr.get("html_url") != pr_url or pr.get("head", {}).get("sha") != head_sha
             or pr.get("merge_commit_sha") != merge_sha or not pr.get("merged")
@@ -83,39 +130,50 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
         raise ValueError("PR URL/head/merge proof does not match a merged GitHub PR")
     if pr.get("base", {}).get("repo", {}).get("full_name") != repo:
         raise ValueError("PR base repository does not match its contract")
-    comment = _api(f"repos/{repo}/issues/comments/{review[1]}")
-    if comment.get("issue_url") != f"https://api.github.com/repos/{repo}/issues/{number}":
-        raise ValueError("review comment is not attached to the exact PR")
-    if (not isinstance(comment.get("body"), str) or head_sha not in comment["body"]
-            or "review" not in comment["body"].lower()):
-        raise ValueError("review comment does not identify review of the immutable PR head")
+    review_endpoint = f"repos/{repo}/pulls/{number}/reviews/{review[1]}"
+    verdict = _api(review_endpoint)
+    reviewer = verdict.get("user") or {}
+    author = pr.get("user") or {}
+    if (verdict.get("html_url") != review_url or verdict.get("id") != int(review[1])
+            or verdict.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
+            or verdict.get("commit_id") != head_sha or verdict.get("state") != "APPROVED"
+            or not verdict.get("submitted_at") or reviewer.get("type") != "User"
+            or not isinstance(reviewer.get("id"), int) or not isinstance(author.get("id"), int)
+            or not reviewer.get("login") or not author.get("login")
+            or reviewer["id"] == author["id"]
+            or reviewer["login"].casefold() == author["login"].casefold()):
+        raise ValueError("review must be an independent affirmative exact-head GitHub verdict")
     repo_data = _api(f"repos/{repo}")
     if repo_data.get("full_name") != repo or repo_data.get("private") is not True:
         raise ValueError("the no-hosted-evidence policy applies only to a private repository")
+    if repo_data.get("permissions", {}).get("admin") is not True:
+        raise ValueError("GitHub login must have verified repository admin permission")
     checks = _api(f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100")
     statuses = _api(f"repos/{repo}/commits/{head_sha}/statuses?per_page=100")
     if checks.get("total_count") != 0 or statuses:
         raise ValueError("hosted evidence exists: use the normal PR acceptance gate")
-    # A private-repo plan can deny the rules endpoint. This is not proof that
-    # required checks do not exist; it is recorded as policy unavailable.
-    from hermes_cli.kanban_pr_acceptance import _GateAuthError
-    try:
-        _api(f"repos/{repo}/rules/branches/{pr['base']['ref']}?per_page=100")
-    except _GateAuthError as exc:
-        if "HTTP 403" not in str(exc):
-            raise ValueError("cannot establish the private-repo rules limitation") from exc
-        rules_state = "unavailable_http_403"
-    else:
-        raise ValueError("branch rules are readable: use the normal acceptance gate")
+    branch = quote(pr["base"]["ref"], safe="")
+    # Independently require explicit plan denial for rules AND classic protection.
+    rules = [_plan_limitation(f"repos/{repo}/rules/branches/{branch}?per_page=100"),
+             _plan_limitation(f"repos/{repo}/branches/{branch}/protection")]
     # Re-read mutable PR state after all evidence calls; a moved head never inherits proof.
     current = _api(f"repos/{repo}/pulls/{number}")
     if (current.get("head", {}).get("sha") != head_sha or current.get("merge_commit_sha") != merge_sha
             or not current.get("merged") or current.get("base", {}).get("ref") != pr["base"]["ref"]):
         raise ValueError("PR evidence changed during collection")
+    if _api(review_endpoint) != verdict:
+        raise ValueError("review evidence changed during collection")
+    _affirmative_review_history(repo, number, verdict)
+    review_snapshot = {key: verdict[key] for key in
+                       ("id", "html_url", "pull_request_url", "state", "commit_id", "submitted_at")}
+    review_snapshot["user"] = {key: reviewer[key] for key in ("id", "login", "type")}
+    review_snapshot["body_sha256"] = hashlib.sha256((verdict.get("body") or "").encode()).hexdigest()
     return {"pr_url": pr_url, "head_sha": head_sha, "merge_sha": merge_sha,
             "merged_at": pr["merged_at"], "review_url": review_url,
-            "review_comment_id": int(review[1]), "checks": "zero", "statuses": "zero",
-            "rules": rules_state, "policy": _POLICY}
+            "review": review_snapshot,
+            "review_sha256": hashlib.sha256(json.dumps(review_snapshot, sort_keys=True).encode()).hexdigest(),
+            "checks": "zero", "statuses": "zero", "rules": rules,
+            "github_admin_verified": True, "policy": _POLICY}
 
 
 def reconcile_pr_contract(conn: sqlite3.Connection, task_id: str, *, operator: str,
@@ -133,7 +191,7 @@ def reconcile_pr_contract(conn: sqlite3.Connection, task_id: str, *, operator: s
         raise ValueError("task not found")
     old = _reconciliation_event(conn, task_id)
     if before["completion_contract"] == "local-only" and old is not None:
-        if all(old.get(key) == val for key, val in (("pr_url", pr_url), ("head_sha", head_sha),
+        if old.get("policy") == _POLICY and all(old.get(key) == val for key, val in (("pr_url", pr_url), ("head_sha", head_sha),
                ("merge_sha", merge_sha), ("review_url", review_url), ("actor", actor))):
             return {"changed": False, "event": old, "status": before["status"]}
         raise ValueError("local-only contract was reconciled for different evidence")
@@ -161,7 +219,7 @@ def reconcile_pr_contract(conn: sqlite3.Connection, task_id: str, *, operator: s
 
 
 def reconcile_review_scope(conn: sqlite3.Connection, task_id: str, *, operator: str,
-                           confirm: str, expected_body_sha256: str, revised_body: str,
+                           confirm: str, expected_body_sha256: str, amendment: dict,
                            deferred_child: str, reason: str) -> dict:
     """Record a narrow owner decision while retaining the complete original goal body.
 
@@ -170,28 +228,57 @@ def reconcile_review_scope(conn: sqlite3.Connection, task_id: str, *, operator: 
     """
     actor = authorize_local_owner(conn, operator, task_id, confirm)
     reason = _required(reason, "reason")
-    if not isinstance(revised_body, str) or len(revised_body.strip()) < 100 or len(revised_body) > 16000:
-        raise ValueError("revised body must state a bounded, substantive acceptance scope")
-    revised_body = revised_body.strip()
     before = _snapshot(conn, task_id)
-    if before is None or before["status"] != "ready" or before["current_run_id"] is not None or not before["goal_mode"]:
+    if (before is None or before["status"] != "ready" or before["current_run_id"] is not None
+            or before["claim_lock"] or before["worker_pid"] or not before["goal_mode"]):
         raise ValueError("goal-scope amendment requires an unclaimed ready goal-mode task")
     if not _SHA256.fullmatch(expected_body_sha256) or hashlib.sha256((before["body"] or "").encode()).hexdigest() != expected_body_sha256:
         raise ValueError("original body hash mismatch")
-    if deferred_child not in revised_body or "review" not in revised_body.lower():
-        raise ValueError("revised acceptance must name the dependent child and review scope")
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='review_scope_reconciled'",
+                    (task_id,)).fetchone():
+        raise ValueError("goal scope already amended; cumulative goal removal is forbidden")
+    if not isinstance(amendment, dict) or set(amendment) != {"deferred_acceptance"}:
+        raise ValueError("amendment must contain only deferred_acceptance exact original lines")
+    deferred = amendment["deferred_acceptance"]
+    original = before["body"] or ""
+    lines = original.splitlines(keepends=True)
+    if (not isinstance(deferred, list) or not deferred
+            or any(not isinstance(item, str) or len(item.strip()) < 20 or "\n" in item or "\r" in item
+                   for item in deferred) or len(set(deferred)) != len(deferred)
+            or any(sum(line.rstrip("\r\n") == item for line in lines) != 1 for item in deferred)):
+        raise ValueError("deferred acceptance must be unique complete original lines")
+    retained = [line for line in lines if line.rstrip("\r\n") not in deferred]
+    if (sum(len(item.strip()) for item in deferred) >= sum(len(line.strip()) for line in retained)
+            or not any(len(line.strip()) >= 20 for line in retained)):
+        raise ValueError("blanket or majority goal removal is forbidden")
     linked = conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (task_id, deferred_child)).fetchone()
-    if not linked:
-        raise ValueError("deferred scope must belong to a directly dependent child")
+    child = conn.execute("SELECT body, assignee, status FROM tasks WHERE id=?", (deferred_child,)).fetchone()
+    if (not linked or child is None or not child["assignee"] or child["status"] in {"done", "archived"}
+            or any(item not in (child["body"] or "").splitlines() for item in deferred)):
+        raise ValueError("assigned directly dependent child must own every exact deferred acceptance line")
+    revised_body = "".join(
+        f"[Deferred acceptance to {deferred_child}: {line.rstrip(chr(13) + chr(10))}]\n"
+        if line.rstrip("\r\n") in deferred else line for line in lines)
+    revised_body += (f"\n\nOwner-bounded review scope; original body SHA256: {expected_body_sha256}.\n"
+                     "All non-deferred requirements above remain operative and unchanged. "
+                     "Only the explicitly marked acceptance belongs to the assigned child; "
+                     "this review is not full-program delivery or release acceptance. "
+                     "Normal goal judge, PR acceptance and independent review remain required.\n")
     from hermes_cli.kanban_db import _append_event
     with write_txn(conn):
         if tuple(_snapshot(conn, task_id) or ()) != tuple(before):
             raise ValueError("goal task changed during amendment")
+        current_child = conn.execute("SELECT body, assignee, status FROM tasks WHERE id=?", (deferred_child,)).fetchone()
+        if (tuple(current_child or ()) != tuple(child) or not conn.execute(
+                "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (task_id, deferred_child)).fetchone()):
+            raise ValueError("deferred child changed during amendment")
         conn.execute("UPDATE tasks SET body=? WHERE id=?", (revised_body, task_id))
         _append_event(conn, task_id, "review_scope_reconciled", {
             "actor": actor, "reason": reason, "original_body": before["body"],
             "original_body_sha256": expected_body_sha256, "revised_body": revised_body,
             "deferred_child": deferred_child, "goal_mode_preserved": True,
+            "deferred_acceptance": deferred, "deferred_assignee": child["assignee"],
+            "child_body_sha256": hashlib.sha256(child["body"].encode()).hexdigest(),
         })
     return {"changed": True, "body_sha256": hashlib.sha256(revised_body.encode()).hexdigest(),
             "status": _snapshot(conn, task_id)["status"]}

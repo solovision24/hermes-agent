@@ -99,11 +99,20 @@ verification and publication alone are not remote acceptance.
 The interactive local board owner may use `hermes kanban reconcile-pr-contract
 <task-id> --operator <OS-user> --confirm <task-id> --pr-url <persisted-exact-PR-URL>
 --head-sha <reviewed-full-head> --merge-sha <full-merge-commit>
---review-url <exact-PR-issue-comment-URL> --reason <owner-decision>
+--review-url <exact-PR-pullrequestreview-URL> --reason <owner-decision>
 --complete-summary <substantive-local-verification>` when the
-**same PR** is already merged, an independent review comment identifies its
-immutable head, the repository is private, zero check runs and legacy statuses
-exist on that head, and the GitHub rules endpoint is unavailable with HTTP 403.
+**same PR** is already merged, an independent GitHub review has state `APPROVED`
+and `commit_id` equal to that immutable head, the repository is private, and zero
+check runs and legacy statuses exist on that head. The reviewer must be a GitHub
+`User` with both ID and login different from the PR author. Issue comments,
+self-attestations, bots, negative/dismissed/unsubmitted verdicts, later superseding
+verdicts and unresolved changes requested in the paginated history are refused.
+The GitHub login must have verified repository `admin` permission. Both active
+rules and classic branch protection probes must return JSON status `403` with
+the exact allowlisted message `Upgrade to GitHub Pro or make this repository
+public to enable this feature.` A generic permission-denied 403 is **not** plan
+evidence. Unknown plan wording, malformed API replies or readable policy fail
+closed; this intentionally narrow policy is not a general hosted-CI waiver.
 The verb is CLI-only and requires an interactive terminal running as the OS
 owner of the board database. Workers and non-interactive callers are refused;
 a dashboard author's free-text name is not an authenticated owner identity.
@@ -112,7 +121,9 @@ the same OS account.
 
 The operation does not fabricate checks or silently approve a review. It stores
 the original exact contract, immutable head/merge proof, review
-URL, policy, operator and reason in a `pr_contract_reconciled` event before
+URL, affirmative verdict identity/state/head/timestamp, review snapshot and body
+hashes, both plan probes, policy, operator and reason in a
+`pr_contract_reconciled` event before
 changing only that task's contract to `local-only`. A repeat with exactly the
 same proof is idempotent; other evidence is refused. It then invokes normal
 `complete_task` with the required summary; dependency and live-claim guards
@@ -121,19 +132,44 @@ the normal downstream recompute. If completion fails, the audited reconciled
 contract remains but the task stays open; inspect and retry only after fixing
 the cause. `kanban show --json <task-id>` and `kanban show --json <child-id>`
 provide durable readback. If
-hosted evidence or readable rules exist, fix the normal PR gate instead.
+hosted evidence or readable rules exist, fix the normal PR gate instead. This
+command requires an actual independently authored GitHub approval; a native
+review performed through the PR author's shared GitHub account is not independent
+GitHub evidence and cannot be substituted by an issue comment.
 
 An owner-approved correction to a goal-mode card's *review scope* is separate:
 `hermes kanban reconcile-review-scope <task-id> --operator <OS-user> --confirm
-<task-id> --expected-body-sha256 <original-body-hash> --body-file <utf8-file>
---deferred-child <linked-child-id> --reason <owner-decision>`. The proposed body
-must state the bounded review acceptance and the directly linked child that
-retains the deferred requirement. The full original body and new body are
-retained in `review_scope_reconciled`; `goal_mode`, dependencies, PR contract and
-status are unchanged. Submit `kanban request-review --summary ... --reviewer
+<task-id> --expected-body-sha256 <original-body-hash> --amendment-file <utf8-json-file>
+--deferred-child <linked-child-id> --reason <owner-decision>`. The JSON must have
+exactly one key, `deferred_acceptance`, containing a nonempty list of unique,
+complete original body lines (at least 20 non-whitespace characters each).
+Freeform replacement bodies, substring matches, unrelated clauses and deferring
+half or more of the original non-whitespace text are refused. The child must be
+directly linked, assigned, unfinished and contain every deferred line verbatim
+in its own body. The generated operative body retains every non-deferred line
+unchanged, marks only the exact deferred clauses with the child ID, and records
+the original body hash and the continuing judge/review/acceptance requirements.
+The entire original body, generated body, exact deferral, assignee and child-body
+hash are retained in `review_scope_reconciled`. Repeated amendments are refused
+to prevent cumulative goal removal. Task claim/run/PID, child body/assignment/status
+and dependency link are rechecked under the write lock. `goal_mode`, dependencies,
+PR contract and status are unchanged. This conservative line-based operation
+does not support splitting a one-line goal or replacing prose wholesale.
+Submit `kanban request-review --summary ... --reviewer
 <profile>` separately: its normal goal judge evaluates the *revised* acceptance
 body and can still reject. Do not use dashboard status PATCH as a substitute for
 this judge-mediated handoff.
+
+These are local-owner CLI contracts, not dashboard REST or worker tool APIs.
+The Python policy functions live in `hermes_cli.kanban_reconcile`: PR reconciliation
+returns `{changed, event, status}` without itself completing the card; the CLI
+then invokes normal goal-gated completion and returns
+`{task_id, changed, completion_contract, status, dependents, hosted_ci_accepted}`.
+Scope reconciliation accepts an `amendment` mapping, returns
+`{changed, body_sha256, status}`, and never submits review itself. No HTTP endpoint
+accepts an asserted operator name as authentication. Focused regression verification:
+`scripts/run_tests.sh tests/hermes_cli/test_kanban_reconcile.py -j 1`; inspect actual
+test counts and subprocess results, not only the runner exit code.
 
 ## Kanban vs. `delegate_task`
 
