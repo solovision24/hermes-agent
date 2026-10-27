@@ -1,8 +1,10 @@
 """Outbound webhooks: ``hooks.outbound`` entries (url, events, secret_env|secret, matcher for
 pre/post_tool_call, timeout clamped to [1, 60], name) -> notify-only callbacks on the plugin hook
 manager, so every ``invoke_hook()`` site can POST lifecycle events (mirror of
-``gateway/platforms/webhook.py``).  Fire-and-forget through a bounded queue + one daemon worker,
-so a target can never block a tool call or influence agent flow.  HMAC-SHA256 signed
+``gateway/platforms/webhook.py``). Default delivery uses a bounded queue + one daemon worker;
+per-target ``durable: true`` commits to a separate profile-local bounded spool before returning.
+Network delivery never blocks a tool call or influences agent flow; durable admission can wait
+briefly for local storage. HMAC-SHA256 signed
 (``X-Hermes-Signature-256: sha256=<hex>`` over the raw body) when a secret is configured;
 ``HERMES_SAFE_MODE=1`` skips registration; registration is idempotent.
 """
@@ -20,6 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -50,6 +53,9 @@ _registered_lock = threading.Lock()
 _delivery_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 _worker_lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
+_spool_targets: dict[str, dict[str, WebhookTarget]] = {}
+_spool_worker: Optional[threading.Thread] = None
+_spool_wake = threading.Event()
 
 
 @dataclass
@@ -62,6 +68,7 @@ class WebhookTarget(_ToolMatcherMixin):
     secret: Optional[str] = None
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
+    durable: bool = False
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
     @property
@@ -83,28 +90,37 @@ def register_from_config(cfg: Optional[dict[str, Any]]) -> list[WebhookTarget]:
         logger.info("HERMES_SAFE_MODE=1 — outbound webhook registration skipped")
         return []
     targets = iter_configured_targets(cfg)
-    if not targets:
+    home_key = _home_key()
+    old_spool = (Path(home_key) / "outbound-webhooks" / "spool.db").exists()
+    if not targets and not old_spool:
         return []
     from hermes_cli.plugins import get_plugin_manager
     manager = get_plugin_manager()
-    home_key = _home_key()
     registered: list[WebhookTarget] = []
     with _registered_lock:
+        durable_targets: dict[str, WebhookTarget] = {}
         for target in targets:
             wired_any = False
             for event in target.events:
                 key = (home_key, event, target.url)
                 if key in _registered:
                     continue
-                manager._hooks.setdefault(event, []).append(_make_callback(event, target))
+                manager._hooks.setdefault(event, []).append(_make_callback(event, target, home_key))
                 _registered.add(key)
                 wired_any = True
                 logger.info(
                     "outbound webhook registered: %s -> %s (matcher=%s, timeout=%ds)",
-                    event, target.label, target.matcher, target.timeout,
+                    event, (target.name or "<durable target>") if target.durable else target.label,
+                    target.matcher, target.timeout,
                 )
             if wired_any:
                 registered.append(target)
+            if target.durable:
+                from agent.outbound_webhook_spool import target_key
+                durable_targets[target_key(target)] = target
+        _spool_targets[home_key] = durable_targets
+    if durable_targets or old_spool:
+        _start_spool_worker()
     return registered
 
 
@@ -123,11 +139,12 @@ def iter_configured_targets(cfg: Optional[dict[str, Any]]) -> list[WebhookTarget
 
 
 def flush(timeout: float = 5.0) -> bool:
-    """Block until all queued deliveries are done (or *timeout* elapses); True if drained."""
+    """Drain the volatile queue. Durable deliveries are already committed and replay on restart."""
     def _drained() -> bool:
         with _delivery_queue.all_tasks_done:
             return _delivery_queue.unfinished_tasks == 0
 
+    _spool_wake.set()
     return poll_until(_drained, timeout, 0.02)
 
 
@@ -149,12 +166,14 @@ def reset_for_tests() -> None:
     """Clear the idempotence set and drain the queue.  Test-only helper."""
     with _registered_lock:
         _registered.clear()
+        _spool_targets.clear()
     try:
         while True:
             _delivery_queue.get_nowait()
             _delivery_queue.task_done()
     except queue.Empty:
         pass
+    _spool_wake.set()
 
 
 def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
@@ -202,6 +221,10 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
         warn(".timeout must be an int (got %r); using default %ds", timeout_raw, DEFAULT_TIMEOUT_SECONDS)
         timeout = DEFAULT_TIMEOUT_SECONDS
     name = raw.get("name")
+    durable = raw.get("durable", False)
+    if not isinstance(durable, bool):
+        warn(".durable must be a boolean; using volatile delivery")
+        durable = False
     # ``secret_env`` (env var name, preferred) wins over inline ``secret``. Read through the profile
     # secret scope: the gateway registers each multiplexed profile's targets inside that profile's
     # scope, and a raw environ read would sign a secondary's deliveries with the DEFAULT profile's
@@ -218,11 +241,13 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
     return WebhookTarget(
         url=url, events=events, name=name.strip() if isinstance(name, str) else "", secret=secret,
         matcher=matcher, timeout=max(1, min(timeout, MAX_TIMEOUT_SECONDS)),
+        durable=durable,
     )
 
 
-def _make_callback(event: str, target: WebhookTarget):
+def _make_callback(event: str, target: WebhookTarget, home_key: Optional[str] = None):
     """Build the notify-only closure ``invoke_hook()`` calls per firing."""
+    home_key = home_key or _home_key()
 
     def _callback(**kwargs: Any) -> None:
         from agent.safe_worker_policy import safe_worker_enabled
@@ -235,9 +260,18 @@ def _make_callback(event: str, target: WebhookTarget):
         try:
             body = _serialize_payload(event, kwargs, delivery_id)
         except Exception:  # a bad payload must not hurt the loop
-            logger.warning("outbound webhook payload serialization failed (event=%s target=%s)", event, target.label, exc_info=True)
+            if target.durable:
+                logger.warning("outbound webhook durable payload serialization failed (event=%s)", event)
+            else:
+                logger.warning("outbound webhook payload serialization failed (event=%s target=%s)", event, target.label, exc_info=True)
             return
-        _enqueue(_build_delivery(event, target, body, delivery_id))
+        delivery = _build_delivery(event, target, body, delivery_id)
+        if target.durable:
+            from agent.outbound_webhook_spool import Spool
+            if Spool(home_key).enqueue(target, delivery):
+                _spool_wake.set()
+        else:
+            _enqueue(delivery)
 
     _callback.__name__ = f"outbound_webhook[{event}:{target.label}]"
     _callback.__qualname__ = _callback.__name__
@@ -301,6 +335,30 @@ def _worker_loop() -> None:
             _delivery_queue.task_done()
 
 
+def _start_spool_worker() -> None:
+    global _spool_worker
+    with _worker_lock:
+        if _spool_worker is None or not _spool_worker.is_alive():
+            _spool_worker = threading.Thread(target=_spool_loop, name="outbound-webhook-spool", daemon=True)
+            _spool_worker.start()
+    _spool_wake.set()
+
+
+def _spool_loop() -> None:
+    from agent.outbound_webhook_spool import Spool
+    while True:
+        with _registered_lock:
+            homes = [(home, targets.copy()) for home, targets in _spool_targets.items()]
+        for home, targets in homes:
+            try:
+                # One record per home per pass; HTTP attempts are sequential across homes.
+                Spool(home).process(targets)
+            except (OSError, RuntimeError, ValueError) as exc:  # background error cannot affect the agent loop
+                logger.warning("outbound webhook spool worker failed (%s)", type(exc).__name__)
+        _spool_wake.wait(timeout=1.0)
+        _spool_wake.clear()
+
+
 class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
     """Refuse redirects: urllib would turn a redirected POST into a body-less GET,
     silently dropping the signed payload. Any 3xx surfaces as HTTPError instead."""
@@ -310,6 +368,27 @@ class _NoRedirectHandler(urlrequest.HTTPRedirectHandler):
 
 
 _opener = urlrequest.build_opener(_NoRedirectHandler)
+
+
+def _classify_status(status: int) -> str:
+    if 200 <= status < 300:
+        return "ok"
+    if status in (408, 425, 429) or 500 <= status < 600:
+        return "retry"
+    return "terminal"
+
+
+def _post_once(delivery: dict[str, Any]) -> tuple[str, str]:
+    """One HTTP attempt; errors expose only a class, never URL, headers or response body."""
+    req = urlrequest.Request(delivery["url"], data=delivery["body"], headers=delivery["headers"], method="POST")
+    try:
+        with _opener.open(req, timeout=delivery["timeout"]) as resp:
+            status = getattr(resp, "status", 200)
+        return _classify_status(status), f"HTTP {status}"
+    except urlerror.HTTPError as exc:
+        return _classify_status(exc.code), f"HTTP {exc.code}"
+    except OSError as exc:
+        return "retry", type(exc).__name__
 
 
 def _deliver(delivery: dict[str, Any]) -> None:

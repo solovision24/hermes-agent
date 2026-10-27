@@ -2155,6 +2155,11 @@ display:
 # protocol and worked examples.
 #
 # hooks:
+#   outbound:
+#     - url: https://ci.example.com/hermes-events
+#       events: [on_session_end]
+#       secret_env: HERMES_OUTBOUND_WEBHOOK_SECRET
+#       durable: false  # opt in: private profile-local spool, at-least-once, 24h retention
 #   pre_tool_call:
 #     - matcher: "terminal"
 #       command: "~/.hermes/agent-hooks/block-rm-rf.sh"

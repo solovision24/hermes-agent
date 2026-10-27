@@ -2176,6 +2176,7 @@ hooks:
       events: [on_session_end, subagent_stop]
       secret_env: HERMES_OUTBOUND_WEBHOOK_SECRET   # env var holding the HMAC secret
       timeout: 10                           # per-attempt seconds (1–60)
+      durable: false                        # optional; true opts this target into the local spool
 
     - name: tool-monitor
       url: https://metrics.example.com/hooks/hermes
@@ -2226,8 +2227,8 @@ def verify(body: bytes, header: str, secret: str) -> bool:
 
 Because `delivery_id` and `timestamp` live **inside the signed body**, a verified receiver also gets replay protection for free:
 
-- **Dedupe** on `delivery_id` (or the matching `X-Hermes-Delivery` header) — remember recently seen ids and skip duplicates. Hermes retries failed deliveries once, so the same id can legitimately arrive twice.
-- **Reject stale events** by checking `timestamp` against your clock with a tolerance window (5 minutes is the common default). An attacker replaying a captured request can't forge a fresh timestamp without the secret.
+- **Dedupe** on `delivery_id` (or the matching `X-Hermes-Delivery` header) — remember recently seen ids and skip duplicates. Volatile delivery retries once; opt-in durable delivery can retry more often after process restarts, so the same id can legitimately arrive more than twice.
+- **Reject stale events** by checking `timestamp` against your clock. Five minutes is a common default for volatile delivery; durable delivery can legitimately replay for up to 24 hours, so opt-in receivers must choose an appropriate window and retain dedupe IDs for at least that long. An attacker replaying a captured request can't forge a fresh timestamp without the secret.
 
 ### Delivery semantics
 
@@ -2239,3 +2240,12 @@ Because `delivery_id` and `timestamp` live **inside the signed body**, a verifie
 - **No consent prompt.** Outbound targets execute no code on your machine — they receive data at a URL you configured. `HERMES_SAFE_MODE=1` still skips registration, same as plugins and shell hooks. Note that payloads include tool inputs and event metadata, so only point targets at endpoints you trust, and prefer `https://`.
 
 `hermes hooks list` shows configured outbound targets alongside shell hooks, including whether each target is signed.
+
+### Opt-in durable delivery
+
+Set `durable: true` on an individual outbound target to use a private SQLite spool under that profile's `HERMES_HOME/outbound-webhooks/spool.db`. For example, a short-lived CLI agent can emit `on_session_end`, commit the event, then exit before the receiver is online: the next Hermes process that registers the same target retries it. Unset or `false` retains the existing in-memory queue, one retry and best-effort semantics. This is **only** for outbound lifecycle hooks; it does not make cron, messaging, or tool effects durable. No migration of existing volatile queue entries occurs.
+
+- **At-least-once retry model, not exactly once or guaranteed delivery.** The spool commits before sending, then records the result. A crash, timeout, or lost acknowledgement after the receiver accepted a POST can cause the exact same signed body and `X-Hermes-Delivery` ID to be sent again. The receiver must dedupe by that ID; Hermes cannot know whether an ambiguous attempt succeeded. No redirects are followed. HTTP 408, 425, 429, 5xx and transport errors retry with bounded backoff (up to five attempts total); other 3xx/4xx end as dead letters. Exhaustion, expiry and storage admission failure can lose an event. A permanent failure needs the operator to fix the endpoint and produce a **new** event, not replay a rejected body automatically.
+- **Bounded private storage.** Up to 256 pending events, 64 KiB per body, a 32 MiB SQLite file cap plus its temporary rollback journal, and 24-hour expiry from admission (including dead metadata, capped to the most recent 128 terminal records). An in-flight HTTP attempt can finish just after expiry. The journal can temporarily consume additional disk space. A full disk, oversized event, private-directory/owner check failure, or malformed database causes a warning and drops the new event; it does **not** bypass the spool into an unsigned or volatile send. The POSIX directory is owner-only (`0700`) and file owner-read/write (`0600`); symlinks and permissive ACL masks are refused. Windows currently fails closed for this opt-in because chmod cannot establish a private Windows ACL. Keep backups of the profile home protected: queued bodies can contain tool inputs, paths and session metadata. Delivered/dead records discard their bodies immediately; stale records are removed on the next spool operation. A stopped profile is not a background service and does not expire records until it starts again.
+- **Config binding.** Only a currently registered matching endpoint and event set can consume a pending record. Removing or editing the URL/events/matcher makes the old record terminal, without sending it elsewhere; rotating/removing the signing secret fails the original signature check and terminalizes the old record. There is no implicit redirect, migration or re-signing. A copied spool is bound to its original profile path, not a second profile. Pending items with no configured target are terminalized when the profile next starts (even if it has no outbound targets); do not temporarily remove a target if you intend to resume it.
+- **Inspect without dumping payloads:** in the checkout's Python environment, run `from agent.outbound_webhook_spool import Spool; print(Spool('/path/to/profile-home').inspect())`. This returns ID, event, state, attempts, creation time and reason only. Do not share the SQLite file or its journal in a bug report. Before retrying an operator event, inspect the terminal reason, fix the cause, then trigger a new event; don't manually edit or reset the database to replay dead rows. A corrupt file requires an offline protected copy for diagnosis, then removal while all Hermes processes for that profile are stopped; retained events in it are unrecoverable unless restored from a valid backup.
