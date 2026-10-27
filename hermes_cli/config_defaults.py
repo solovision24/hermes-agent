@@ -1839,10 +1839,10 @@ DEFAULT_CONFIG = {
         "wrap_response": True,
         "delivery": {  # Delivery behaviour for cron output sent through a live gateway adapter.
             # Mark cron deliveries FINAL so the platform pushes them (Telegram's "important" mode
-            # otherwise sends with disable_notification=True and briefs look undelivered). False =
-            # silent, no-push deliveries.
+            # otherwise sends with disable_notification=True and briefs look undelivered). False = silent.
             "notify": True,
         },
+        "quiet_window": None,  # Owner-only opt-in: defer human notifications, not execution.
         # Make cron deliveries CONTINUABLE (user can reply to a brief with it in context). False
         # keeps deliveries isolated to the job's session; per-job `attach_to_session` overrides.
         # Thread-capable platforms (Telegram topics, Discord/Slack threads) get a seeded thread per

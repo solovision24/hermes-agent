@@ -1389,11 +1389,32 @@ def drain_delivery_queue(adapters, loop) -> int:
         # The ping left the process: book the incident alerted. A notice every target hid
         # (warning notifications suppressed) is a durable disposition, not an alert.
         if (not error and queued_for_failure
-                and not queued_job.get("_notification_all_targets_suppressed")):
+                and not queued_job.get("_notification_all_targets_suppressed")
+                and not queued_job.get("_quiet_deferred_failure")):
             _mark_incident_alerted(queued_job.get("_failure_incident_id"))
         return error
 
-    return drain(send)
+    processed = drain(send)
+    from cron.target_receipts import release_targets
+
+    def send_target(target, content, for_failure):
+        from cron.jobs import get_job
+        job = get_job(target["_job_id"])
+        if job is None:
+            return "failed", "job deleted before delivery"
+        evidence: list[bool] = []
+        error = _deliver_result(job, content, adapters=adapters, loop=loop,
+                                for_failure=for_failure, _resolved_targets=[target],
+                                _quiet_release=True, _receipt_evidence=evidence)
+        if error:
+            return "failed", error
+        if evidence == [True]:
+            if for_failure:
+                _mark_incident_alerted(target.get("_incident_id"))
+            return "delivered", None
+        return "unknown", "transport did not provide confirmed per-target evidence"
+
+    return processed + release_targets(send_target)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)

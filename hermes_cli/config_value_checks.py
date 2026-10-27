@@ -6,6 +6,15 @@ from typing import Any
 from hermes_cli.config_issues import ConfigIssue, _issue
 
 
+def _validate_cron_quiet_window(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
+    from cron.quiet_window import policy
+    try:
+        policy(config)
+    except ValueError as exc:
+        _issue(issues, "error", str(exc),
+               "Set cron.quiet_window to null, or provide timezone, start and end in config.yaml")
+
+
 def _validate_voice(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
     voice_cfg = config.get("voice")
     if not (isinstance(voice_cfg, dict) and "submit_mode" in voice_cfg):

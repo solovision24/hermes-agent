@@ -283,6 +283,13 @@ def _missed_fire_issue(job: dict[str, Any], fire_err: dict[str, Any]) -> str:
 def _job_warnings(job: dict[str, Any]) -> list[str]:
     """Delivery / fire warning lines for one job in ``cron list``."""
     lines = []
+    if quiet := job.get("last_quiet_window"):
+        from cron.delivery_queue import _path
+        from cron.target_receipts import get_target_receipts
+        receipts = (get_target_receipts(quiet["execution_id"]) if _path().exists() else [])
+        states = ", ".join(sorted({row["status"] for row in receipts})) or "unavailable"
+        lines.append(f"Quiet-window notification: {states}; scheduled release {quiet['release_at']} "
+                     f"({quiet['targets']} destination(s)); execution already completed")
     if queued := job.get("last_delivery_queued"):
         lines.append(f"Delivery still in progress (the result was handed off but not confirmed yet): {queued}")
     if job.get("last_delivery_error"):

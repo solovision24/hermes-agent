@@ -42,6 +42,51 @@ Whichever provider a job resolves to, its provider-specific request settings (e.
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::
 
+## Optional quiet notification window
+
+Cron can finish nightly work without waking you. This is an **owner-configured** policy,
+not an agent-generated urgency flag; it is off by default and does not defer the job,
+approval checks, machine/webhook delivery, or Bot Chat. Add to your own profile's
+`config.yaml` (not `.env`):
+
+```yaml
+cron:
+  quiet_window:
+    timezone: America/New_York
+    start: "22:00"
+    end: "07:00"
+```
+
+Use a valid IANA timezone and distinct 24-hour `HH:MM` values. The start is
+inclusive, the end exclusive; an end earlier than start crosses midnight.
+Hermes projects the current instant into that zone, so a nonexistent spring
+minute releases at the first real eligible minute and a fall-back repeated
+hour remains quiet in both folds. The host's timezone and the job's scheduling
+timezone do not change this policy. Delete the key or set it to `null` to
+disable future deferral; existing queued receipts retain their original release
+instant and destination. `hermes doctor` reports malformed policy; a malformed
+runtime value reports a delivery error and sends normally rather than silently
+discarding results.
+
+Only human chat destinations are deferred; routing resolves at completion and
+the concrete chat/topic is saved so later home-channel changes cannot redirect
+an old result. Each target has its own bounded receipt in the profile's existing
+`cron/deliveries.db` (100 pending, 32 per execution, 64 KiB payload, at most one
+day after release before expiry). No digest or urgent-prompt bypass exists.
+`hermes cron list` shows a job's latest deferred receipt status and release UTC
+instant. A paused job holds pending results until resumed or expired; deleting
+the job suppresses pending results, while a completed one-shot releases normally.
+An uncertain send stays `unknown`, never retried automatically. Transport errors
+are `failed`; records are bounded and terminal content is cleared. No-agent
+scripts and failure notices follow the same policy, except warning notifications
+the owner already disabled are never queued. Media attachments cannot be held
+safely across restart: during quiet time they are not sent to the human target,
+and the run reports a delivery error; machine destinations still receive theirs.
+
+This differs from heartbeat active-hours settings, which gate *execution*.
+Quiet windows only postpone human notification, with an explicit visible status.
+The implementation does not change existing schedules or generate extra LLM calls.
+
 ## Admission recovery
 
 Agent-backed runs retain their fire identity until output and a durable delivery handoff are recorded.

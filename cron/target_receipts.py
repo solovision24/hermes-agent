@@ -186,7 +186,10 @@ def get_target_receipts(execution_id: str, *, conn: Optional[sqlite3.Connection]
 def _default_job_state(job_id: str) -> str:
     from cron.jobs import get_job
     job = get_job(job_id)
-    return "deleted" if job is None else "active" if job.get("enabled", True) else "paused"
+    # A finished one-shot is disabled by the scheduler as state=completed, not
+    # paused by the owner. Its already-produced result still needs release.
+    return ("deleted" if job is None else "active"
+            if job.get("enabled", True) or job.get("state") == "completed" else "paused")
 
 
 def recover_targets(*, db_path: Optional[Path] = None) -> int:
@@ -267,7 +270,9 @@ def release_targets(send: Callable[[dict, str, bool], tuple[str, Optional[str]]]
                 break
         if state == "active" and selected["expires_at"] > now:
             try:
-                outcome = send(json.loads(selected["target_json"]), selected["content"],
+                snapshot = json.loads(selected["target_json"])
+                snapshot["_job_id"] = selected["job_id"]
+                outcome = send(snapshot, selected["content"],
                                bool(selected["for_failure"]))
                 status, error = outcome if isinstance(outcome, tuple) and len(outcome) == 2 else ("unknown", "no delivery confirmation")
                 if status not in ("delivered", "failed", "unknown"):

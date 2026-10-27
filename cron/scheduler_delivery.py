@@ -1321,6 +1321,7 @@ def _live_send_text(
             "assuming delivered (skipping standalone fallback "
             "to avoid duplicate)",
             job["id"], t.platform_name, t.chat_id)
+        unverified_targets.append(t.where)
         return True, True, None
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.
@@ -1767,7 +1768,9 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
 
 
 def _deliver_result(
-    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
+    job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False,
+    _resolved_targets: Optional[list[dict]] = None, _quiet_release: bool = False,
+    _receipt_evidence: Optional[list[bool]] = None,
 ) -> Optional[str]:
     """Deliver job output to the configured target(s). With ``adapters``/``loop`` (gateway
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
@@ -1775,7 +1778,8 @@ def _deliver_result(
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
-    targets = _resolve_delivery_targets(job, for_failure=for_failure)
+    targets = (_resolved_targets if _resolved_targets is not None
+               else _resolve_delivery_targets(job, for_failure=for_failure))
     if not targets:
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
@@ -1872,6 +1876,12 @@ def _deliver_result(
 
     delivery_errors = []
     suppressed_targets = 0  # local: `job` is snapshotted into durable deferred records mid-loop
+    quiet_keys: set[tuple] = set()
+    if not _quiet_release:
+        from cron.scheduler_quiet_window import defer_human_targets
+        quiet_keys = defer_human_targets(job, content, targets, user_cfg, media_files,
+                                         for_failure, delivery_errors)
+    receipt_evidence = _receipt_evidence if _receipt_evidence is not None else []
     for target in targets:
         # A failure notice for a platform that hides warning notifications is a suppressed
         # disposition, not a send; requested (non-failure) results are never gated.
@@ -1879,6 +1889,8 @@ def _deliver_result(
         if (for_failure and target["platform"] != BOT_CHAT_PLATFORM
                 and not warning_notifications_enabled(target["platform"], user_cfg)):
             suppressed_targets += 1
+            continue
+        if (target["platform"], target["chat_id"], target.get("thread_id")) in quiet_keys:
             continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
@@ -1913,6 +1925,8 @@ def _deliver_result(
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
+        receipt_evidence.append(bool(delivered and t.where not in unverified_targets
+                                     and not target_errors and not delivery_errors))
         if not delivered:
             _deliver_standalone(
                 t, cleaned_delivery_content, media_files, target_errors, delivery_errors)

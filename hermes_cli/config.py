@@ -1097,11 +1097,11 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
         except Exception as exc:
             from hermes_cli.config_home import config_load_issue
             return [config_load_issue(exc)]
-
-    from hermes_cli.config_value_checks import _validate_timezone, _validate_voice, _validate_web_backends
+    from hermes_cli import config_value_checks as _value_checks
     issues: list[ConfigIssue] = []
-    _validate_voice(config, issues)
-    _validate_timezone(config, issues)
+    _value_checks._validate_voice(config, issues)
+    _value_checks._validate_timezone(config, issues)
+    _value_checks._validate_cron_quiet_window(config, issues)
     cp = config.get("custom_providers")
     fb = config.get("fallback_model")
     for value, validator in ((cp, _validate_custom_providers), (fb, _validate_fallback_model)):
@@ -1127,7 +1127,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
 
-    _validate_web_backends(config, issues)
+    _value_checks._validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
 

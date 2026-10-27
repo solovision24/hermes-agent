@@ -512,6 +512,17 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]
+    if quiet := job.get("last_quiet_window"):
+        from cron.delivery_queue import _path
+        from cron.target_receipts import get_target_receipts
+        states = (get_target_receipts(quiet["execution_id"]) if _path().exists() else [])
+        result["quiet_window_delivery"] = {
+            "release_at": quiet["release_at"],
+            "execution_id": quiet["execution_id"],
+            "targets": quiet["targets"],
+            "statuses": sorted({row["status"] for row in states}) or ["unavailable"],
+            "note": "Execution completed; human notification deferred, not bypassable by prompt",
+        }
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]
