@@ -341,6 +341,26 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    _cmd("reconcile-pr-contract", [
+        _TASK_ID,
+        _arg("--operator", required=True, help="Local OS account authorizing this exception"),
+        _arg("--confirm", required=True, help="Repeat the exact task ID"),
+        _arg("--pr-url", required=True, help="Exact persisted GitHub pull URL"),
+        _arg("--head-sha", required=True, help="Reviewed immutable 40-character head"),
+        _arg("--merge-sha", required=True, help="Verified 40-character merge commit"),
+        _arg("--review-url", required=True, help="Independent review comment on that PR"),
+        _arg("--reason", required=True, help="Owner's auditable policy decision"),
+        _arg("--complete-summary", required=True,
+             help="Substantive completion evidence; normal complete_task gates still apply"),
+    ], help="Owner-only: reconcile one merged exact PR with unavailable private-repo hosted evidence; never marks CI green"),
+    _cmd("reconcile-review-scope", [
+        _TASK_ID,
+        _arg("--operator", required=True), _arg("--confirm", required=True),
+        _arg("--expected-body-sha256", required=True),
+        _arg("--body-file", required=True, help="UTF-8 revised scoped acceptance criteria"),
+        _arg("--deferred-child", required=True, help="Direct child owning deferred acceptance"),
+        _arg("--reason", required=True, help="Owner's auditable scope decision"),
+    ], help="Owner-only: audit a narrow goal-mode review amendment; normal judge still gates review"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [

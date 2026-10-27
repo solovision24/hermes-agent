@@ -210,6 +210,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
+    "reconcile-pr-contract", "reconcile-review-scope",
     "gc",
 })
 
@@ -1055,6 +1056,65 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reconcile_pr_contract(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_reconcile import reconcile_pr_contract
+
+    with kbc.connect_closing() as conn:
+        summary = _stripped_or_none(args.complete_summary)
+        if not summary:
+            return _err("kanban: substantive --complete-summary is required", 2)
+        result = reconcile_pr_contract(
+            conn, args.task_id, operator=args.operator, confirm=args.confirm,
+            pr_url=args.pr_url, head_sha=args.head_sha, merge_sha=args.merge_sha,
+            review_url=args.review_url, reason=args.reason,
+        )
+        task = kb.get_task(conn, args.task_id)
+        if task is None:
+            raise RuntimeError("task vanished after reconciliation")
+        if task.status != "done":
+            gate_err = _goal_gate_error(
+                conn, args.task_id, summary, "completion",
+                "Keep the card open with its reconciled policy.",
+                "Provide evidence matching the amended acceptance criteria.")
+            if gate_err:
+                return _err(gate_err)
+            if not kb.complete_task(conn, args.task_id, summary=summary):
+                return _err("kanban: contract reconciled and audited, but normal completion "
+                            "refused (status/dependencies changed); inspect the card")
+        task = kb.get_task(conn, args.task_id)
+        if task is None or task.status != "done":
+            raise RuntimeError("completed task readback failed")
+        children = [r[0] for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id=? ORDER BY child_id", (args.task_id,))]
+        downstream = {}
+        for cid in children:
+            child = kb.get_task(conn, cid)
+            if child is None:
+                raise RuntimeError(f"dependent {cid} readback failed")
+            downstream[cid] = child.status
+        print(json.dumps({"task_id": args.task_id, "changed": result["changed"],
+                          "completion_contract": task.completion_contract,
+                          "status": task.status, "dependents": downstream,
+                          "hosted_ci_accepted": False}))
+    return 0
+
+def _cmd_reconcile_review_scope(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_reconcile import reconcile_review_scope
+
+    path = Path(args.body_file)
+    if path.stat().st_size > 16000:
+        return _err("kanban: revised body file exceeds 16000 bytes", 2)
+    with kbc.connect_closing() as conn:
+        result = reconcile_review_scope(
+            conn, args.task_id, operator=args.operator, confirm=args.confirm,
+            expected_body_sha256=args.expected_body_sha256,
+            revised_body=path.read_text(encoding="utf-8"),
+            deferred_child=args.deferred_child, reason=args.reason,
+        )
+        print(json.dumps({"task_id": args.task_id, **result,
+                          "next": "request-review with exact evidence; normal goal judge still applies"}))
+    return 0
+
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
@@ -1328,6 +1388,8 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
+    "reconcile-pr-contract": _cmd_reconcile_pr_contract,
+    "reconcile-review-scope": _cmd_reconcile_review_scope,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,

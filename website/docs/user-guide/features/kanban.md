@@ -94,6 +94,47 @@ guard, not OS isolation against arbitrary direct database writes. GitHub Enterpr
 is not covered. Related publication/lifecycle work: #91230, #84254, #52311; local
 verification and publication alone are not remote acceptance.
 
+### Owner reconciliation for one already-reviewed PR
+
+The interactive local board owner may use `hermes kanban reconcile-pr-contract
+<task-id> --operator <OS-user> --confirm <task-id> --pr-url <persisted-exact-PR-URL>
+--head-sha <reviewed-full-head> --merge-sha <full-merge-commit>
+--review-url <exact-PR-issue-comment-URL> --reason <owner-decision>
+--complete-summary <substantive-local-verification>` when the
+**same PR** is already merged, an independent review comment identifies its
+immutable head, the repository is private, zero check runs and legacy statuses
+exist on that head, and the GitHub rules endpoint is unavailable with HTTP 403.
+The verb is CLI-only and requires an interactive terminal running as the OS
+owner of the board database. Workers and non-interactive callers are refused;
+a dashboard author's free-text name is not an authenticated owner identity.
+This is local machine ownership, **not** isolation from another process using
+the same OS account.
+
+The operation does not fabricate checks or silently approve a review. It stores
+the original exact contract, immutable head/merge proof, review
+URL, policy, operator and reason in a `pr_contract_reconciled` event before
+changing only that task's contract to `local-only`. A repeat with exactly the
+same proof is idempotent; other evidence is refused. It then invokes normal
+`complete_task` with the required summary; dependency and live-claim guards
+remain active, and the command prints the exact target and child statuses after
+the normal downstream recompute. If completion fails, the audited reconciled
+contract remains but the task stays open; inspect and retry only after fixing
+the cause. `kanban show --json <task-id>` and `kanban show --json <child-id>`
+provide durable readback. If
+hosted evidence or readable rules exist, fix the normal PR gate instead.
+
+An owner-approved correction to a goal-mode card's *review scope* is separate:
+`hermes kanban reconcile-review-scope <task-id> --operator <OS-user> --confirm
+<task-id> --expected-body-sha256 <original-body-hash> --body-file <utf8-file>
+--deferred-child <linked-child-id> --reason <owner-decision>`. The proposed body
+must state the bounded review acceptance and the directly linked child that
+retains the deferred requirement. The full original body and new body are
+retained in `review_scope_reconciled`; `goal_mode`, dependencies, PR contract and
+status are unchanged. Submit `kanban request-review --summary ... --reviewer
+<profile>` separately: its normal goal judge evaluates the *revised* acceptance
+body and can still reject. Do not use dashboard status PATCH as a substitute for
+this judge-mediated handoff.
+
 ## Kanban vs. `delegate_task`
 
 They look similar; they are not the same primitive.
