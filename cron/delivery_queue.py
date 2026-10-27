@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -33,7 +34,14 @@ _lock = threading.RLock()
 _ACTIVE_DELIVERIES: set[str] = set()
 _TERMINAL = ("delivered", "failed", "unknown", "suppressed")
 MAX_TERMINAL_DELIVERIES = 1000
+MAX_DEFERRED_PENDING = 100
+MAX_DEFERRED_PAYLOAD_BYTES = 65536
 DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS = 300.0
+
+
+def _utc_iso(instant: datetime) -> str:
+    """Fixed-precision UTC ordering, including sub-millisecond boundaries."""
+    return instant.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 def _prune_terminal_unlocked(conn: sqlite3.Connection) -> None:
@@ -118,6 +126,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              owner_pid INTEGER,
              owner_started_at INTEGER,
              created_at TEXT NOT NULL,
+             not_before TEXT,
+             expires_at TEXT,
              finished_at TEXT,
              error TEXT
            )"""
@@ -134,6 +144,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         conn, "deliveries", "for_failure",
         "for_failure INTEGER NOT NULL DEFAULT 0",
     )
+    add_column_if_missing(conn, "deliveries", "not_before", "not_before TEXT")
+    add_column_if_missing(conn, "deliveries", "expires_at", "expires_at TEXT")
 
 
 def _connect() -> sqlite3.Connection:
@@ -168,8 +180,23 @@ def enqueue(
     content: str,
     *,
     for_failure: bool = False,
+    not_before: Optional[datetime] = None,
+    expires_at: Optional[datetime] = None,
 ) -> dict:
     """Persist one idempotent delivery request before the worker waits."""
+    if not_before is None and expires_at is not None:
+        raise ValueError("expires_at requires not_before")
+    if not_before is not None:
+        if (not isinstance(not_before, datetime) or not isinstance(expires_at, datetime)
+                or not_before.tzinfo is None or not_before.utcoffset() is None
+                or expires_at.tzinfo is None or expires_at.utcoffset() is None):
+            raise ValueError("not_before and expires_at require aware datetimes")
+        not_before = not_before.astimezone(UTC)
+        expires_at = expires_at.astimezone(UTC)
+        if expires_at <= not_before:
+            raise ValueError("expires_at must be later than not_before")
+        if len(content.encode("utf-8")) > MAX_DEFERRED_PAYLOAD_BYTES:
+            raise ValueError("deferred delivery payload exceeds size limit")
     with _transaction() as conn:
         # Serialize the tombstone check and insert with retention in other
         # processes, which can move a terminal delivery into the tombstone table.
@@ -185,16 +212,29 @@ def enqueue(
                 "status": tombstone["terminal_status"],
                 "finished_at": tombstone["finished_at"],
             }
+        existing = conn.execute("SELECT * FROM deliveries WHERE execution_id=?",
+                                (str(execution_id),)).fetchone()
+        if existing is not None:
+            return dict(existing)
+        if not_before is not None:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM deliveries WHERE status='pending' AND not_before IS NOT NULL"
+            ).fetchone()[0]
+            if pending >= MAX_DEFERRED_PENDING:
+                raise ValueError("deferred delivery queue at capacity; no message was queued")
         conn.execute(
             """INSERT OR IGNORE INTO deliveries
-               (execution_id, job_json, content, for_failure, status, created_at)
-               VALUES (?, ?, ?, ?, 'pending', ?)""",
+               (execution_id, job_json, content, for_failure, status, created_at,
+                not_before, expires_at)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)""",
             (
                 str(execution_id),
                 json.dumps(job, ensure_ascii=False, sort_keys=True),
                 str(content),
                 int(bool(for_failure)),
                 _hermes_now().isoformat(),
+                _utc_iso(not_before) if not_before else None,
+                _utc_iso(expires_at) if expires_at else None,
             ),
         )
         row = conn.execute(
@@ -231,9 +271,13 @@ def claim_next() -> Optional[dict]:
     started = _process_start_time(pid)
     with _transaction() as conn:
         # created_at carries a DST-varying offset: order by instant, not text.
+        now = _utc_iso(_hermes_now())
         row = conn.execute(
             "SELECT execution_id FROM deliveries WHERE status='pending' "
-            "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1"
+            "AND (not_before IS NULL OR not_before <= ?) "
+            "AND (expires_at IS NULL OR expires_at > ?) "
+            "ORDER BY julianday(created_at), created_at, execution_id LIMIT 1",
+            (now, now),
         ).fetchone()
         if row is None:
             return None
@@ -330,6 +374,7 @@ def drain(
 ) -> int:
     """Deliver pending rows through *send*, terminalizing every claimed row."""
     recover_abandoned()
+    _expire_pending()
     processed = 0
     for _ in range(max(0, limit)):
         row = claim_next()
@@ -354,6 +399,39 @@ def drain(
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])
         processed += 1
     return processed
+
+
+def _expire_pending() -> None:
+    """Discard expired, provably unattempted sends and surface their failure."""
+    expired = []
+    with _transaction() as conn:
+        now = _utc_iso(_hermes_now())
+        due = conn.execute(
+            "SELECT 1 FROM deliveries WHERE status='pending' "
+            "AND expires_at IS NOT NULL AND expires_at <= ? LIMIT 1", (now,)
+        ).fetchone()
+        if due is None:
+            return
+        # Serialize expiry with a competing gateway claim; only unattempted rows may expire.
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT execution_id, job_json FROM deliveries WHERE status='pending' "
+            "AND expires_at IS NOT NULL AND expires_at <= ?",
+            (now,),
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE deliveries SET status='failed', finished_at=?, "
+                "error='deferred delivery expired before send' WHERE execution_id=? AND status='pending'",
+                (_hermes_now().isoformat(), row["execution_id"]),
+            )
+            expired.append((json.loads(row["job_json"]).get("id"), row["execution_id"]))
+        if expired:
+            _prune_terminal_unlocked(conn)
+    if expired:
+        from cron.delivery_outcome import settle_quietly
+        for job_id, execution_id in expired:
+            settle_quietly(job_id, execution_id)
 
 
 def _terminalize_wait_timeout(execution_id: str) -> str:
