@@ -31,7 +31,6 @@ from agent.deadline import poll_until
 from agent.shell_hooks import (
     _TOOL_EVENTS as _TOOL_SCOPED_EVENTS,
     _ToolMatcherMixin,
-    _forget_home_registrations,
     _home_key,
     _payload_fields,
     _utc_now_iso,
@@ -49,6 +48,8 @@ QUEUE_MAX_SIZE = 256
 # multiplexed gateway's secondary profiles (own plugin managers) can register identical targets.
 _registered: set[tuple[str, str, str]] = set()
 _registered_lock = threading.Lock()
+_callbacks: dict[tuple[str, str, str], Any] = {}
+_current_targets: dict[tuple[str, str, str], WebhookTarget] = {}
 
 _delivery_queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 _worker_lock = threading.Lock()
@@ -92,29 +93,56 @@ def register_from_config(cfg: Optional[dict[str, Any]]) -> list[WebhookTarget]:
     targets = iter_configured_targets(cfg)
     home_key = _home_key()
     old_spool = (Path(home_key) / "outbound-webhooks" / "spool.db").exists()
-    if not targets and not old_spool:
-        return []
     from hermes_cli.plugins import get_plugin_manager
     manager = get_plugin_manager()
     registered: list[WebhookTarget] = []
     with _registered_lock:
-        durable_targets: dict[str, WebhookTarget] = {}
+        desired: dict[tuple[str, str, str], WebhookTarget] = {}
         for target in targets:
-            wired_any = False
             for event in target.events:
                 key = (home_key, event, target.url)
-                if key in _registered:
+                if key in desired:
+                    previous = desired[key]
+                    if (previous.durable, previous.secret, previous.matcher, previous.timeout, previous.name) != (
+                            target.durable, target.secret, target.matcher, target.timeout, target.name):
+                        logger.warning("hooks.outbound has conflicting entries for %s; first entry wins", event)
                     continue
-                manager._hooks.setdefault(event, []).append(_make_callback(event, target, home_key))
-                _registered.add(key)
-                wired_any = True
+                desired[key] = target
+        for key, callback in list(_callbacks.items()):
+            if key[0] != home_key or key in desired:
+                continue
+            event = key[1]
+            manager._hooks[event] = [cb for cb in manager._hooks.get(event, []) if cb is not callback]
+            del _callbacks[key]
+            _current_targets.pop(key, None)
+            _registered.discard(key)
+        for key, target in desired.items():
+            event = key[1]
+            previous = _current_targets.get(key)
+            if previous is not None and (previous.durable, previous.secret, previous.matcher, previous.timeout,
+                                         previous.name, previous.events) == (
+                    target.durable, target.secret, target.matcher, target.timeout, target.name, target.events):
+                continue
+            callback = _make_callback(event, target, home_key)
+            callbacks = manager._hooks.setdefault(event, [])
+            old_callback = _callbacks.get(key)
+            if old_callback is not None and old_callback in callbacks:
+                callbacks[callbacks.index(old_callback)] = callback
+            else:
+                callbacks.append(callback)
+            _callbacks[key] = callback
+            _current_targets[key] = target
+            _registered.add(key)
+            if previous is None:
+                if target not in registered:
+                    registered.append(target)
                 logger.info(
                     "outbound webhook registered: %s -> %s (matcher=%s, timeout=%ds)",
                     event, (target.name or "<durable target>") if target.durable else target.label,
                     target.matcher, target.timeout,
                 )
-            if wired_any:
-                registered.append(target)
+        durable_targets: dict[str, WebhookTarget] = {}
+        for target in desired.values():
             if target.durable:
                 from agent.outbound_webhook_spool import target_key
                 durable_targets[target_key(target)] = target
@@ -158,7 +186,13 @@ def re_register_config_hooks() -> None:
     so without this the force-reloaded profile's outbound webhooks go silently inert (#92682 review).
     """
     from hermes_cli.config import load_config
-    _forget_home_registrations(_registered, _registered_lock)
+    with _registered_lock:
+        home = _home_key()
+        for key in list(_callbacks):
+            if key[0] == home:
+                del _callbacks[key]
+                _current_targets.pop(key, None)
+                _registered.discard(key)
     register_from_config(load_config())
 
 
@@ -166,6 +200,8 @@ def reset_for_tests() -> None:
     """Clear the idempotence set and drain the queue.  Test-only helper."""
     with _registered_lock:
         _registered.clear()
+        _callbacks.clear()
+        _current_targets.clear()
         _spool_targets.clear()
     try:
         while True:
@@ -273,7 +309,8 @@ def _make_callback(event: str, target: WebhookTarget, home_key: Optional[str] = 
         else:
             _enqueue(delivery)
 
-    _callback.__name__ = f"outbound_webhook[{event}:{target.label}]"
+    label = "<durable target>" if target.durable else target.label
+    _callback.__name__ = f"outbound_webhook[{event}:{label}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
 

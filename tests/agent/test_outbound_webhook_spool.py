@@ -260,6 +260,93 @@ def test_registered_worker_drains_durable_event_without_volatile_queue(tmp_path,
         manager._hooks["on_session_end"] = [cb for cb in manager._hooks.get("on_session_end", [])
                                             if not getattr(cb, "__name__", "").startswith("outbound_webhook[")]
 
+@pytest.mark.parametrize("before,after", [(True, False), (False, True)])
+def test_reregistration_updates_delivery_mode_and_signing(tmp_path, monkeypatch, before, after):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    sent = []
+    monkeypatch.setattr(hooks, "_enqueue", sent.append)
+    monkeypatch.setattr(hooks, "_start_spool_worker", lambda: None)
+    monkeypatch.setattr(spool.Spool, "process", lambda self, targets: False)
+    url = "https://example.test/hook"
+    def config(durable, secret, matcher, timeout):
+        return {"hooks": {"outbound": [{"url": url, "events": ["post_tool_call"],
+                    "matcher": matcher, "timeout": timeout, "secret": secret, "durable": durable}]}}
+    try:
+        hooks.register_from_config(config(before, "before", "web_search", 2))
+        hooks.register_from_config(config(after, "after", "terminal", 3))
+        callbacks = [cb for cb in manager._hooks["post_tool_call"]
+                     if getattr(cb, "__name__", "").startswith("outbound_webhook[")]
+        assert len(callbacks) == 1
+        manager.invoke_hook("post_tool_call", tool_name="web_search")
+        manager.invoke_hook("post_tool_call", tool_name="terminal")
+        store = spool.Spool(tmp_path)
+        if after:
+            assert sent == []
+            assert store.inspect()[0]["state"] == "pending"
+            assert store.inspect()[0]["event"] == "post_tool_call"
+            with sqlite3.connect(store.path) as db:
+                body, signature = db.execute("SELECT body, signature FROM deliveries").fetchone()
+            assert signature == hooks._build_delivery(
+                "post_tool_call", hooks.WebhookTarget(url=url, events=["post_tool_call"], secret="after"),
+                body, json.loads(body)["delivery_id"])["headers"]["X-Hermes-Signature-256"]
+        else:
+            assert not store.path.exists()
+            assert len(sent) == 1
+            assert sent[0]["timeout"] == 3
+            assert sent[0]["headers"]["X-Hermes-Signature-256"] == hooks._build_delivery(
+                "post_tool_call", hooks.WebhookTarget(url=url, events=["post_tool_call"], secret="after"),
+                sent[0]["body"], sent[0]["headers"]["X-Hermes-Delivery"])["headers"]["X-Hermes-Signature-256"]
+    finally:
+        manager._hooks["post_tool_call"] = [cb for cb in manager._hooks.get("post_tool_call", [])
+                                             if not getattr(cb, "__name__", "").startswith("outbound_webhook[")]
+
+def test_conflicting_same_url_entries_warn_and_only_first_is_active(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    sent = []
+    monkeypatch.setattr(hooks, "_enqueue", sent.append)
+    monkeypatch.setattr(hooks, "_start_spool_worker", lambda: None)
+    url = "https://user:password@example.test/hook"
+    try:
+        hooks.register_from_config({"hooks": {"outbound": [
+            {"url": url, "events": ["on_session_end"], "secret": "first"},
+            {"url": url, "events": ["on_session_end"], "durable": True, "secret": "second"},
+        ]}})
+        assert "conflicting" in caplog.text
+        assert "password" not in caplog.text and "second" not in caplog.text
+        manager.invoke_hook("on_session_end")
+        assert len(sent) == 1 and not spool.Spool(tmp_path).path.exists()
+    finally:
+        manager._hooks["on_session_end"] = [cb for cb in manager._hooks.get("on_session_end", [])
+                                            if not getattr(cb, "__name__", "").startswith("outbound_webhook[")]
+
+def test_durable_callback_name_never_contains_url_credentials():
+    target = _target(url="https://user:password@example.test/hook")
+    target.name = "user:password"
+    callback = hooks._make_callback("on_session_end", target)
+    assert callback.__name__.startswith("outbound_webhook[")
+    assert "password" not in callback.__name__ + callback.__qualname__
+
+def test_reregistration_removes_obsolete_callback_and_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    monkeypatch.setattr(hooks, "_start_spool_worker", lambda: None)
+    url = "https://example.test/hook"
+    try:
+        hooks.register_from_config({"hooks": {"outbound": [{
+            "url": url, "events": ["on_session_end"], "durable": True}]}})
+        hooks.register_from_config({"hooks": {"outbound": []}})
+        manager.invoke_hook("on_session_end")
+        assert not spool.Spool(tmp_path).path.exists()
+        assert not any(cb.__name__.startswith("outbound_webhook[") for cb in manager._hooks["on_session_end"])
+    finally:
+        manager._hooks["on_session_end"] = [cb for cb in manager._hooks.get("on_session_end", [])
+                                            if not getattr(cb, "__name__", "").startswith("outbound_webhook[")]
+
 
 def test_bounds_corruption_and_storage_failure(tmp_path, monkeypatch):
     target = _target()
