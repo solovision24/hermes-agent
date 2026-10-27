@@ -146,6 +146,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     )
     add_column_if_missing(conn, "deliveries", "not_before", "not_before TEXT")
     add_column_if_missing(conn, "deliveries", "expires_at", "expires_at TEXT")
+    from cron.target_receipts import initialize_schema
+    initialize_schema(conn)
 
 
 def _connect() -> sqlite3.Connection:
