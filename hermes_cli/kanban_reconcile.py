@@ -21,7 +21,7 @@ from hermes_cli.kanban_db_connect import write_txn
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_POLICY = "private-merged-exact-pr-no-hosted-evidence-v2"
+_POLICY = "private-merged-exact-pr-no-hosted-evidence-v3"
 _PLAN_MESSAGE = "Upgrade to GitHub Pro or make this repository public to enable this feature."
 
 
@@ -47,16 +47,16 @@ def _plan_limitation(endpoint: str) -> dict:
     return {"endpoint": endpoint, "status": 403, "message": _PLAN_MESSAGE}
 
 
-def _affirmative_review_history(repo: str, number: int, verdict: dict) -> None:
+def _affirmative_review_history(repo: str, number: int, verdict: dict | None) -> None:
     latest = {}
-    found = False
+    found = verdict is None
     # Explicit pages also work on owner machines with gh versions predating --slurp.
     for page_number in range(1, 101):
         page = _api(f"repos/{repo}/pulls/{number}/reviews?per_page=100&page={page_number}")
         if not isinstance(page, list) or any(not isinstance(review, dict) for review in page):
             raise ValueError("incomplete review history")
         for review in page:
-            if review.get("id") == verdict["id"]:
+            if verdict is not None and review.get("id") == verdict["id"]:
                 found = review == verdict
             if review.get("state") not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
                 continue
@@ -69,7 +69,7 @@ def _affirmative_review_history(repo: str, number: int, verdict: dict) -> None:
             break
     else:
         raise ValueError("review history exceeds bounded recovery policy; use normal acceptance")
-    if (not found or latest.get(verdict["user"]["id"], {}).get("id") != verdict["id"]
+    if (not found or (verdict is not None and latest.get(verdict["user"]["id"], {}).get("id") != verdict["id"])
             or any(review["state"] == "CHANGES_REQUESTED" for review in latest.values())):
         raise ValueError("review approval is superseded or has unresolved changes requested")
 
@@ -115,7 +115,8 @@ def _reconciliation_event(conn, task_id):
     return json.loads(row[0]) if row else None
 
 
-def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, review_url: str) -> dict:
+def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, review_url: str,
+                               native_review: dict | None = None) -> dict:
     """Read real GitHub evidence, including independent exact-head approval.
 
     API reads use the interactive owner's gh login. The accepting worker's login
@@ -126,7 +127,10 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
         raise ValueError("exact GitHub PR URL and full lower-case head/merge SHAs are required")
     repo, number = match[1], int(match[2])
     review = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{number}#pullrequestreview-([1-9][0-9]*)", review_url)
-    if not review:
+    comment = re.fullmatch(rf"https://github\.com/{re.escape(repo)}/pull/{number}#issuecomment-([1-9][0-9]*)", review_url)
+    if native_review is not None and not comment:
+        raise ValueError("native evidence requires its premerge issue comment URL")
+    if not review and not (native_review and comment):
         raise ValueError("review evidence must be an exact affirmative PR review URL, not an issue comment")
     pr = _api(f"repos/{repo}/pulls/{number}")
     if (pr.get("html_url") != pr_url or pr.get("head", {}).get("sha") != head_sha
@@ -135,11 +139,22 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
         raise ValueError("PR URL/head/merge proof does not match a merged GitHub PR")
     if pr.get("base", {}).get("repo", {}).get("full_name") != repo:
         raise ValueError("PR base repository does not match its contract")
-    review_endpoint = f"repos/{repo}/pulls/{number}/reviews/{review[1]}"
+    from hermes_cli.kanban_native_review import corroborate_native_comment, github_timestamp
+    if native_review is not None and comment is not None:
+        review_endpoint = f"repos/{repo}/issues/comments/{comment[1]}"
+    else:
+        assert review is not None
+        review_endpoint = f"repos/{repo}/pulls/{number}/reviews/{review[1]}"
     verdict = _api(review_endpoint)
     reviewer = verdict.get("user") or {}
     author = pr.get("user") or {}
-    if (verdict.get("html_url") != review_url or verdict.get("id") != int(review[1])
+    review_snapshot = {}
+    if native_review is not None:
+        if not comment:
+            raise ValueError("native evidence requires its premerge issue comment URL")
+        review_snapshot = {**native_review, "corroboration": corroborate_native_comment(
+            pr, verdict, review_url, int(comment[1]), native_review, head_sha)}
+    elif review is None or (verdict.get("html_url") != review_url or verdict.get("id") != int(review[1])
             or verdict.get("pull_request_url") != f"https://api.github.com/repos/{repo}/pulls/{number}"
             or verdict.get("commit_id") != head_sha or verdict.get("state") != "APPROVED"
             or not verdict.get("submitted_at") or reviewer.get("type") != "User"
@@ -148,6 +163,8 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
             or reviewer["id"] == author["id"]
             or reviewer["login"].casefold() == author["login"].casefold()):
         raise ValueError("review must be an independent affirmative exact-head GitHub verdict")
+    elif github_timestamp(verdict["submitted_at"]) > github_timestamp(pr["merged_at"]):
+        raise ValueError("GitHub approval submitted after merge is not premerge review")
     repo_data = _api(f"repos/{repo}")
     if repo_data.get("full_name") != repo or repo_data.get("private") is not True:
         raise ValueError("the no-hosted-evidence policy applies only to a private repository")
@@ -168,11 +185,16 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
         raise ValueError("PR evidence changed during collection")
     if _api(review_endpoint) != verdict:
         raise ValueError("review evidence changed during collection")
-    _affirmative_review_history(repo, number, verdict)
-    review_snapshot = {key: verdict[key] for key in
-                       ("id", "html_url", "pull_request_url", "state", "commit_id", "submitted_at")}
-    review_snapshot["user"] = {key: reviewer[key] for key in ("id", "login", "type")}
-    review_snapshot["body_sha256"] = hashlib.sha256((verdict.get("body") or "").encode()).hexdigest()
+    if native_review:
+        if current.get("body") != pr.get("body") or current.get("merged_at") != pr.get("merged_at"):
+            raise ValueError("canonical PR provenance changed during collection")
+        _affirmative_review_history(repo, number, None)
+    else:
+        _affirmative_review_history(repo, number, verdict)
+        review_snapshot = {key: verdict[key] for key in
+                           ("id", "html_url", "pull_request_url", "state", "commit_id", "submitted_at")}
+        review_snapshot["user"] = {key: reviewer[key] for key in ("id", "login", "type")}
+        review_snapshot["body_sha256"] = hashlib.sha256((verdict.get("body") or "").encode()).hexdigest()
     return {"pr_url": pr_url, "head_sha": head_sha, "merge_sha": merge_sha,
             "merged_at": pr["merged_at"], "review_url": review_url,
             "review": review_snapshot,
@@ -183,7 +205,8 @@ def collect_merged_pr_evidence(pr_url: str, head_sha: str, merge_sha: str, revie
 
 def reconcile_pr_contract(conn: sqlite3.Connection, task_id: str, *, operator: str,
                           confirm: str, pr_url: str, head_sha: str, merge_sha: str,
-                          review_url: str, reason: str) -> dict:
+                          review_url: str, reason: str, native_review_task: str | None = None,
+                          native_review_run: int | None = None) -> dict:
     """Bind an exact pre-existing PR to a local-only completion policy, audit first.
 
     This does not complete the card. The operator must subsequently use normal
@@ -194,27 +217,44 @@ def reconcile_pr_contract(conn: sqlite3.Connection, task_id: str, *, operator: s
     before = _snapshot(conn, task_id)
     if before is None:
         raise ValueError("task not found")
+    if bool(native_review_task) != (native_review_run is not None):
+        raise ValueError("native review task and run must be supplied together")
     old = _reconciliation_event(conn, task_id)
     if before["completion_contract"] == "local-only" and old is not None:
         if old.get("policy") == _POLICY and all(old.get(key) == val for key, val in (("pr_url", pr_url), ("head_sha", head_sha),
-               ("merge_sha", merge_sha), ("review_url", review_url), ("actor", actor))):
+               ("merge_sha", merge_sha), ("review_url", review_url), ("actor", actor),
+               ("native_review_task", native_review_task), ("native_review_run", native_review_run))):
             return {"changed": False, "event": old, "status": before["status"]}
         raise ValueError("local-only contract was reconciled for different evidence")
     if before["completion_contract"] != pr_url or before["status"] not in {"ready", "blocked", "review"}:
         raise ValueError("task must be unclaimed and carry this exact persisted PR contract")
     if before["current_run_id"] is not None or before["claim_lock"] or before["worker_pid"]:
         raise ValueError("task still has an active claim")
-    evidence = collect_merged_pr_evidence(pr_url, head_sha, merge_sha, review_url)
+    from hermes_cli.kanban_native_review import native_review_snapshot
+    native = None
+    if native_review_task is not None and native_review_run is not None:
+        native = native_review_snapshot(conn, task_id, native_review_task, native_review_run,
+                                       pr_url, head_sha, merge_sha)
+    if native is not None:
+        evidence = collect_merged_pr_evidence(pr_url, head_sha, merge_sha, review_url, native)
+    else:
+        evidence = collect_merged_pr_evidence(pr_url, head_sha, merge_sha, review_url)
     from hermes_cli.kanban_db import _append_event
     payload = {**evidence, "actor": actor, "reason": reason,
                "original_contract": pr_url, "replacement_contract": "local-only",
-               "hosted_ci_accepted": False}
+               "hosted_ci_accepted": False, "native_review_task": native_review_task,
+               "native_review_run": native_review_run}
     with write_txn(conn):
         current = _snapshot(conn, task_id)
         if current is None or tuple(current) != tuple(before):
             raise ValueError("task changed during evidence collection; retry")
         if _reconciliation_event(conn, task_id):
             raise ValueError("contract already reconciled; refresh task")
+        if native is not None:
+            assert native_review_task is not None and native_review_run is not None
+            if native_review_snapshot(conn, task_id, native_review_task, native_review_run,
+                                      pr_url, head_sha, merge_sha) != native:
+                raise ValueError("native review provenance changed during evidence collection")
         conn.execute("UPDATE tasks SET completion_contract='local-only' WHERE id=?", (task_id,))
         _append_event(conn, task_id, "pr_contract_reconciled", payload)
     readback = _snapshot(conn, task_id)

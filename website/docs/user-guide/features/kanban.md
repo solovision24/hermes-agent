@@ -102,9 +102,9 @@ The interactive local board owner may use `hermes kanban reconcile-pr-contract
 --review-url <exact-PR-pullrequestreview-URL> --reason <owner-decision>
 --complete-summary <substantive-local-verification>` when the
 **same PR** is already merged, an independent GitHub review has state `APPROVED`
-and `commit_id` equal to that immutable head, the repository is private, and zero
+and `commit_id` equal to that immutable head (submitted no later than `merged_at`), the repository is private, and zero
 check runs and legacy statuses exist on that head. The reviewer must be a GitHub
-`User` with both ID and login different from the PR author. Issue comments,
+`User` with both ID and login different from the PR author. Standalone issue comments,
 self-attestations, bots, negative/dismissed/unsubmitted verdicts, later superseding
 verdicts and unresolved changes requested in the paginated history are refused.
 The GitHub login must have verified repository `admin` permission. Both active
@@ -132,10 +132,44 @@ the normal downstream recompute. If completion fails, the audited reconciled
 contract remains but the task stays open; inspect and retry only after fixing
 the cause. `kanban show --json <task-id>` and `kanban show --json <child-id>`
 provide durable readback. If
-hosted evidence or readable rules exist, fix the normal PR gate instead. This
-command requires an actual independently authored GitHub approval; a native
-review performed through the PR author's shared GitHub account is not independent
-GitHub evidence and cannot be substituted by an issue comment.
+hosted evidence or readable rules exist, fix the normal PR gate instead.
+
+For an already completed native **external-intake** review performed through a
+shared GitHub account, supply `--native-review-task <same-board-review-task-id>
+--native-review-run <exact-run-id>` together and use its corroborating premerge
+`#issuecomment-<id>` URL as `--review-url`. This is a separate native authority
+path, not independent GitHub-account evidence. Policy v3 recognizes only the
+dispatched `orion` lane and requires all of the following:
+
+- A completed or archived task created by `github-webhook`; exact repository,
+  PR URL/number and head in the `github_pr_native_ingest` intake run; a native
+  review request naming Orion followed by a real review-state claim, spawned
+  worker and completed run in order. Synthetic completions or comment-author
+  names do not establish reviewer identity.
+- The exact latest run is `done`/`completed`, has no error, and has structured
+  `review_outcome=approved_merged_source_only`, `published_pr`, `reviewed_head`,
+  `merge_commit`, nonempty `reviewer_checks` and `worker_session_id`. Orion must
+  differ from the canonical assignee and every recorded implementation profile;
+  missing implementation provenance, later runs or revoked reviews fail closed.
+- The PR's `## Kanban Task` section contains the exact canonical owner-companion
+  task link. The comment belongs to that PR, names the exact head and source-merge
+  approval, and was created/last edited during the review run **before merge**.
+  The GitHub author's identity is not the approval authority: a shared-account
+  comment without the independent native run is always rejected.
+- The native run/intake/events/metadata, original comment and SHA256 snapshot are
+  included in the durable audit. Native provenance is reread under the write lock
+  before the contract changes. Unresolved formal GitHub change requests are still
+  refused; private/admin/zero-check/dual-plan-response gates are unchanged.
+
+The Python API `reconcile_pr_contract(conn, task_id, ..., native_review_task=None,
+native_review_run=None)` has the same paired optional inputs; it changes only the
+contract and appends the audit, not completion. The CLI invokes normal completion
+and emits `{task_id, changed, completion_contract, status, dependents,
+hosted_ci_accepted:false}` after target/dependent readback. Neither a dashboard
+PATCH nor a worker tool exposes this owner-only authority. Evidence IDs are
+resolved on `conn`'s board; the API does not open a different board or accept an
+uploaded native-proof JSON file. This is source-merge reconciliation only, not
+deployment authorization or acceptance of deferred integration requirements.
 
 An owner-approved correction to a goal-mode card's *review scope* is separate:
 `hermes kanban reconcile-review-scope <task-id> --operator <OS-user> --confirm

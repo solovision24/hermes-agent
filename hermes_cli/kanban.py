@@ -1067,6 +1067,7 @@ def _cmd_reconcile_pr_contract(args: argparse.Namespace) -> int:
             conn, args.task_id, operator=args.operator, confirm=args.confirm,
             pr_url=args.pr_url, head_sha=args.head_sha, merge_sha=args.merge_sha,
             review_url=args.review_url, reason=args.reason,
+            native_review_task=args.native_review_task, native_review_run=args.native_review_run,
         )
         task = kb.get_task(conn, args.task_id)
         if task is None:

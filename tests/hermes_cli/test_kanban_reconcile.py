@@ -50,7 +50,8 @@ def scope_fixture(conn, task, child):
 def fake_github(monkeypatch, *, merged=True, head=HEAD, checks=0, status=None,
                 review_head=HEAD, private=True, rules_unavailable=True,
                 review_state="APPROVED", reviewer_id=2, reviewer_login="independent",
-                plan_message=rec._PLAN_MESSAGE, admin=True, review_type="User", later_state=None):
+                plan_message=rec._PLAN_MESSAGE, admin=True, review_type="User", later_state=None,
+                submitted_at="2026-10-27T19:00:00Z"):
 
     calls = []
     def api(endpoint, **kwargs):
@@ -66,7 +67,7 @@ def fake_github(monkeypatch, *, merged=True, head=HEAD, checks=0, status=None,
                     "pull_request_url": "https://api.github.com/repos/acme/repo/pulls/182",
                     "user": {"id": reviewer_id, "login": reviewer_login, "type": review_type},
                     "state": review_state, "commit_id": review_head,
-                    "submitted_at": "2026-10-27T19:00:00Z", "body": "Exact head approved"}
+                    "submitted_at": submitted_at, "body": "Exact head approved"}
         if endpoint == "repos/acme/repo/pulls/182/reviews?per_page=100&page=1":
             verdict = api("repos/acme/repo/pulls/182/reviews/1234")
             later = [{**verdict, "id": 1235, "state": later_state}] if later_state else []
@@ -370,3 +371,13 @@ def test_later_page_negative_review_is_not_hidden_by_first_page_approval(monkeyp
     with pytest.raises(ValueError, match="unresolved changes"):
         rec._affirmative_review_history("acme/repo", 182, verdict)
     assert len(calls) == 2
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("timestamp", ["2026-10-27T20:00:01Z", "invalid", None])
+def test_postmerge_or_unverifiable_github_approval_is_not_premerge_review(board, monkeypatch, timestamp):
+    conn, task, _, actor = board
+    fake_github(monkeypatch, submitted_at=timestamp)
+    with pytest.raises(ValueError):
+        rec.reconcile_pr_contract(conn, task, **options(task, actor))
+    assert kb.get_task(conn, task).completion_contract == PR
