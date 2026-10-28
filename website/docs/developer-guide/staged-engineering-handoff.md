@@ -82,8 +82,13 @@ Structured approval metadata uses `reviewed_head`, `review_outcome` (`approved`,
 native review claim before completion. If a published PR is declared, its current
 head is re-read with the review assignee's GitHub scope; stale/missing evidence
 refuses completion, including for `local-only` source tasks. A changed head requires
-a new review. Legacy handoffs without structured head pins retain the existing
-lifecycle; this compatibility limit is not a universal retrospective approval claim.
+a new review. A declared `published_pr` (or native intake `url`) requires a full
+lowercase 40-character `head_sha` at admission. Invalid/conflicting PR URLs and
+missing/malformed pins fail closed at admission and historical handoff completion;
+terminal approval cannot guess or backfill an omitted immutable pin from GitHub.
+Legacy **non-PR** handoffs without structured head pins retain the existing
+lifecycle; published PRs never use that compatibility exemption. This is not a
+universal retrospective approval claim.
 
 ## RELEASE receipt
 

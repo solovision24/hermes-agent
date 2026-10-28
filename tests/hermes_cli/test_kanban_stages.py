@@ -199,11 +199,12 @@ def test_rereview_receives_all_canonical_findings_not_just_latest(board, monkeyp
 
 
 @pytest.mark.parametrize("remote", ["same", "moved", "auth"])
-def test_local_only_pr_review_still_checks_live_head_as_reviewer(board, monkeypatch, remote):
+@pytest.mark.parametrize("field", ["published_pr", "url"])
+def test_local_only_pr_review_still_checks_live_head_as_reviewer(board, monkeypatch, remote, field):
     from hermes_cli import kanban_pr_acceptance as acceptance
     task = kb.create_task(board, title="Published source", assignee="forge")
     head, url = "a" * 40, "https://github.com/example/export/pull/17"
-    assert kb.request_review(board, task, summary="Review", reviewer="orion", metadata={"head_sha": head, "published_pr": url})
+    assert kb.request_review(board, task, summary="Review", reviewer="orion", metadata={"head_sha": head, field: url})
     review = kb.claim_review_task(board, task)
     calls = []
     monkeypatch.setattr(acceptance, "_assignee_profile_home", lambda assignee: "reviewer-home:" + assignee)
@@ -217,6 +218,68 @@ def test_local_only_pr_review_still_checks_live_head_as_reviewer(board, monkeypa
         expected_run_id=review.current_run_id)
     assert approved == (remote == "same")
     assert calls == [("repos/example/export/pulls/17", {"profile_home": "reviewer-home:orion"})]
+
+
+@pytest.mark.parametrize("field", ["published_pr", "url"])
+@pytest.mark.parametrize("head", ["missing", None, "", "abc123", "A" * 40, 123])
+def test_published_pr_requires_immutable_pin_before_review(board, field, head):
+    task = kb.create_task(board, title="Published source", assignee="forge")
+    metadata = {field: "https://github.com/example/export/pull/17"}
+    if head != "missing":
+        metadata["head_sha"] = head
+    ok, reason = kb.request_review(board, task, summary="Ready", reviewer="orion",
+                                   metadata=metadata, with_reason=True)
+    assert not ok and "head_sha" in reason
+    assert kb.get_task(board, task).status == "ready"
+    assert not [event for event in kb.list_events(board, task) if event.kind == "review_requested"]
+
+
+@pytest.mark.parametrize("field", ["published_pr", "url"])
+@pytest.mark.parametrize("head", ["missing", None, "", "abc123", "A" * 40, 123])
+def test_historical_unpinned_pr_handoff_cannot_complete(board, monkeypatch, field, head):
+    from hermes_cli import kanban_stages as stages, kanban_pr_acceptance as acceptance
+    task = kb.create_task(board, title="Historical PR source", assignee="forge")
+    metadata = {field: "https://github.com/example/export/pull/17"}
+    if head != "missing":
+        metadata["head_sha"] = head
+    # Model a handoff accepted by the previous admission policy on a real board.
+    # Only admission is replaced; terminal gates use their actual implementation.
+    with monkeypatch.context() as old_policy:
+        old_policy.setattr(stages, "admission_error", lambda *_: None)
+        assert kb.request_review(board, task, summary="Old handoff", reviewer="orion", metadata=metadata)
+    review = kb.claim_review_task(board, task)
+    calls = []
+    monkeypatch.setattr(acceptance, "_api", lambda *args, **kwargs: calls.append(args))
+    approval = {"review_outcome": "approved_source_only", "reviewer_checks": ["read diff"]}
+    assert stages.review_pin_error(board, task, approval)
+    assert stages.live_review_head_error(board, task)
+    assert not kb.complete_task(board, task, summary="No immutable evidence", metadata=approval,
+                                expected_run_id=review.current_run_id)
+    assert calls == []  # Missing pins cannot be repaired by guessing a remote head.
+    assert kb.get_task(board, task).status == "running"
+
+
+@pytest.mark.parametrize("metadata", [
+    {"published_pr": None}, {"published_pr": ""}, {"published_pr": 123},
+    {"published_pr": "https://example.com/report"},
+    {"adapter": "github_pr_native_ingest", "url": "https://example.com/report"},
+    {"published_pr": "https://github.com/example/export/pull/17",
+     "url": "https://github.com/example/export/pull/18"},
+])
+def test_published_artifact_url_must_be_unambiguous(board, metadata):
+    task = kb.create_task(board, title="Ambiguous PR", assignee="forge")
+    metadata = dict(metadata, head_sha="a" * 40)
+    assert not kb.request_review(board, task, summary="Ready", reviewer="orion", metadata=metadata)
+    assert kb.get_task(board, task).status == "ready"
+
+
+@pytest.mark.parametrize("metadata", [{"format": "report"}, {"url": "https://example.com/report"}])
+def test_non_pr_legacy_review_keeps_existing_lifecycle(board, metadata):
+    task = kb.create_task(board, title="Non-PR report", assignee="forge")
+    assert kb.request_review(board, task, summary="Report ready", reviewer="orion", metadata=metadata)
+    review = kb.claim_review_task(board, task)
+    assert kb.complete_task(board, task, summary="Report inspected", expected_run_id=review.current_run_id)
+    assert kb.get_task(board, task).status == "done"
 
 
 @pytest.mark.platforms("posix")

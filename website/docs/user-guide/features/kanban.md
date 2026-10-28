@@ -71,8 +71,11 @@ Completion retains full-goal judging and applicable PR required-check acceptance
 Structured head-pinned review handoffs additionally require an independent native
 review claim, matching `reviewed_head`, affirmative `review_outcome` and concrete
 `reviewer_checks` at completion. A declared published PR is re-read as the review
-assignee and a changed/unavailable head refuses completion. Legacy handoffs with
-no structured head pin retain their prior behavior. Owner-ratified deferrals are
+assignee and a changed/unavailable head refuses completion. Declaring `published_pr`
+or native intake `url` requires a full lowercase 40-character `head_sha` at admission;
+missing/malformed pins and invalid/conflicting PR URLs fail closed, including when
+completing historical PR handoffs admitted by an older runtime. Only legacy non-PR
+handoffs without a structured head pin retain their prior behavior. Owner-ratified deferrals are
 revalidated at review/completion; changed body/criterion/owner/link or onward
 deferral must be coordinated, not silently inherited. Review admission never
 completes a task, releases its dependent children, merges or claims anything live.

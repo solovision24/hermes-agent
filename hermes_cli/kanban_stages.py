@@ -83,9 +83,33 @@ def declared_evidence_error(metadata) -> str | None:
     return None
 
 
+def review_artifact_error(metadata) -> str | None:
+    """Declared PRs cannot opt out of exact-head review by omitting their pin.
+
+    Separate from completion's general evidence check: non-review PR completions
+    still use their existing required-check acceptance contract.
+    """
+    from hermes_cli.kanban_pr_acceptance import _PR
+    meta = metadata if isinstance(metadata, dict) else {}
+    urls = [meta["published_pr"]] if "published_pr" in meta else []
+    alias = meta.get("url")
+    # Generic report/asset URLs are not PR declarations. Native intake uses url;
+    # recognize that adapter, a PR-shaped alias, or a structured pinned artifact.
+    if "url" in meta and (urls or "head_sha" in meta or meta.get("adapter") == "github_pr_native_ingest"
+                          or (isinstance(alias, str) and alias.startswith("https://github.com/") and "/pull/" in alias)):
+        urls.append(alias)
+    if urls and (any(not isinstance(url, str) or not _PR.fullmatch(url) for url in urls)
+                 or any(url != urls[0] for url in urls)):
+        return "invalid or conflicting published review artifact URL"
+    pin = meta.get("head_sha")
+    if (urls or "head_sha" in meta) and (not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{40}", pin)):
+        return "published review artifact requires immutable head_sha as a full lowercase Git SHA"
+    return None
+
+
 def admission_error(conn, task, summary, metadata) -> str | None:
     """Declared failures plus the stage judge; metadata never supplies authority."""
-    error = declared_evidence_error(metadata)
+    error = declared_evidence_error(metadata) or review_artifact_error(metadata)
     if error:
         return error
     meta = metadata if isinstance(metadata, dict) else {}
@@ -180,7 +204,7 @@ def validate_scope_provenance(conn, task_id: str) -> str | None:
 def review_pin_error(conn, task_id: str, metadata) -> str | None:
     """Bind structured native PR approval to its handoff head and reviewer run.
 
-    Legacy/non-PR handoffs without a pin retain the existing lifecycle. This
+    Legacy non-PR handoffs without a pin retain the existing lifecycle. This
     terminal gate never runs at admission. GitHub required-check/current-head
     collection remains separate; local metadata alone does not prove live head.
     """
@@ -192,7 +216,11 @@ def review_pin_error(conn, task_id: str, metadata) -> str | None:
     if event is None:
         return None
     handoff = kb.get_run(conn, event["run_id"]) if event["run_id"] else None
-    pin = (handoff.metadata or {}).get("head_sha") if handoff else None
+    handoff_meta = (handoff.metadata or {}) if handoff else {}
+    error = review_artifact_error(handoff_meta)
+    if error:
+        return error
+    pin = handoff_meta.get("head_sha")
     if pin is None:
         return None
     task = kb.get_task(conn, task_id)
@@ -220,6 +248,9 @@ def live_review_head_error(conn, task_id: str) -> str | None:
     ).fetchone()
     run = kb.get_run(conn, event["run_id"]) if event and event["run_id"] else None
     meta = (run.metadata or {}) if run else {}
+    error = review_artifact_error(meta)
+    if error:
+        return error
     pin, url = meta.get("head_sha"), meta.get("published_pr") or meta.get("url")
     if not pin or not url:
         return None
