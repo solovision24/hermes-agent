@@ -459,8 +459,8 @@ _GOAL_GATE_MESSAGES = {
 
 
 def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
-    """Goal-mode stage gate: assess readiness for review, full acceptance for
-    completion. ``blocked`` gets its own
+    """Goal-mode completion gate (review admission lives at the domain boundary).
+    ``blocked`` gets its own
     guidance; any other non-``done`` verdict gets the ``continue`` guidance.
     A broken judge fails open (logged) so it cannot permanently wedge work."""
     if not task or not task.goal_mode or not _goal_judge_available():
@@ -471,8 +471,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
         try:
-            from hermes_cli.kanban_stages import judge_kwargs
-            scope_kwargs: dict = judge_kwargs("review" if tool_name == "kanban_request_review" else "completion")
+            scope_kwargs: dict = {}
             if "\n\nOwner-bounded review scope" in (task.body or ""):
                 scope_kwargs["goal_max_chars"] = 24000
             verdict, reason, _, _, transport_failed = judge_goal(

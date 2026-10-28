@@ -884,14 +884,8 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, stag
 
 def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
                      continue_hint: str) -> Optional[str]:
-    """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
-    applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
-    None to allow."""
-    from hermes_cli.kanban_stages import dependent_context
-    stage = "review" if handoff == "review handoff" else "completion"
-    if stage == "review":
-        evidence += dependent_context(conn, tid)
-    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence, stage=stage)
+    """Full-goal completion gate; review admission runs at request_review's domain boundary."""
+    verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
                 f"the goal unachievable — {rejection}. {blocked_hint}")
