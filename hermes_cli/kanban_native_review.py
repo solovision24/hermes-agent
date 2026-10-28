@@ -33,16 +33,30 @@ def native_review_snapshot(conn, task_id: str, review_task_id: str, run_id: int,
     target = kb.get_task(conn, task_id)
     review_task = kb.get_task(conn, review_task_id)
     run = kb.get_run(conn, run_id)
-    implementers = sorted({r.profile for r in kb.list_runs(conn, task_id) if r.profile})
+    # Later reviewer-owned bookkeeping/acceptance retries are not authorship of
+    # the immutable artifact already independently reviewed. Never use today's
+    # assignee to retroactively label a premerge review self-review.
+    implementers = sorted({r.profile for r in kb.list_runs(conn, task_id)
+                           if r.profile and run is not None and r.started_at <= run.started_at})
     if (target is None or review_task is None or review_task_id == task_id
             or review_task.created_by != "github-webhook"
             or review_task.status not in {"done", "archived"}
             or run is None or run.task_id != review_task_id
             or run.profile != "orion" or run.profile in implementers
-            or target.assignee == run.profile or not implementers
+            or not implementers
             or run.status != "done" or run.outcome != "completed" or run.error
             or not run.ended_at or run.ended_at < run.started_at):
         raise ValueError("native evidence requires an independent dispatched Orion review run")
+    if target.assignee == run.profile:
+        # An owner change is bookkeeping only when its durable provenance is
+        # strictly after the independent review. A pre-review reviewer-owned
+        # implementation card is not rescued by an absence of author metadata.
+        assignments = [e for e in kb.list_events(conn, task_id) if e.kind == "assigned"]
+        last_assignment = max(assignments, key=lambda e: e.id) if assignments else None
+        if (last_assignment is None or last_assignment.created_at <= run.ended_at
+                or (last_assignment.payload or {}).get("assignee") != run.profile
+                or (last_assignment.payload or {}).get("from") not in implementers):
+            raise ValueError("reviewer-owned target requires an audited post-review owner handoff")
     runs = kb.list_runs(conn, review_task_id)
     if not runs or max(r.id for r in runs) != run_id:
         raise ValueError("native review is superseded by a later run")

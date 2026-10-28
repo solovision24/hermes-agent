@@ -1626,6 +1626,13 @@ def check_respawn_guard(
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    from hermes_cli.kanban_recovery import remediation_allows
+    pr_urls = {m.group(0) for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id=? AND created_at>=?",
+        (task_id, pr_cutoff),
+    ) for m in _RESPAWN_GUARD_PR_URL_RE.finditer(_kb._lossy_text(c["body"]) or "")}
+    if pr_urls and remediation_allows(conn, task_id, pr_urls):
+        return None
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
