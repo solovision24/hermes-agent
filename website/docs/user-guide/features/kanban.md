@@ -632,6 +632,35 @@ parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
 
+### Resume a triage task without rewriting its spec
+
+After resolving the cause of a triage escalation, an operator can continue the
+same card with its existing specification:
+
+```bash
+hermes kanban resume-triage t_abc --reason "Missing capability restored; original scope remains valid" --json
+```
+
+Unlike `specify`, this single-card operation never calls an LLM or changes the
+title, body, assignee, skills, parents, workspace, branch, completion contract or
+attachments. The API is `hermes_cli.kanban_triage.resume_triage_task(conn,
+task_id, author=..., reason=...)`. Both author and reason must be nonblank.
+
+The transaction requires the current state to be `triage`, with no outstanding
+claim, worker identity, current-run pointer or open run. It refuses ambiguous
+ownership rather than reclaiming or killing a worker. A `triage_resumed` event
+records actor, reason and `triage -> todo` atomically with an audit comment.
+Normal readiness recomputation then reapplies the existing parent and
+review-resume routing: open parents keep the card in `todo`; eligible work
+returns to `ready` (or its recorded `review` phase). Read back the card before
+expecting dispatch. Failure and block-recurrence counters are preserved.
+
+This is an explicit operator disposition of changed conditions, not an automatic
+unblock loop, review verdict, completion, merge or release. It cannot resume a
+card already in `ready` or `running`, waive acceptance or recover over a healthy
+claim. Installation and actual runtime recovery require their own authorized
+release and readback evidence.
+
 ## Enabling tools for a chat profile
 
 The Desktop Kanban plugin displays the board; it does not grant the chat agent

@@ -451,6 +451,12 @@ _SPECS = [
          help="Flesh out a triage-column task into a concrete spec (title + "
               "body) and promote it to todo. Uses the auxiliary LLM "
               "configured under auxiliary.triage_specifier."),
+    _cmd("resume-triage", [
+        _TASK_ID,
+        _arg("--reason", required=True, help="Changed conditions justifying continuation (durable audit)"),
+        _json_flag(),
+    ], help="Resume one idle triage task with its exact existing spec; no LLM. "
+            "Refuses outstanding claims/runs and rechecks parent readiness."),
     _cmd("decompose", _triage_sweep_args("decompose", "Decompose", "decomposer"),
          help="Decompose a triage-column task into a graph of child tasks "
               "routed to specialist profiles by description. Falls back "
