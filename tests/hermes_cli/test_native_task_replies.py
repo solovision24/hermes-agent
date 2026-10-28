@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from hermes_cli.native_task_replies import (
-    ReplyConflict, ReplyScope, ReplyUnauthorized, current_generation, install_schema, reply,
+    ReplyConflict, ReplyScope, ReplyUnauthorized, board_generation, current_generation, install_schema, reply,
 )
 
 
@@ -28,14 +28,15 @@ def board(tmp_path):
     path = tmp_path / "kanban.db"
     with _connection(path) as conn:
         conn.execute("INSERT INTO tasks VALUES ('t_one', 'chip', 1)")
+        native_board = board_generation(conn)
         generation = current_generation(conn, "t_one")
-    return path, ReplyScope("install-1", "owner-1", "inc-1", "chip", "default", "t_one", generation, "thread-1")
+    return path, ReplyScope("install-1", "owner-1", "inc-1", "chip", "default", native_board, "t_one", generation, "thread-1")
 
 
 def _send(path, scope, *, body="hello", revision=0, key="key-1", authorize=None, board="default"):
     with _connection(path) as conn:
         return reply(conn, scope=scope, body=body, expected_revision=revision,
-                     idempotency_key=key, canonical_board=board,
+                     idempotency_key=key, canonical_board=board, canonical_db_path=path,
                      authorize=authorize if authorize is not None else lambda _: True)
 
 
@@ -113,9 +114,24 @@ def test_missing_resolver_and_body_bound(board):
     path, scope = board
     with _connection(path) as conn, pytest.raises(ReplyUnauthorized):
         reply(conn, scope=scope, body="hello", expected_revision=0,
-              idempotency_key="key-1", canonical_board="default", authorize=None)
+              idempotency_key="key-1", canonical_board="default", canonical_db_path=path, authorize=None)
     with pytest.raises(ValueError, match="16384"):
         _send(path, scope, body="é" * 8193)
+
+
+def test_physical_board_identity_and_recreated_board(board, tmp_path):
+    path, scope = board
+    with _connection(path) as conn, pytest.raises(ReplyUnauthorized):
+        reply(conn, scope=scope, body="hello", expected_revision=0,
+              idempotency_key="key-1", canonical_board="default",
+              canonical_db_path=tmp_path / "foreign.db", authorize=lambda _: True)
+    foreign = tmp_path / "foreign.db"
+    with _connection(foreign) as conn:
+        conn.execute("INSERT INTO tasks VALUES ('t_one','chip',1)")
+        assert board_generation(conn) != scope.board_generation
+        current_generation(conn, "t_one")
+    with pytest.raises(ReplyConflict, match="board generation"):
+        _send(foreign, scope)
 
 
 def test_real_native_board_schema_commit_and_reopen(tmp_path):
@@ -127,14 +143,15 @@ def test_real_native_board_schema_commit_and_reopen(tmp_path):
                      "VALUES ('t_real','real task','ready',1,'chip')")
         conn.commit()
         install_schema(conn)
+        native_board = board_generation(conn)
         generation = current_generation(conn, "t_real")
         conn.commit()
-        scope = ReplyScope("install-1", "owner-1", "inc-1", "chip", "default", "t_real", generation, "thread-1")
+        scope = ReplyScope("install-1", "owner-1", "inc-1", "chip", "default", native_board, "t_real", generation, "thread-1")
         first = reply(conn, scope=scope, body="  exact bytes  ", expected_revision=0,
-                      idempotency_key="idem", canonical_board="default", authorize=lambda _: True)
+                      idempotency_key="idem", canonical_board="default", canonical_db_path=path, authorize=lambda _: True)
     with kanban_db_connect.connect_closing(db_path=path) as conn:
         second = reply(conn, scope=scope, body="  exact bytes  ", expected_revision=0,
-                       idempotency_key="idem", canonical_board="default", authorize=lambda _: True)
+                       idempotency_key="idem", canonical_board="default", canonical_db_path=path, authorize=lambda _: True)
         assert second == first
         assert conn.execute("SELECT body FROM task_comments WHERE id=?", (first.native_reply_id,)).fetchone()[0] == "  exact bytes  "
         assert conn.execute("SELECT kind FROM task_events WHERE task_id='t_real'").fetchone()[0] == "commented"

@@ -12,6 +12,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 
@@ -36,6 +37,7 @@ class ReplyScope:
     owner_incarnation: str
     profile: str
     board: str
+    board_generation: str
     task_id: str
     task_generation: str
     thread_id: str
@@ -53,6 +55,9 @@ class ReplyReceipt:
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS native_task_reply_board_identity (
+ singleton INTEGER PRIMARY KEY CHECK(singleton = 1), generation TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS native_task_reply_generations (
  task_id TEXT PRIMARY KEY, generation TEXT NOT NULL
 );
@@ -66,6 +71,7 @@ CREATE TABLE IF NOT EXISTS native_task_reply_receipts (
  thread_id TEXT NOT NULL, expected_revision INTEGER NOT NULL,
  idempotency_key TEXT NOT NULL, body_hash TEXT NOT NULL,
  owner TEXT NOT NULL, profile TEXT NOT NULL, board TEXT NOT NULL,
+ board_generation TEXT NOT NULL,
  task_id TEXT NOT NULL, task_generation TEXT NOT NULL,
  native_reply_id INTEGER NOT NULL, native_revision INTEGER NOT NULL,
  PRIMARY KEY (installation, owner_incarnation, thread_id, expected_revision, idempotency_key)
@@ -80,10 +86,16 @@ def install_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
 
 
+def board_generation(conn: sqlite3.Connection) -> str:
+    """Issue an incarnation in the physical board DB, never a display slug."""
+    conn.execute("INSERT OR IGNORE INTO native_task_reply_board_identity VALUES (1, ?)", (uuid.uuid4().hex,))
+    return conn.execute("SELECT generation FROM native_task_reply_board_identity WHERE singleton=1").fetchone()[0]
+
+
 def _require_scope(scope: ReplyScope) -> None:
     if not isinstance(scope, ReplyScope) or not _BOARD.fullmatch(scope.board):
         raise ValueError("explicit canonical board slug required")
-    for name in ("installation", "owner", "owner_incarnation", "profile", "task_id", "task_generation", "thread_id"):
+    for name in ("installation", "owner", "owner_incarnation", "profile", "board_generation", "task_id", "task_generation", "thread_id"):
         value = getattr(scope, name)
         if not isinstance(value, str) or not value or len(value) > 256:
             raise ValueError(f"invalid {name}")
@@ -122,19 +134,22 @@ def _revision(conn: sqlite3.Connection, task_id: str) -> int:
 
 def reply(
     conn: sqlite3.Connection, *, scope: ReplyScope, expected_revision: int,
-    idempotency_key: str, body: str, canonical_board: str,
+    idempotency_key: str, body: str, canonical_board: str, canonical_db_path: Path,
     authorize: Callable[[ReplyScope], bool] | None,
 ) -> ReplyReceipt:
     """Atomically authorize, reconcile or insert an exact-byte comment and receipt.
 
-    ``canonical_board`` comes from the already attested DB connection, NOT the
-    request. Caller verifies DB path/board pin and authenticates scope upstream.
+    ``canonical_board`` and ``canonical_db_path`` come from the authenticated
+    installation board registry, NOT the request or ambient board pointer.
     Callback must re-read current owner/incarnation, profile and source grant.
     An unknown response after commit can be reconciled by the identical call.
     """
     _require_scope(scope)
     if canonical_board != scope.board:
         raise ReplyUnauthorized("foreign board")
+    main = next((row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"), None)
+    if not main or Path(main).resolve() != canonical_db_path.resolve():
+        raise ReplyUnauthorized("board DB is not the attested source")
     if authorize is None:
         raise ReplyUnauthorized("native owner resolver unavailable")
     if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 0:
@@ -151,6 +166,11 @@ def reply(
         raise ValueError("reply requires its own immediate transaction")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        native_board = conn.execute(
+            "SELECT generation FROM native_task_reply_board_identity WHERE singleton=1"
+        ).fetchone()
+        if native_board is None or native_board[0] != scope.board_generation:
+            raise ReplyConflict("board generation changed")
         task = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (scope.task_id,)).fetchone()
         if task is None:
             raise ReplyConflict("task missing")
@@ -163,14 +183,14 @@ def reply(
             raise ReplyUnauthorized("current owner/profile binding denied")
         key = (scope.installation, scope.owner_incarnation, scope.thread_id, expected_revision, idempotency_key)
         prior = conn.execute(
-            "SELECT body_hash, owner, profile, board, task_id, task_generation, native_reply_id, native_revision "
+            "SELECT body_hash, owner, profile, board, board_generation, task_id, task_generation, native_reply_id, native_revision "
             "FROM native_task_reply_receipts WHERE installation=? AND owner_incarnation=? "
             "AND thread_id=? AND expected_revision=? AND idempotency_key=?", key,
         ).fetchone()
         if prior is not None:
-            if tuple(prior[:6]) != (digest, scope.owner, scope.profile, scope.board, scope.task_id, scope.task_generation):
+            if tuple(prior[:7]) != (digest, scope.owner, scope.profile, scope.board, scope.board_generation, scope.task_id, scope.task_generation):
                 raise ReplyConflict("idempotency key reused with different identity or bytes")
-            receipt = ReplyReceipt(scope.board, "task", scope.task_id, scope.task_generation, prior[6], prior[7], idempotency_key)
+            receipt = ReplyReceipt(scope.board, "task", scope.task_id, scope.task_generation, prior[7], prior[8], idempotency_key)
         else:
             collision = conn.execute(
                 "SELECT 1 FROM native_task_reply_receipts WHERE installation=? AND owner_incarnation=? "
@@ -194,9 +214,9 @@ def reply(
                 (scope.task_id, '{"source":"native_task_reply"}'),
             )
             conn.execute(
-                "INSERT INTO native_task_reply_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (*key, digest, scope.owner, scope.profile, scope.board, scope.task_id,
-                 scope.task_generation, reply_id, reply_id),
+                "INSERT INTO native_task_reply_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*key, digest, scope.owner, scope.profile, scope.board, scope.board_generation,
+                 scope.task_id, scope.task_generation, reply_id, reply_id),
             )
             receipt = ReplyReceipt(scope.board, "task", scope.task_id, scope.task_generation, reply_id, reply_id, idempotency_key)
         conn.commit()
