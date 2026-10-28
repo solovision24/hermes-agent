@@ -26,6 +26,39 @@ REVIEW_TASK = "t_5e785fd1"
 REVIEW_RUN = 15992
 
 
+@pytest.mark.platforms("posix")
+def test_later_reviewer_bookkeeping_is_not_premerge_implementation(native_board):
+    from hermes_cli.kanban_native_review import native_review_snapshot
+    conn, data, _ = native_board
+    kb.assign_task(conn, TARGET, "orion")
+    kb._synthesize_ended_run(conn, TARGET, outcome="blocked", profile="orion",
+                            summary="Postmerge acceptance retry only")
+    pr = data["pr"]
+    proof = native_review_snapshot(conn, TARGET, REVIEW_TASK, REVIEW_RUN,
+        pr["html_url"], pr["head"]["sha"], pr["merge_commit_sha"])
+    assert "orion" not in proof["implementers"]
+    assert "quill" in proof["implementers"]
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("fault", ["missing", "before-review", "wrong-previous-owner"])
+def test_reviewer_owned_target_requires_a_real_postreview_owner_event(native_board, fault):
+    from hermes_cli.kanban_native_review import native_review_snapshot
+    conn, data, _ = native_board
+    kb.assign_task(conn, TARGET, "orion")
+    if fault == "missing":
+        conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='assigned'", (TARGET,))
+    if fault == "before-review":
+        conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=? AND kind='assigned'", (TARGET,))
+    if fault == "wrong-previous-owner":
+        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='assigned'",
+                     (json.dumps({"assignee": "orion", "from": "unknown"}), TARGET))
+    pr = data["pr"]
+    with pytest.raises(ValueError, match="audited post-review"):
+        native_review_snapshot(conn, TARGET, REVIEW_TASK, REVIEW_RUN,
+            pr["html_url"], pr["head"]["sha"], pr["merge_commit_sha"])
+
+
 @pytest.fixture
 def native_board(tmp_path, monkeypatch):
     import pwd

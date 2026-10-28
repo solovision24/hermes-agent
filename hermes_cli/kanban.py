@@ -212,6 +212,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "reconcile-pr-contract", "reconcile-review-scope",
+    "authorize-pr-remediation", "reconcile-local-acceptance",
     "gc", "resume-triage",
 })
 
@@ -1374,6 +1375,10 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+from hermes_cli.kanban_recovery import cmd_authorize_pr_remediation, cmd_recovery_version
+from hermes_cli.kanban_local_acceptance import cmd_reconcile_local_acceptance
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
@@ -1387,6 +1392,9 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reconcile-pr-contract": _cmd_reconcile_pr_contract,
+    "recovery-version": cmd_recovery_version,
+    "authorize-pr-remediation": cmd_authorize_pr_remediation,
+    "reconcile-local-acceptance": cmd_reconcile_local_acceptance,
     "reconcile-review-scope": _cmd_reconcile_review_scope,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

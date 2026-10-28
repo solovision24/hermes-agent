@@ -341,6 +341,24 @@ _SPECS = [
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    _cmd("recovery-version", [_TASK_ID], help="Read the current specification/contract recovery version"),
+    _cmd("authorize-pr-remediation", [
+        _TASK_ID,
+        _arg("--operator", required=True), _arg("--confirm", required=True),
+        _arg("--pr-url", required=True), _arg("--head-sha", required=True),
+        _arg("--branch", required=True), _arg("--head-repository", required=True),
+        _arg("--assignee", required=True), _arg("--reason", required=True),
+    ], help="Attended owner authorization for SAME card/PR/branch/head; never claims or reassigns"),
+    _cmd("reconcile-local-acceptance", [
+        _TASK_ID,
+        _arg("--operator", required=True), _arg("--confirm", required=True),
+        _arg("--contract-version", required=True),
+        _arg("--pr-url", required=True), _arg("--head-sha", required=True),
+        _arg("--merge-sha", required=True), _arg("--review-url", required=True),
+        _arg("--native-review-task"), _arg("--native-review-run", type=int),
+        _arg("--reason", required=True),
+        _arg("--test-plan", required=True, help="Owner-selected JSON {cwd,sha,commands:[argv,...]}; commands really execute"),
+    ], help="Audit exact merged-PR local test acceptance without changing the contract or completing/releasing"),
     _cmd("reconcile-pr-contract", [
         _TASK_ID,
         _arg("--operator", required=True, help="Local OS account authorizing this exception"),
