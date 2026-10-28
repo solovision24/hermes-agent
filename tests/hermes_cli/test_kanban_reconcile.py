@@ -199,7 +199,8 @@ def test_cli_review_handoff_still_calls_goal_judge_on_revised_scope(board, monke
     body = kb.get_task(conn, task).body
 
     seen = []
-    def judge(t, evidence):
+    def judge(t, evidence, *, stage):
+        assert stage == "review"
         seen.append((t.body, evidence))
         return "continue", "the evidence does not meet the bounded review scope"
     monkeypatch.setattr(cli, "_goal_mode_handoff_rejection", judge)
@@ -209,7 +210,9 @@ def test_cli_review_handoff_still_calls_goal_judge_on_revised_scope(board, monke
     parser = build_parser(wrapper.add_subparsers(dest="top"))
     args = parser.parse_args(["request-review", task, "--summary", "missing evidence", "--reviewer", "orion"])
     assert cli.kanban_command(args) == 1
-    assert seen == [(body, "missing evidence")]
+    assert len(seen) == 1 and seen[0][0] == body
+    assert seen[0][1].startswith("missing evidence")
+    assert child in seen[0][1]
     assert kb.get_task(conn, task).status == "ready"
     assert "rejected by judge" in capsys.readouterr().err
 

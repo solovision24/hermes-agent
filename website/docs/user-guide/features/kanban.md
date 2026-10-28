@@ -47,6 +47,36 @@ The eight canonical collaboration patterns are catalogued in [Collaboration patt
 
 ## PR completion contracts
 
+### Separate review admission from merge and release
+
+For goal-mode tasks, `request_review` uses a fixed review-admission judge policy:
+the implementation and relevant verification must be ready for independent
+inspection, not already independently approved, merged or deployed. The original
+goal body remains intact. Producer/live integration and release evidence stay
+mandatory at their later stage; missing future delivery proof is not itself a
+source-review admission failure. Actual required implementation test failures,
+security/privacy/auth defects, data-loss risks and unauthorized external actions
+remain stops. The [cross-project handoff template](../../developer-guide/staged-engineering-handoff)
+records stage evidence, exact-head review, bounded dependent ownership and release proof.
+
+The shared `request_review` domain boundary runs the judge for CLI, worker tools
+and dashboard callers, once per admission, outside the write transaction. It
+rechecks parent/child scope, ownership and run state under the transition lock.
+Declared `required_tests` must contain commands with `passed` or `success` status;
+nonempty `safety_blockers` and malformed supplied `head_sha` reject even non-goal
+handoffs. Metadata absence is not proof of safety or tests. Independent inspection
+is still mandatory; metadata is neither an approval authority nor a bypass.
+
+Completion retains full-goal judging and applicable PR required-check acceptance.
+Structured head-pinned review handoffs additionally require an independent native
+review claim, matching `reviewed_head`, affirmative `review_outcome` and concrete
+`reviewer_checks` at completion. A declared published PR is re-read as the review
+assignee and a changed/unavailable head refuses completion. Legacy handoffs with
+no structured head pin retain their prior behavior. Owner-ratified deferrals are
+revalidated at review/completion; changed body/criterion/owner/link or onward
+deferral must be coordinated, not silently inherited. Review admission never
+completes a task, releases its dependent children, merges or claims anything live.
+
 Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
 `https://github.com/OWNER/REPO/pull/123` URL for existing work). `kanban_create`
 accepts the same `completion_contract`. Use `local-only` for intentionally local

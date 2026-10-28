@@ -900,6 +900,7 @@ def judge_goal(
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
+    lifecycle_stage: Optional[str] = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -907,6 +908,12 @@ def judge_goal(
     blocked / continue / wait / skipped. ``parse_failed`` means unusable output; transport errors
     set ``transport_failed`` instead and fail-open to ``continue``.
     """
+    system_prompt = JUDGE_SYSTEM_PROMPT
+    if lifecycle_stage is not None:
+        if lifecycle_stage != "review":
+            raise ValueError("unknown goal lifecycle stage")
+        from hermes_cli.kanban_stages import REVIEW_ADMISSION_POLICY
+        system_prompt += "\n\n" + REVIEW_ADMISSION_POLICY
     if not goal.strip():
         return "skipped", "empty goal", False, None, False
     if not last_response.strip():
@@ -926,7 +933,7 @@ def judge_goal(
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
         goal=_truncate(goal, goal_max_chars),
-        response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+        response=_truncate(last_response, 24000 if lifecycle_stage == "review" else _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes)
         + (JUDGE_DELEGATIONS_BLOCK_TEMPLATE.format(count=active_delegations) if active_delegations > 0 else ""),
         current_time=safe_strftime(datetime.now(tz=timezone.utc).astimezone(), "%Y-%m-%d %H:%M:%S %Z"),
@@ -943,7 +950,7 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(**common)
 
     try:
-        raw = _call_goal_judge_llm(call_llm, JUDGE_SYSTEM_PROMPT, prompt, timeout)
+        raw = _call_goal_judge_llm(call_llm, system_prompt, prompt, timeout)
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
         # re-authenticate, not to context-length / model debugging (#42177). Still fails open.
