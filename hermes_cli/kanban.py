@@ -32,6 +32,7 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
+from hermes_cli.kanban_triage import cmd_resume_triage
 
 
 # --- Flag parsing helpers ---
@@ -211,7 +212,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "reconcile-pr-contract", "reconcile-review-scope",
-    "gc",
+    "gc", "resume-triage",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
@@ -825,8 +826,8 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
-    """Goal judge for every terminal worker handoff (including review).
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str, *, stage: str = "completion"):
+    """Stage-aware goal judge: review readiness is not whole-program completion.
 
     Returns ``(verdict, reason_or_None)``: ``"done"`` allows; ``"blocked"`` = judge ruled the goal
     unachievable; ``"continue"``/``"wait"`` reject with the judge's reason. Judge failures allow
@@ -857,7 +858,8 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
-            scope_kwargs: dict = {}
+            from hermes_cli.kanban_stages import judge_kwargs
+            scope_kwargs: dict = judge_kwargs(stage)
             if "\n\nOwner-bounded review scope" in (task.body or ""):
                 scope_kwargs["goal_max_chars"] = 24000
             verdict, reason, _, _, transport_failed = judge_goal(
@@ -883,9 +885,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
 
 def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: str,
                      continue_hint: str) -> Optional[str]:
-    """Goal-mode judge gate shared by ``complete`` / ``request-review`` (mirrors tools/kanban_tools.py);
-    applied to every terminal handoff so request-review can't bypass it. Returns the error line, or
-    None to allow."""
+    """Full-goal completion gate; review admission runs at request_review's domain boundary."""
     verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
@@ -1042,12 +1042,6 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        gate_err = _goal_gate_error(
-            conn, tid, summary or "", "review handoff",
-            "Record the block with kanban block instead of requesting review.",
-            "Provide acceptance evidence matching the task.")
-        if gate_err:
-            return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
             expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
@@ -1401,6 +1395,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+    "resume-triage": cmd_resume_triage,
     "gc": _cmd_gc,
 }
 

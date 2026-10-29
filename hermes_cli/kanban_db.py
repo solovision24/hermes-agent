@@ -2758,6 +2758,9 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    from hermes_cli.kanban_stages import declared_evidence_error, review_pin_error, live_review_head_error
+    if declared_evidence_error(metadata) or review_pin_error(conn, task_id, metadata) or live_review_head_error(conn, task_id):
+        return False
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2769,6 +2772,11 @@ def complete_task(
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
+            return False
+        from hermes_cli.kanban_stages import validate_scope_provenance
+        if validate_scope_provenance(conn, task_id):
+            return False
+        if review_pin_error(conn, task_id, metadata):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
@@ -3383,6 +3391,15 @@ def request_review(
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
     metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    # One admission judge for every surface, including dashboard/domain callers.
+    # Network work stays outside write_txn; bind the verdict to the scope/run
+    # and dependent ownership snapshot rechecked under the transition lock.
+    from hermes_cli.kanban_stages import admission_snapshot, admission_error
+    admission_before = admission_snapshot(conn, task_id)
+    if admission_before is not None:
+        error = admission_error(conn, get_task(conn, task_id), summary, metadata)
+        if error:
+            return _ret(False, error)
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
@@ -3391,6 +3408,12 @@ def request_review(
         with write_txn(conn):
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
+            if admission_snapshot(conn, task_id) != admission_before:
+                return _ret(False, "review scope/run/ownership changed during admission; retry")
+            from hermes_cli.kanban_stages import validate_scope_provenance
+            scope_error = validate_scope_provenance(conn, task_id)
+            if scope_error:
+                return _ret(False, scope_error)
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),

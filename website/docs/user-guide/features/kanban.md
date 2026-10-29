@@ -47,6 +47,39 @@ The eight canonical collaboration patterns are catalogued in [Collaboration patt
 
 ## PR completion contracts
 
+### Separate review admission from merge and release
+
+For goal-mode tasks, `request_review` uses a fixed review-admission judge policy:
+the implementation and relevant verification must be ready for independent
+inspection, not already independently approved, merged or deployed. The original
+goal body remains intact. Producer/live integration and release evidence stay
+mandatory at their later stage; missing future delivery proof is not itself a
+source-review admission failure. Actual required implementation test failures,
+security/privacy/auth defects, data-loss risks and unauthorized external actions
+remain stops. The [cross-project handoff template](../../developer-guide/staged-engineering-handoff)
+records stage evidence, exact-head review, bounded dependent ownership and release proof.
+
+The shared `request_review` domain boundary runs the judge for CLI, worker tools
+and dashboard callers, once per admission, outside the write transaction. It
+rechecks parent/child scope, ownership and run state under the transition lock.
+Declared `required_tests` must contain commands with `passed` or `success` status;
+nonempty `safety_blockers` and malformed supplied `head_sha` reject even non-goal
+handoffs. Metadata absence is not proof of safety or tests. Independent inspection
+is still mandatory; metadata is neither an approval authority nor a bypass.
+
+Completion retains full-goal judging and applicable PR required-check acceptance.
+Structured head-pinned review handoffs additionally require an independent native
+review claim, matching `reviewed_head`, affirmative `review_outcome` and concrete
+`reviewer_checks` at completion. A declared published PR is re-read as the review
+assignee and a changed/unavailable head refuses completion. Declaring `published_pr`
+or native intake `url` requires a full lowercase 40-character `head_sha` at admission;
+missing/malformed pins and invalid/conflicting PR URLs fail closed, including when
+completing historical PR handoffs admitted by an older runtime. Only legacy non-PR
+handoffs without a structured head pin retain their prior behavior. Owner-ratified deferrals are
+revalidated at review/completion; changed body/criterion/owner/link or onward
+deferral must be coordinated, not silently inherited. Review admission never
+completes a task, releases its dependent children, merges or claims anything live.
+
 Declare PR work at creation with `--completion-contract OWNER/REPO` (or an exact
 `https://github.com/OWNER/REPO/pull/123` URL for existing work). `kanban_create`
 accepts the same `completion_contract`. Use `local-only` for intentionally local
@@ -598,6 +631,35 @@ unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
+
+### Resume a triage task without rewriting its spec
+
+After resolving the cause of a triage escalation, an operator can continue the
+same card with its existing specification:
+
+```bash
+hermes kanban resume-triage t_abc --reason "Missing capability restored; original scope remains valid" --json
+```
+
+Unlike `specify`, this single-card operation never calls an LLM or changes the
+title, body, assignee, skills, parents, workspace, branch, completion contract or
+attachments. The API is `hermes_cli.kanban_triage.resume_triage_task(conn,
+task_id, author=..., reason=...)`. Both author and reason must be nonblank.
+
+The transaction requires the current state to be `triage`, with no outstanding
+claim, worker identity, current-run pointer or open run. It refuses ambiguous
+ownership rather than reclaiming or killing a worker. A `triage_resumed` event
+records actor, reason and `triage -> todo` atomically with an audit comment.
+Normal readiness recomputation then reapplies the existing parent and
+review-resume routing: open parents keep the card in `todo`; eligible work
+returns to `ready` (or its recorded `review` phase). Read back the card before
+expecting dispatch. Failure and block-recurrence counters are preserved.
+
+This is an explicit operator disposition of changed conditions, not an automatic
+unblock loop, review verdict, completion, merge or release. It cannot resume a
+card already in `ready` or `running`, waive acceptance or recover over a healthy
+claim. Installation and actual runtime recovery require their own authorized
+release and readback evidence.
 
 ## Enabling tools for a chat profile
 
