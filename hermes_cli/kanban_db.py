@@ -5009,18 +5009,48 @@ def _validate_block_prompt_revision_input(
         or any(ord(c) < 32 and c not in "\n\r\t" for c in reason)
     ):
         raise BlockPromptRevisionError("reason must be a non-empty string", "invalid_reason")
+    # Match the companion's label grammar, including decorated/fullwidth labels.
+    # Never let a second spelling silently overwrite an already checked field.
     fields = {}
-    for label, text in re.findall(r"(?im)^\s*(NEED|OPTIONS?|WHY)\s*:[ \t]*([^\r\n]*)", reason):
-        label = "OPTIONS" if label.upper() in ("OPTION", "OPTIONS") else label.upper()
-        if label in fields or not text.strip():
-            raise BlockPromptRevisionError("malformed labelled prompt", "invalid_reason")
-        fields[label] = text.strip()
+    current = None
+    for line in re.split(r"\r?\n", reason):
+        match = re.match(r"^\s*(?:[-*]\s*)?\**(NEED|OPTIONS?|WHY)\**\s*[:：]\s*(.*)$", line, re.I)
+        if match:
+            label, text = match.groups()
+            label = "OPTIONS" if label.upper() in ("OPTION", "OPTIONS") else label.upper()
+            if label in fields or not text.strip():
+                raise BlockPromptRevisionError("malformed labelled prompt", "invalid_reason")
+            current = label
+            fields[label] = text.strip()
+        elif current and line.strip():
+            fields[current] += " " + line.strip()
     if fields and "NEED" not in fields:
         raise BlockPromptRevisionError("labelled prompt requires NEED", "invalid_reason")
     if "OPTIONS" in fields:
         choices = [choice.strip() for choice in fields["OPTIONS"].split("|")]
-        if not 2 <= len(choices) <= 5 or any(not c or len(c) > 48 for c in choices):
+        # Literal pipes only; no renderer-specific alternate separators or
+        # wrapping-marker cleanup may reinterpret a revised decision value.
+        if (not 2 <= len(choices) <= 5 or any(
+                not c or len(c.encode("utf-16-le", errors="surrogatepass")) // 2 > 48
+                for c in choices)
+                or len({c.lower() for c in choices}) != len(choices)):
             raise BlockPromptRevisionError("OPTIONS requires 2-5 short answers", "invalid_reason")
+    ask = fields.get("NEED", reason).strip()
+    automatic = re.search(
+        r"\b(?:retry|rerun|restart|resume|recover|requeue)\b[^\n.!?]{0,60}\bautomatically\b"
+        r"|\b(?:auto[- ]?(?:retry|rerun|restart|resume|recover|requeue)|no human (?:input|action) (?:needed|required))\b",
+        ask, re.I,
+    )
+    machine_failure = re.search(
+        r"\b(?:CI|build|test|worker|process|network|connection|service)\b[^\n.!?]{0,40}"
+        r"\b(?:failed|failure|timeout|timed out|unavailable|crashed)\b", ask, re.I,
+    )
+    human_ask = re.search(
+        r"\?|\b(?:choose|type|provide|approve|confirm|decide|select|which|what|should|may I|can you)\b",
+        ask, re.I,
+    )
+    if (automatic or machine_failure) and not human_ask:
+        raise BlockPromptRevisionError("machine-actionable reason is not a human ask", "invalid_reason")
     if kind != "needs_input":
         raise BlockPromptRevisionError(
             "only the needs_input human lane can revise a block prompt", "invalid_kind",

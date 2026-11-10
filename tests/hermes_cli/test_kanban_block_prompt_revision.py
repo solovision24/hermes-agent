@@ -4,10 +4,37 @@ from __future__ import annotations
 
 from pathlib import Path
 import threading
+import json
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+REVISION_CASES = json.loads((Path(__file__).parent / "fixtures/block_prompt_revision_cases.json").read_text())
+
+
+@pytest.mark.parametrize("case", REVISION_CASES, ids=lambda case: case["reason"])
+def test_cross_layer_revision_contract_preserves_state(board, case):
+    task_id, prompt = _blocked_human_task(board)
+    before = {
+        table: [tuple(row) for row in board.execute(f"SELECT * FROM {table}")]
+        for table in ("tasks", "task_runs", "task_events")
+    }
+    def revise():
+        return kb.revise_block_prompt(board, task_id, reason=case["reason"], kind="needs_input",
+                                      expected_event_id=prompt.event_id, actor="owner")
+    if case["accepted"]:
+        revised = revise()
+        assert revised.reason == case["reason"]
+        assert kb.get_current_block_prompt(board, task_id) == revised
+    else:
+        with pytest.raises(kb.BlockPromptRevisionError) as caught:
+            revise()
+        assert caught.value.code == "invalid_reason"
+        assert [tuple(row) for row in board.execute("SELECT * FROM task_events")] == before["task_events"]
+    for table in ("tasks", "task_runs"):
+        assert [tuple(row) for row in board.execute(f"SELECT * FROM {table}")] == before[table]
 
 
 @pytest.fixture

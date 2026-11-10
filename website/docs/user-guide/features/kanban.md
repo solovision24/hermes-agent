@@ -61,6 +61,19 @@ never recover older choices. An explicit free-text revision omitting `OPTIONS`
 clears choices even when the question text is identical. Reasons are bounded to
 16,000 characters; labelled prompts need one nonempty NEED and optional WHY and
 2–5 pipe-separated answers of at most 48 characters when OPTIONS is present.
+Labels are case-insensitive and accept ASCII/fullwidth colons and list/bold
+decoration. Duplicate labels (including OPTION/OPTIONS aliases), empty labels,
+empty answers and case-insensitive duplicate answers are refused. Continuation
+lines belong to the preceding field. Revised answer values are literal: only
+`|` separates them; semicolons, commas, `//` and wrapping markers are not rewritten.
+
+Revision validation also rejects recognizable machine-failure/automatic-retry
+statements without a human question or request (for example `CI build failed:
+retry automatically`). An explicit human ask such as `Should we retry automatically?`
+or `Provide your preferred recovery window.` remains valid, as does unlabelled
+free text. This deterministic guard is not a semantic classifier: operators
+remain responsible for choosing the human lane, not relabelling machine work.
+Only NEED (or the whole free-text ask) is classified; WHY may describe failures.
 
 Reading/revising a prompt neither records a user's decision nor resumes work.
 A decision comment and explicit same-card unblock remain separate. Neither is
