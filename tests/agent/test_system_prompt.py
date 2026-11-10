@@ -130,6 +130,74 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_fresh_worker_prompt_owns_human_block_packet_without_leaking_to_chat(monkeypatch, tmp_path):
+    """Exercise prompt assembly, not merely the guidance constant or source text."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    with patch("agent.file_safety._resolve_active_profile_name", return_value="chip"):
+        worker = _make_agent(
+            valid_tool_names=["kanban_show", "kanban_block"],
+            _kanban_worker_guidance=KANBAN_GUIDANCE,
+            skip_context_files=True,
+        )
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            prompt = build_system_prompt(worker)
+            repeated = build_system_prompt(worker)
+
+    assert prompt == repeated
+    assert "Active Hermes profile: chip" in prompt
+    assert "If human action truly remains, YOU (the agent calling `kanban_block`)" in prompt
+    assert "`NEED: <plain-language person/action and exact resume/done condition>`" in prompt
+    assert "`OPTIONS: <answer> | <answer>` for 2–5" in prompt
+    assert "Omit OPTIONS for free-text answers, secure login/credentials" in prompt
+    assert "Never offer a button that implies ungranted approval" in prompt
+    assert "revise the current blocked prompt in place" in prompt
+    assert "Do not call `clarify`" in prompt
+    assert "kanban_submit_review" in prompt  # existing terminal-state instructions retained
+
+    with patch("agent.file_safety._resolve_active_profile_name", return_value="default"):
+        chat = _make_agent(valid_tool_names=["read_file"], skip_context_files=True)
+        normal_prompt = _stable_prompt(chat)
+    assert "Active Hermes profile: default" in normal_prompt
+    assert "If human action truly remains, YOU" not in normal_prompt
+
+
+def test_new_agent_worker_receives_packet_in_cached_system_prompt(monkeypatch, tmp_path):
+    """Real AIAgent initialization/tool wiring must carry the packet into the prompt."""
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "worker-home"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fixture")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[
+            {"function": {"name": "kanban_show"}},
+            {"function": {"name": "kanban_block"}},
+        ]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("agent.file_safety._resolve_active_profile_name", return_value="chip"),
+    ):
+        agent = AIAgent(
+            base_url="https://example.invalid/v1", api_key="dummy-key",
+            model="test-model", quiet_mode=True, skip_context_files=True,
+            skip_memory=True,
+        )
+        prompt = build_system_prompt(agent)
+        assert prompt == build_system_prompt(agent)
+    assert getattr(agent, "_kanban_worker_guidance")
+    assert "Active Hermes profile: chip" in prompt
+    assert "`NEED: <plain-language person/action and exact resume/done condition>`" in prompt
+    assert "`OPTIONS: <answer> | <answer>`" in prompt
+    assert "Never offer a button that implies ungranted approval" in prompt
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
