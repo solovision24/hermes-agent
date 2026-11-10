@@ -453,7 +453,7 @@ Every profile that works kanban tasks automatically gets the worker lifecycle â€
 1. On spawn, call `kanban_show()` to read title + body + parent handoffs + prior attempts + full comment thread.
 2. `cd $HERMES_KANBAN_WORKSPACE` (via the terminal tool) and do the work there.
 3. Call `kanban_heartbeat(note="...")` every few minutes during long operations. **If your work may run longer than 1 hour, call `kanban_heartbeat` at least once an hour** â€” the dispatcher reclaims tasks that have been running past `kanban.dispatch_stale_timeout_seconds` (default 4 h) with no heartbeat in the last hour, on the assumption the worker crashed without cleanup. A reclaim is benign (the task goes back to `ready` for re-dispatch without a failure-counter tick) but you lose your current run's progress.
-4. Complete with `kanban_complete(summary="...", metadata={...})`, or `kanban_block(reason="...")` if stuck.
+4. For an implementation PR requiring independent review, submit the same card with `kanban_submit_review(reviewer="orion", summary="...", metadata={...})`, including the exact PR head and verification evidence. This is a terminal Review handoff, not approval or completion. For work not requiring review, finish with `kanban_complete(summary="...", metadata={...})`. Reserve `kanban_block(reason="...")` for a genuine external need after recovery attempts; never block for routine review.
 
 The worker calling `kanban_block` owns the decision to involve a human and the current ask. First inspect the artifact, recheck the premise, use available tools and supported alternatives, and resolve reversible choices or qualified peer work without asking the user to debug it. Keep identity/OAuth, spend, send, legal, destructive actions, security and independent-review approvals gated. For a genuine external ask, put the plain-language packet **in the block reason itself**, not only in a comment or a later audit:
 
@@ -465,7 +465,7 @@ WHY: Both times are available on your calendar.
 
 `NEED` must say exactly what the person must do and when work resumes (under 140 characters, no task IDs, paths or jargon). Use `OPTIONS` only for two to five distinct, safe, complete answers; omit it for free-text, secure sign-in/credentials, or price/identity details. Never present an agent-owned repair or an ungranted approval as a one-tap choice. Put technical attempts, the next owner and checkpoint in a task comment. If the ask changes while blocked, revise the current prompt in place through a supported route rather than unblock/reblock solely to rewrite it.
 
-That final `kanban_complete` / `kanban_block` call is part of the worker
+That final `kanban_submit_review` / `kanban_complete` / `kanban_block` call is part of the worker
 protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.

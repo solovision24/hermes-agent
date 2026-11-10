@@ -159,7 +159,11 @@ def test_fresh_worker_prompt_owns_human_block_packet_without_leaking_to_chat(mon
     assert "Never offer a button that implies ungranted approval" in prompt
     assert "revise the current blocked prompt in place" in prompt
     assert "Do not call `clarify`" in prompt
-    assert "kanban_submit_review" in prompt  # existing terminal-state instructions retained
+    assert "`kanban_submit_review(reviewer=orion, summary=..., metadata=...)`" in prompt
+    assert "do not use `kanban_block` for routine review" in prompt
+    assert 'kanban_block(reason="review-required:' not in prompt
+    assert "`review_submitted` event" in prompt
+    assert "review submission is not approval, merge or release" in prompt
 
     with patch("agent.file_safety._resolve_active_profile_name", return_value="default"):
         chat = _make_agent(valid_tool_names=["read_file"], skip_context_files=True)
@@ -196,6 +200,8 @@ def test_new_agent_worker_receives_packet_in_cached_system_prompt(monkeypatch, t
     assert "`NEED: <plain-language person/action and exact resume/done condition>`" in prompt
     assert "`OPTIONS: <answer> | <answer>`" in prompt
     assert "Never offer a button that implies ungranted approval" in prompt
+    assert "`kanban_submit_review(reviewer=orion, summary=..., metadata=...)`" in prompt
+    assert 'kanban_block(reason="review-required:' not in prompt
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
