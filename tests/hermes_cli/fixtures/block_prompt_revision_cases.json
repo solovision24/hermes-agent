@@ -1,0 +1,150 @@
+[
+  {
+    "reason": "NEED: Choose?\nOPTIONS: 🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍🌍 | Hold",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED: Choose?\nOPTIONS: Approve | Deny\nOPTIONS： Delete | Grant",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED: Choose?\nOPTIONS: Approve | Deny\n- **OPTIONS**： Delete | Grant",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "**NEED**： Choose?\n- **OPTION**: A | B\n* OPTIONS： C | D",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED: Choose?\n**NEED**： Different?",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED： Choose?\n**OPTIONS**： A",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED： Choose?\n**OPTIONS**： A | B | C | D | E | F",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED： Choose?\n**OPTIONS**： A | | B",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED： Choose?\n**OPTIONS**： A | a",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED： Choose?\n**OPTIONS**： A | B | xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED: Choose?\nOPTIONS：",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "Type a custom hostname.",
+    "accepted": true,
+    "options": []
+  },
+  {
+    "reason": "NEED： Type a custom hostname.",
+    "accepted": true,
+    "options": []
+  },
+  {
+    "reason": "- **NEED**： Choose a region?\n- **OPTIONS**： Europe | America",
+    "accepted": true,
+    "options": [
+      "Europe",
+      "America"
+    ]
+  },
+  {
+    "reason": "NEED: Choose?\nOPTIONS: A; B | C // D | E, F",
+    "accepted": true,
+    "options": [
+      "A; B",
+      "C // D",
+      "E, F"
+    ]
+  },
+  {
+    "reason": "NEED: Choose?\nOPTIONS: **A** | `B`",
+    "accepted": true,
+    "options": [
+      "**A**",
+      "`B`"
+    ]
+  },
+  {
+    "reason": "NEED: Choose?\nOPTIONS: A |\n B",
+    "accepted": true,
+    "options": [
+      "A",
+      "B"
+    ]
+  },
+  {
+    "reason": "CI build failed: retry automatically",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "NEED: CI build failed: retry automatically",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "Worker crashed; restart automatically",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "Network connection timed out",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "Auto-retry after cooldown",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "No human input required",
+    "accepted": false,
+    "options": []
+  },
+  {
+    "reason": "CI build failed. Should we retry or cancel?",
+    "accepted": true,
+    "options": []
+  },
+  {
+    "reason": "Should we retry automatically after CI failures?",
+    "accepted": true,
+    "options": []
+  },
+  {
+    "reason": "NEED: Approve a retry?\nWHY: CI build failed: retry automatically is the old plan.",
+    "accepted": true,
+    "options": []
+  },
+  {
+    "reason": "Provide your preferred recovery window.",
+    "accepted": true,
+    "options": []
+  }
+]

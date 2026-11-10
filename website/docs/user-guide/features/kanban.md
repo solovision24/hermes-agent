@@ -19,6 +19,66 @@ The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
 
+### Revise a human block prompt without unblocking
+
+Trusted operator integrations can call `kanban_db.get_current_block_prompt(conn, task_id)`
+and `kanban_db.revise_block_prompt(...)`. This is not a worker tool and is not an
+unblock/reblock cycle. Select the board using the normal native connection API:
+
+```python
+from dataclasses import asdict
+from hermes_cli import kanban_db
+
+with kanban_db.connect_closing(board="default") as conn:
+    current = kanban_db.get_current_block_prompt(conn, task_id)
+    if current is None:
+        raise ValueError("No current human prompt; inspect the task first")
+    revised = kanban_db.revise_block_prompt(
+        conn, task_id,
+        reason="NEED: Which region should launch?\nOPTIONS: Europe | North America",
+        kind="needs_input",
+        expected_event_id=current.event_id,
+        actor="local-operator",
+    )
+    print(asdict(revised))
+    assert kanban_db.get_current_block_prompt(conn, task_id) == revised
+```
+
+Use a previously inspected `event_id`; do not automatically retry a conflict with
+a newly fetched version. `BlockPromptRevisionError.code` distinguishes stale
+versions, active claims, wrong state, malformed inputs and missing prompts.
+Tasks must be blocked in `needs_input`. Legacy untyped blocks are admitted only
+when the current reason explicitly starts a `NEED:` or `Human decision required:`
+line; other kinds and untyped machine failures are refused. The stored task
+`block_kind` is preserved, even for legacy untyped cards.
+
+The transaction appends only `block_prompt_revised` with `schema_version: 1`, new
+reason/kind, previous event ID/reason/kind, stored task block kind and operator
+actor. It changes no task row, run, claim, recurrence count or synthetic-run count.
+Any task claim field or open/claimed run refuses the operation without clearing it.
+The newest prompt event by event ID is authoritative; malformed selected events
+never recover older choices. An explicit free-text revision omitting `OPTIONS`
+clears choices even when the question text is identical. Reasons are bounded to
+16,000 characters; labelled prompts need one nonempty NEED and optional WHY and
+2–5 pipe-separated answers of at most 48 characters when OPTIONS is present.
+Labels are case-insensitive and accept ASCII/fullwidth colons and list/bold
+decoration. Duplicate labels (including OPTION/OPTIONS aliases), empty labels,
+empty answers and case-insensitive duplicate answers are refused. Continuation
+lines belong to the preceding field. Revised answer values are literal: only
+`|` separates them; semicolons, commas, `//` and wrapping markers are not rewritten.
+
+Revision validation also rejects recognizable machine-failure/automatic-retry
+statements without a human question or request (for example `CI build failed:
+retry automatically`). An explicit human ask such as `Should we retry automatically?`
+or `Provide your preferred recovery window.` remains valid, as does unlabelled
+free text. This deterministic guard is not a semantic classifier: operators
+remain responsible for choosing the human lane, not relabelling machine work.
+Only NEED (or the whole free-text ask) is classified; WHY may describe failures.
+
+Reading/revising a prompt neither records a user's decision nor resumes work.
+A decision comment and explicit same-card unblock remain separate. Neither is
+OAuth consent, credential access, a spend approval or a deployment authorization.
+
 This is the shape that covers the workloads `delegate_task` can't:
 
 - **Research triage** — parallel researchers + analyst + writer, human-in-the-loop.

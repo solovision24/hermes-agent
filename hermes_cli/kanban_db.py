@@ -1299,6 +1299,27 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class BlockPrompt:
+    """Authoritative human prompt for a task's current blocked state."""
+
+    event_id: int
+    task_id: str
+    reason: str
+    kind: Optional[str]
+    previous_event_id: Optional[int] = None
+    previous_reason: Optional[str] = None
+    actor: Optional[str] = None
+
+
+class BlockPromptRevisionError(ValueError):
+    """Stable refusal raised by :func:`revise_block_prompt`."""
+
+    def __init__(self, message: str, code: str = "invalid_block_prompt") -> None:
+        super().__init__(message)
+        self.code = code
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -4913,6 +4934,215 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
     except OSError:
         pass
     return att
+
+
+_BLOCK_PROMPT_EVENT_KINDS = ("block_prompt_revised", "blocked", "block_loop_detected")
+
+
+def _decode_block_prompt_row(row: sqlite3.Row) -> Optional[BlockPrompt]:
+    """Decode one selected event without falling through to older prompts."""
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    reason = payload.get("reason")
+    kind = payload.get("kind")
+    if not isinstance(reason, str) or not reason.strip() or "\x00" in reason:
+        return None
+    if row["kind"] == "block_prompt_revised" and payload.get("schema_version") != 1:
+        return None
+    if kind not in (None, "needs_input"):
+        return None
+    if kind is None and not re.search(r"(?im)^\s*(?:NEED\s*:|Human decision required\s*:)", reason):
+        # Legacy untyped machine failures are not operator decision prompts.
+        # Only an explicit human label is evidence, never word overlap.
+        return None
+    previous_event_id = payload.get("previous_event_id")
+    if previous_event_id is not None and (
+        isinstance(previous_event_id, bool) or not isinstance(previous_event_id, int)
+    ):
+        previous_event_id = None
+    previous_reason = payload.get("previous_reason")
+    actor = payload.get("actor")
+    return BlockPrompt(
+        event_id=int(row["id"]),
+        task_id=str(row["task_id"]),
+        reason=reason.strip(),
+        kind=kind,
+        previous_event_id=previous_event_id,
+        previous_reason=previous_reason if isinstance(previous_reason, str) else None,
+        actor=actor if isinstance(actor, str) else None,
+    )
+
+
+def get_current_block_prompt(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[BlockPrompt]:
+    """Return the current human block prompt and its CAS event version.
+
+    Only ``blocked`` tasks in ``needs_input`` (or explicitly human-labelled
+    legacy untyped blocks) have a prompt. The newest event is authoritative. In particular,
+    a malformed or generic ``block_prompt_revised`` event is never skipped in
+    favour of a stale earlier ``blocked`` event.
+    """
+    task = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task is None or task["status"] != "blocked" or task["block_kind"] not in (None, "needs_input"):
+        return None
+    placeholders = ",".join("?" for _ in _BLOCK_PROMPT_EVENT_KINDS)
+    row = conn.execute(
+        f"SELECT id, task_id, kind, payload FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_PROMPT_EVENT_KINDS),
+    ).fetchone()
+    return _decode_block_prompt_row(row) if row is not None else None
+
+
+def _validate_block_prompt_revision_input(
+    *, reason: Any, kind: Any, expected_event_id: Any, actor: Any,
+) -> tuple[str, int, str]:
+    if (
+        not isinstance(reason, str) or not reason.strip() or len(reason) > 16000
+        or any(ord(c) < 32 and c not in "\n\r\t" for c in reason)
+    ):
+        raise BlockPromptRevisionError("reason must be a non-empty string", "invalid_reason")
+    # Match the companion's label grammar, including decorated/fullwidth labels.
+    # Never let a second spelling silently overwrite an already checked field.
+    fields = {}
+    current = None
+    for line in re.split(r"\r?\n", reason):
+        match = re.match(r"^\s*(?:[-*]\s*)?\**(NEED|OPTIONS?|WHY)\**\s*[:：]\s*(.*)$", line, re.I)
+        if match:
+            label, text = match.groups()
+            label = "OPTIONS" if label.upper() in ("OPTION", "OPTIONS") else label.upper()
+            if label in fields or not text.strip():
+                raise BlockPromptRevisionError("malformed labelled prompt", "invalid_reason")
+            current = label
+            fields[label] = text.strip()
+        elif current and line.strip():
+            fields[current] += " " + line.strip()
+    if fields and "NEED" not in fields:
+        raise BlockPromptRevisionError("labelled prompt requires NEED", "invalid_reason")
+    if "OPTIONS" in fields:
+        choices = [choice.strip() for choice in fields["OPTIONS"].split("|")]
+        # Literal pipes only; no renderer-specific alternate separators or
+        # wrapping-marker cleanup may reinterpret a revised decision value.
+        if (not 2 <= len(choices) <= 5 or any(
+                not c or len(c.encode("utf-16-le", errors="surrogatepass")) // 2 > 48
+                for c in choices)
+                or len({c.lower() for c in choices}) != len(choices)):
+            raise BlockPromptRevisionError("OPTIONS requires 2-5 short answers", "invalid_reason")
+    ask = fields.get("NEED", reason).strip()
+    automatic = re.search(
+        r"\b(?:retry|rerun|restart|resume|recover|requeue)\b[^\n.!?]{0,60}\bautomatically\b"
+        r"|\b(?:auto[- ]?(?:retry|rerun|restart|resume|recover|requeue)|no human (?:input|action) (?:needed|required))\b",
+        ask, re.I,
+    )
+    machine_failure = re.search(
+        r"\b(?:CI|build|test|worker|process|network|connection|service)\b[^\n.!?]{0,40}"
+        r"\b(?:failed|failure|timeout|timed out|unavailable|crashed)\b", ask, re.I,
+    )
+    human_ask = re.search(
+        r"\?|\b(?:choose|type|provide|approve|confirm|decide|select|which|what|should|may I|can you)\b",
+        ask, re.I,
+    )
+    if (automatic or machine_failure) and not human_ask:
+        raise BlockPromptRevisionError("machine-actionable reason is not a human ask", "invalid_reason")
+    if kind != "needs_input":
+        raise BlockPromptRevisionError(
+            "only the needs_input human lane can revise a block prompt", "invalid_kind",
+        )
+    if isinstance(expected_event_id, bool) or not isinstance(expected_event_id, int) or expected_event_id <= 0:
+        raise BlockPromptRevisionError(
+            "expected_event_id must be a positive integer", "invalid_expected_event_id",
+        )
+    if not isinstance(actor, str) or not actor.strip() or "\x00" in actor:
+        raise BlockPromptRevisionError("actor must be a non-empty string", "invalid_actor")
+    return reason.strip(), expected_event_id, actor.strip()
+
+
+def revise_block_prompt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    kind: str,
+    expected_event_id: int,
+    actor: str,
+) -> BlockPrompt:
+    """Atomically revise the current human ask using event-id compare-and-swap.
+
+    This trusted operator API is deliberately event-only: it never changes the
+    task row, recurrence counters, claim history, or run history. A live task or
+    run claim, a non-human block lane, or a stale event version is refused.
+    """
+    normalized_reason, expected, normalized_actor = _validate_block_prompt_revision_input(
+        reason=reason, kind=kind, expected_event_id=expected_event_id, actor=actor,
+    )
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, block_kind, current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if task is None:
+            raise BlockPromptRevisionError("task does not exist", "not_found")
+        if task["status"] != "blocked" or task["block_kind"] not in (None, "needs_input"):
+            raise BlockPromptRevisionError(
+                "task is not currently blocked for human input", "invalid_block_state",
+            )
+        task_claimed = any(
+            task[name] is not None
+            for name in ("current_run_id", "claim_lock", "claim_expires", "worker_pid")
+        )
+        open_run = conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? AND "
+            "(ended_at IS NULL OR claim_lock IS NOT NULL OR claim_expires IS NOT NULL "
+            "OR worker_pid IS NOT NULL) LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if task_claimed or open_run is not None:
+            raise BlockPromptRevisionError(
+                "task has an active claim and cannot be revised", "active_claim",
+            )
+        current = get_current_block_prompt(conn, task_id)
+        if current is None:
+            raise BlockPromptRevisionError(
+                "task has no well-formed current human prompt", "no_current_prompt",
+            )
+        if current.event_id != expected:
+            raise BlockPromptRevisionError(
+                f"stale block prompt version: expected {expected}, current {current.event_id}",
+                "stale_event",
+            )
+        payload = {
+            "schema_version": 1,
+            "reason": normalized_reason,
+            "kind": "needs_input",
+            "previous_event_id": current.event_id,
+            "previous_reason": current.reason,
+            "previous_kind": current.kind,
+            "task_block_kind": task["block_kind"],
+            "actor": normalized_actor,
+        }
+        cur = conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'block_prompt_revised', ?, ?)",
+            (task_id, json.dumps(payload, ensure_ascii=False), int(time.time())),
+        )
+        event_id = int(cur.lastrowid)
+    return BlockPrompt(
+        event_id=event_id,
+        task_id=task_id,
+        reason=normalized_reason,
+        kind="needs_input",
+        previous_event_id=current.event_id,
+        previous_reason=current.reason,
+        actor=normalized_actor,
+    )
 
 
 def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
