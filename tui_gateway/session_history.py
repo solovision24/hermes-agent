@@ -398,6 +398,8 @@ def _start_inflight_turn(
     session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
 ) -> None:
+    from tui_gateway.strict_steer import start_run
+    start_run(session)
     now = time.time()
     turn = {
         "assistant": "", "started_at": now, "streaming": True, "updated_at": now,
@@ -438,6 +440,8 @@ def _record_inflight_correction(session: dict, text: Any) -> None:
 
 
 def _clear_inflight_turn(session: dict) -> None:
+    from tui_gateway.strict_steer import finish_run
+    finish_run(session)
     session["inflight_turn"] = None
     # A turn that never reached the agent (cancelled/refused before ready) leaves its submit-time row
     # as the durable record of the send; a later turn must not adopt it as its own input.
@@ -448,6 +452,8 @@ def _fail_inflight_turn(session: dict, error: Any, error_surface: Optional[dict]
     """Mark the in-flight turn terminal-error but keep it replayable: a failure's terminal frame can be lost on
     WS disconnect and the turn may never have been committed, so the snapshot lets ``session.resume`` replay
     prompt, partial text and error. Lives until the next turn starts or the session closes. Caller holds history_lock."""
+    from tui_gateway.strict_steer import finish_run
+    finish_run(session)
     message = str(error) if not isinstance(error, BaseException) else (str(error) or type(error).__name__)
     now = time.time()
     turn = session.get("inflight_turn")

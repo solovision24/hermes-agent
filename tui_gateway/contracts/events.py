@@ -15,12 +15,24 @@ closed, so a drifted emitter fails the suite (``registry.check_payload`` raises 
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from .base import JsonValue, Payload, WireEnum
 from .common import MessageReaction, PlanGauge, SessionLiveInfo, SubagentStatus, ToolLabel, ToolLabelKind, Usage
 from .config_free_tier_control import FreeTierChallengePayload, SessionControlSnapshot
 from .registry import event
+
+
+
+class SteerUpdatePayload(Payload):
+    run_id: str
+    intent_id: str
+    status: Literal["accepted", "delivered", "missed"]
+
+
+event("steer.update", SteerUpdatePayload, doc="Strict run steering admission or checkpoint outcome.")
 
 
 class OpenPayload(Payload):
