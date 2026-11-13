@@ -22,7 +22,6 @@ _lease_watcher_started = threading.Event()
 # profile key → last epoch broadcast or seen (in-process transitions record theirs too, so a change
 # made by THIS process is not re-broadcast when its file write is noticed a tick later).
 _lease_epochs: dict[str, int] = {}
-_lease_mtimes: dict[str, int | None] = {}
 # profile key → (env mtime, launcher.pid mtime, launcher alive): the screen's running/display
 # identity. A start or stop made by another process (CLI, gateway auto-start) moves a file; a crash
 # leaves both files and only flips liveness.
@@ -125,18 +124,11 @@ def _poll_idle_screens() -> None:
 
 
 def _poll_lease_files() -> None:
-    """One pass: read a home's lease only when its file mtime moved; broadcast when the epoch did."""
+    """Read each lease to enforce inactivity expiry even when no file moved; broadcast epoch changes."""
     from hermes_constants import hermes_home_key
     from tools.bot_desktop import lease as _bd_lease
     for home in _watched_lease_homes():
         key = hermes_home_key(home)
-        try:
-            mtime = (home / "bot-desktop" / "lease.json").stat().st_mtime_ns
-        except OSError:
-            mtime = None
-        if mtime == _lease_mtimes.get(key, 0):
-            continue
-        _lease_mtimes[key] = mtime
         lease = _bd_lease.get(str(home))
         if key not in _lease_epochs:  # first sighting seeds silently: display.status carries it
             _lease_epochs[key] = lease.epoch

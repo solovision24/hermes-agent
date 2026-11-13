@@ -12,10 +12,8 @@ Watch mode and reconnects.
 
 Design notes. The ticket rides in the query string on purpose: noVNC's Websock owns the socket and
 cannot negotiate a subprotocol or add a header, and the ticket is single-use and expires in 30 s, so
-a logged URL is spent by the time anyone reads it. The bridge's input gate re-reads ``lease.json`` at
-most every ``_LEASE_REFRESH_S`` (250 ms) between in-process ``on_change`` callbacks: that bounds how
-long another PROCESS's takeover can go unnoticed, and is the price of not stat-ing the lease file on
-the event loop for every pointer move.
+a logged URL is spent by the time anyone reads it. Each complete input message is admitted and
+timestamped under the profile's lease lock. Framebuffer requests and watching never renew control.
 """
 
 from __future__ import annotations
@@ -39,7 +37,6 @@ _CLOSE_DESKTOP_GONE = 4001
 _CLOSE_BAD_TICKET = 4401
 _CLOSE_NOT_ALLOWED = 4403
 _CLOSE_PROTOCOL = 1003
-_LEASE_REFRESH_S = 0.25
 
 
 def _should_evict(held: dict, lease, viewer_id: str) -> bool:
@@ -138,26 +135,14 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
     loop = asyncio.get_running_loop()
     evicted = asyncio.Event()
     held = {"ever": _lease.viewer_may_send_input(viewer_id, profile_key=profile_home)}
-    # Input gate cache: reading lease.json per client message (a stat + read on the event loop for
-    # every pointer move) is replaced by a decision refreshed on this process's on_change callback
-    # and by a file re-read at most every _LEASE_REFRESH_S, so another process's takeover still lands.
-    allowed = {"input": held["ever"], "at": loop.time()}
-
-    def _refresh_allowed(lease=None) -> None:
-        if lease is None:
-            lease = _lease.get(profile_key=profile_home)
-        allowed["input"] = lease.holder == _lease.HUMAN and lease.viewer_id == viewer_id
-        allowed["at"] = loop.time()
-
     def _may_send_input() -> bool:
-        if loop.time() - allowed["at"] > _LEASE_REFRESH_S:
-            _refresh_allowed()
-        return allowed["input"]
+        # RfbClientFilter calls this only for a complete keyboard/pointer/clipboard/resize
+        # message. A poll, a partial packet, or another viewer cannot extend the lease.
+        return _lease.record_input(viewer_id, profile_key=profile_home)
 
     def _on_lease(key: str, lease) -> None:
         if key != profile_key:
             return
-        loop.call_soon_threadsafe(_refresh_allowed, lease)
         if _should_evict(held, lease, viewer_id):
             loop.call_soon_threadsafe(evicted.set)
     unsubscribe = _lease.on_change(_on_lease)
@@ -234,8 +219,8 @@ async def _bridge(ws: WebSocket, info: dict) -> None:
         if relay is not None:
             relay.kill()  # the exec client; Xvnc inside the sandbox stays up
         # Closing the viewer window hands control back. A DROPPED link (laptop lid, Wi-Fi, 1006)
-        # keeps the human's exclusion: they may be mid-login on that screen and the agent must not
-        # resume into it. The Desktop reconnects into the same lease, or the human hands back.
+        # keeps the human's exclusion until the 30-minute input inactivity limit. The Desktop
+        # reconnects into the same lease while it is still valid, or the human hands back.
         if viewer_closed.is_set() and _lease.viewer_may_send_input(viewer_id, profile_key=profile_home):
             _lease.release(viewer_id, profile_key=profile_home)
         try:

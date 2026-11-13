@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 AGENT = "agent"
 HUMAN = "human"
+HUMAN_IDLE_SECONDS = 30 * 60
 
 
 class HumanHasControl(RuntimeError):
@@ -52,6 +54,7 @@ class Lease:
     since: float = field(default_factory=time.time)
     reason: str = ""
     epoch: int = 0
+    last_input_at: Optional[float] = None
 
     def as_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -63,6 +66,7 @@ def public_view(lease: Lease) -> Dict[str, object]:
     so it is replaced by a short hash the holder can match against its own id to know it is in control."""
     import hashlib
     d = lease.as_dict()
+    d.pop("last_input_at", None)  # private persistence, not a new wire-contract field
     d["viewer_id"] = None
     d["viewer_hash"] = hashlib.sha256(lease.viewer_id.encode()).hexdigest()[:12] if lease.viewer_id else None
     return d
@@ -144,7 +148,49 @@ class _locked:
 
 
 def get(profile_key: Optional[str] = None) -> Lease:
-    return _read(_path(profile_key))
+    current = _read(_path(profile_key))
+    if current.holder != HUMAN:
+        return current
+    # Re-read under the same lock as input/takeover: a recent input must win over
+    # a poll that observed an older timestamp. Reads never renew human control.
+    return _transition(profile_key, _expire_human)
+
+
+def _expire_human(lease: Lease) -> bool:
+    if lease.holder != HUMAN:
+        return False
+    last = lease.last_input_at if lease.last_input_at is not None else lease.since
+    if not isinstance(last, (int, float)) or not math.isfinite(last):
+        return False  # malformed authority remains fail-closed
+    now = time.time()
+    if now - last < HUMAN_IDLE_SECONDS:
+        return False
+    lease.holder, lease.viewer_id, lease.since = AGENT, None, now
+    lease.reason = "Human control returned after 30 minutes without input"
+    lease.last_input_at = None
+    return True
+
+
+def record_input(viewer_id: str, *, profile_key: Optional[str] = None) -> bool:
+    """Admit and persist actual RFB input from the current holder only.
+
+    Expiry is checked first, so a viewer cannot revive expired control by typing.
+    Activity changes no epoch and emits no transition: admitted agent actions use
+    the epoch to detect real takeovers, not mouse movement.
+    """
+    get(profile_key)  # persist/broadcast any expiry before attempting input
+    path = _path(profile_key)
+    with _locked(path):
+        lease = _read(path)
+        if lease.holder != HUMAN or lease.viewer_id != viewer_id:
+            return False
+        # Another process may have delayed us after get(); deny expired input.
+        last = lease.last_input_at if lease.last_input_at is not None else lease.since
+        if not isinstance(last, (int, float)) or not math.isfinite(last) or time.time() - last >= HUMAN_IDLE_SECONDS:
+            return False
+        lease.last_input_at = time.time()
+        _write(path, lease)
+        return True
 
 
 def on_change(listener: Callable[[str, Lease], None]) -> Callable[[], None]:
@@ -186,11 +232,12 @@ def acquire(viewer_id: str, *, profile_key: Optional[str] = None, reason: str = 
     """Human ``viewer_id`` takes control. Last writer wins: a second viewer evicts the first, and the
     RFB bridge closes the evicted socket so its UI drops to view-only."""
     def _m(lease: Lease) -> bool:
-        if lease.holder == HUMAN and lease.viewer_id == viewer_id:
+        if lease.holder == HUMAN and lease.viewer_id == viewer_id and not _expire_human(lease):
             return False  # already theirs: no epoch bump, `since` and the reason on screen stay put
         # The agent's ask ("please log in to X") stays as the takeover reason: the human needs it
         # on screen WHILE they act, not only before they clicked Take over.
         lease.holder, lease.viewer_id, lease.since = HUMAN, viewer_id, time.time()
+        lease.last_input_at = lease.since
         lease.reason = reason or ""
         return True
     return _transition(profile_key, _m)
@@ -217,6 +264,7 @@ def release(viewer_id: Optional[str] = None, *, profile_key: Optional[str] = Non
             # agent action (a double-clicked Hand back, a stray CLI stop) look overtaken and get voided.
             return False
         lease.holder, lease.viewer_id, lease.since, lease.reason = AGENT, None, time.time(), ""
+        lease.last_input_at = None
         return True
     return _transition(profile_key, _m)
 
