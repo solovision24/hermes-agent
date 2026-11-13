@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from typing import Callable
 
 from agent.prompt_builder import steer_user_row
 
@@ -22,7 +23,7 @@ class StrictSteerRun:
         self.lock = threading.RLock()
         self.closed = False
         self.receipts = {}
-        self.emit = None
+        self.emit: Callable[[dict], object] | None = None
 
     def snapshot(self):
         with self.lock:

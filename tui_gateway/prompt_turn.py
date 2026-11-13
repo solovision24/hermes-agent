@@ -1214,6 +1214,8 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            from tui_gateway.strict_steer import finish_run
+            finish_run(session)
             _release_turn_scopes(sid, session, st)
             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
                 _current_runtime_session_record.reset(runtime_session_token)

@@ -176,6 +176,47 @@ _correction_method("session.redirect", "redirect", "redirected",
                    and hasattr(agent, "redirect"), "agent does not support active-turn redirect")
 
 
+@method("session.steer.state")
+def _(rid, params: dict) -> dict:
+    transport, session = _current_session_steer_authority(params.get("session_id", ""))
+    if transport is None or session is None:
+        return _err(rid, 4001, "attached session required")
+    with session["history_lock"]:
+        run = session.get("_strict_steer_run")
+        return _ok(rid, run.snapshot() if run is not None else
+                   {"run_id": None, "active": False, "receipts": []})
+
+
+def _publish_strict_steer_receipt(sid, session, receipt):
+    # Never route an old generation's terminal receipt to a reused runtime id.
+    if _sessions.get(sid) is session:
+        _emit("steer.update", sid, receipt)
+
+
+@method("session.steer.submit")
+def _(rid, params: dict) -> dict:
+    transport, session = _current_session_steer_authority(params.get("session_id", ""))
+    if transport is None or session is None:
+        return _err(rid, 4001, "attached session required")
+    if not all(isinstance(params.get(k), str) and params[k].strip()
+               for k in ("run_id", "intent_id", "text")):
+        return _err(rid, 4002, "run_id, intent_id and text required")
+    if any(len(params[k]) > limit for k, limit in
+           (("run_id", 128), ("intent_id", 128), ("text", 65536))):
+        return _err(rid, 4000, "strict steering parameter exceeds size limit")
+    with session["history_lock"]:
+        run = session.get("_strict_steer_run")
+        if run is None or run.run_id != params["run_id"]:
+            return _err(rid, 4009, "steering run no longer available; reconcile without resend")
+        if _session_uses_compute_host(session):
+            return _err(rid, 4010, "strict steering unsupported for compute-host turns")
+        run.emit = lambda receipt: _publish_strict_steer_receipt(params["session_id"], session, receipt)
+        try:
+            return _ok(rid, run.submit(params["intent_id"], params["text"]))
+        except ValueError as exc:
+            return _err(rid, 4009, str(exc))
+
+
 def register(server) -> None:
     """Publish this module's helpers onto ``server`` (rebound to its globals) and install handlers."""
     bind_module(globals(), server, skip=("_",))

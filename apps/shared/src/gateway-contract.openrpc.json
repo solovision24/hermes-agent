@@ -3679,6 +3679,42 @@
       }
     },
     {
+      "name": "session.steer.state",
+      "summary": "Read current run token and steering receipts after reconnect or lost acknowledgement.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StrictSteerState"
+        }
+      }
+    },
+    {
+      "name": "session.steer.submit",
+      "summary": "Idempotent run-bound steering at a real tool checkpoint; never a next turn.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/StrictSteerSubmitParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StrictSteerReceipt"
+        }
+      }
+    },
+    {
       "name": "session.title",
       "summary": "Read or set a live session's title; a title set before the row exists is queued.",
       "params": [
@@ -30418,7 +30454,6 @@
         "type": "object"
       },
       "ProfileCreateReceipt": {
-        "additionalProperties": false,
         "description": "What ``hermes profile create`` prints about a new profile, read on the machine (and in the\nprofile scope) that made it: built after a local create, or sent by the gateway that made it\n(``profiles.create`` with ``report``). The contract uses this type itself; a stdlib dataclass, so a\nlocal create never loads pydantic. A client treats a receipt missing a field, or with a wrong type,\nas an unknown outcome.",
         "properties": {
           "path": {
@@ -43749,6 +43784,35 @@
         "title": "SteerStatus",
         "type": "string"
       },
+      "SteerUpdatePayload": {
+        "additionalProperties": false,
+        "properties": {
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "intent_id": {
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "accepted",
+              "delivered",
+              "missed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "intent_id",
+          "status"
+        ],
+        "title": "SteerUpdatePayload",
+        "type": "object"
+      },
       "StoredTranscriptParams": {
         "additionalProperties": false,
         "properties": {
@@ -44134,6 +44198,119 @@
           "text"
         ],
         "title": "StreamDeltaPayload",
+        "type": "object"
+      },
+      "StrictSteerReceipt": {
+        "additionalProperties": false,
+        "properties": {
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "intent_id": {
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StrictSteerStatus"
+          }
+        },
+        "required": [
+          "run_id",
+          "intent_id",
+          "status"
+        ],
+        "title": "StrictSteerReceipt",
+        "type": "object"
+      },
+      "StrictSteerState": {
+        "additionalProperties": false,
+        "properties": {
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/StrictSteerReceipt"
+            },
+            "title": "Receipts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "run_id",
+          "active",
+          "receipts"
+        ],
+        "title": "StrictSteerState",
+        "type": "object"
+      },
+      "StrictSteerStatus": {
+        "enum": [
+          "accepted",
+          "delivered",
+          "missed"
+        ],
+        "title": "StrictSteerStatus",
+        "type": "string"
+      },
+      "StrictSteerSubmitParams": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "run_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Run Id",
+            "type": "string"
+          },
+          "intent_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Intent Id",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 65536,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "run_id",
+          "intent_id",
+          "text"
+        ],
+        "title": "StrictSteerSubmitParams",
         "type": "object"
       },
       "SubagentEventPayload": {
@@ -51855,6 +52032,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/StatusUpdatePayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "steer.update",
+      "summary": "Strict run steering admission or checkpoint outcome.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/SteerUpdatePayload"
           }
         }
       ]

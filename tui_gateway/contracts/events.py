@@ -25,7 +25,6 @@ from .config_free_tier_control import FreeTierChallengePayload, SessionControlSn
 from .registry import event
 
 
-
 class SteerUpdatePayload(Payload):
     run_id: str
     intent_id: str

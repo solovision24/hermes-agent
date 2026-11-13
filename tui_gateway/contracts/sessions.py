@@ -636,9 +636,9 @@ class StrictSteerReceipt(Result):
 
 
 class StrictSteerSubmitParams(SessionParams):
-    run_id: str
-    intent_id: str
-    text: str
+    run_id: str = Field(min_length=1, max_length=128)
+    intent_id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=65536)
 
 
 class StrictSteerState(Result):
