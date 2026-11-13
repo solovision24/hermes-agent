@@ -63,6 +63,7 @@ class DisplayStatus(Result):
     image_switch: DisplayImageSwitch | None = None  # a default-image switch the pane may approve (docker placement)
     lease: DisplayLease
     profile_key: str
+    credential_storage: dict[str, str] | None = None  # metadata-only readiness; not an encryption guarantee
 
 
 # ── methods ───────────────────────────────────────────────────────────────────────────────────

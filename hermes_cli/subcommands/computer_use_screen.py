@@ -28,6 +28,9 @@ def _screen_status(args) -> int:
         print(f"Bot Desktop [{st.profile}]: running on DISPLAY {st.display} ({st.geometry}), pid {st.pid}")
         print(f"  control: {who}   rfb socket: {st.socket}")
         print("  View it: Hermes Desktop → Bots → this bot → Screen")
+        credentials = getattr(st, "credential_storage", None)
+        if credentials and credentials["state"] != "unlocked":
+            print("  Browser credentials: " + credentials["message"])
         return 0
     if st.blocker:
         print(f"Bot Desktop [{st.profile}]: installed, not running. {st.blocker}")

@@ -1407,6 +1407,7 @@ export interface DisplayStatus {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  credential_storage?: Record<string, string> | null
 }
 /** A persisted Docker sandbox kept on the previous default image; the user decides the switch. */
 export interface DisplayImageSwitch {
@@ -1452,6 +1453,7 @@ export interface DisplayStopResult {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  credential_storage?: Record<string, string> | null
   stopped: boolean
 }
 export interface DisplayObserveParams {
@@ -1477,6 +1479,7 @@ export interface DisplayObserveResult {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  credential_storage?: Record<string, string> | null
   ticket: string
   path: string
   viewer_id: string
@@ -1504,6 +1507,7 @@ export interface DisplaySwitchSandboxImageResult {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  credential_storage?: Record<string, string> | null
   docker_image: string
 }
 export interface DisplayInstallResult {
@@ -5841,6 +5845,7 @@ export interface DisplayStatusPayload {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  credential_storage?: Record<string, string> | null
 }
 export interface DisplayLeasePayload {
   profile_key: string
