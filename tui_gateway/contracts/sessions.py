@@ -623,6 +623,36 @@ method("session.interrupt", params=SessionInterruptParams, result=SessionInterru
        doc="Stop the running turn (and streaming TTS); retires the crash-recovery marker.")
 
 
+class StrictSteerStatus(WireEnum):
+    accepted = "accepted"
+    delivered = "delivered"
+    missed = "missed"
+
+
+class StrictSteerReceipt(Result):
+    run_id: str
+    intent_id: str
+    status: StrictSteerStatus
+
+
+class StrictSteerSubmitParams(SessionParams):
+    run_id: str = Field(min_length=1, max_length=128)
+    intent_id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=65536)
+
+
+class StrictSteerState(Result):
+    run_id: str | None
+    active: bool
+    receipts: list[StrictSteerReceipt]
+
+
+method("session.steer.submit", params=StrictSteerSubmitParams, result=StrictSteerReceipt,
+       doc="Idempotent run-bound steering at a real tool checkpoint; never a next turn.")
+method("session.steer.state", params=SessionParams, result=StrictSteerState,
+       doc="Read current run token and steering receipts after reconnect or lost acknowledgement.")
+
+
 class CorrectionStatus(WireEnum):
     queued = "queued"
     redirected = "redirected"

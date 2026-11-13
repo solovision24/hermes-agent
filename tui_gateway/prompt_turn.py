@@ -821,6 +821,10 @@ def _invoke_agent(
     agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
         "session.title", sid, {"session_id": _k, "title": t})
     _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+    strict_run = session.get("_strict_steer_run")
+    if strict_run is not None:
+        agent._strict_steer_checkpoint = lambda messages, count: strict_run.checkpoint(
+            messages, count, agent._drain_pending_steer)
     try:
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
@@ -829,6 +833,9 @@ def _invoke_agent(
             if hold is not None and (rest := hold.finish()) and not getattr(agent, "_mute_notification_reply", False):
                 _emit_delta(rest)
     finally:
+        if strict_run is not None:
+            strict_run.finish()
+            agent._strict_steer_checkpoint = None
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
         _usage_stop.set()
@@ -1207,6 +1214,8 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
+            from tui_gateway.strict_steer import finish_run
+            finish_run(session)
             _release_turn_scopes(sid, session, st)
             try:  # a raising settle step must not skip the trim / HERMES_HOME reset
                 _current_runtime_session_record.reset(runtime_session_token)

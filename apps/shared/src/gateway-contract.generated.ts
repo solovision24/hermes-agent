@@ -3708,6 +3708,24 @@ export interface SessionInterruptResult {
   turn_isolation?: boolean | null
 }
 export type InterruptStatus = 'interrupted' | 'not_interrupted'
+export interface StrictSteerSubmitParams {
+  session_id: string
+  profile?: string | null
+  run_id: string
+  intent_id: string
+  text: string
+}
+export interface StrictSteerReceipt {
+  run_id: string
+  intent_id: string
+  status: StrictSteerStatus
+}
+export type StrictSteerStatus = 'accepted' | 'delivered' | 'missed'
+export interface StrictSteerState {
+  run_id: string | null
+  active: boolean
+  receipts: StrictSteerReceipt[]
+}
 export interface SessionCorrectionParams {
   session_id: string
   profile?: string | null
@@ -5852,6 +5870,11 @@ export interface DisplayInstallDonePayload {
   code: number
   status: DisplayStatus
 }
+export interface SteerUpdatePayload {
+  run_id: string
+  intent_id: string
+  status: 'accepted' | 'delivered' | 'missed'
+}
 /** ``tui_gateway/entry.py`` (stdio) / ``tui_gateway/ws.py`` (WebSocket) first frame. */
 export interface GatewayReadyPayload {
   skin: SkinPayload
@@ -6710,6 +6733,10 @@ export interface RpcMethods {
   'session.status': { params: SessionStatusParams; result: SessionStatusResult }
   /** Inject text into the next tool result without interrupting the turn. */
   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
+  /** Read current run token and steering receipts after reconnect or lost acknowledgement. */
+  'session.steer.state': { params: SessionParams; result: StrictSteerState }
+  /** Idempotent run-bound steering at a real tool checkpoint; never a next turn. */
+  'session.steer.submit': { params: StrictSteerSubmitParams; result: StrictSteerReceipt }
   /** Read or set a live session's title; a title set before the row exists is queued. */
   'session.title': { params: SessionTitleParams; result: SessionTitleResult }
   /** Drop the last user turn (and everything after it) from an idle session. */
@@ -7033,6 +7060,8 @@ export const RPC_METHODS = [
   'session.set_hidden',
   'session.status',
   'session.steer',
+  'session.steer.state',
+  'session.steer.submit',
   'session.title',
   'session.undo',
   'session.usage',
@@ -7422,6 +7451,8 @@ export interface BackendGatewayEventMap {
   'skin.changed': SkinPayload
   /** Transient status line (kind: status, lifecycle, compacting, goal, loop, heartbeat, process, …). */
   'status.update': StatusUpdatePayload
+  /** Strict run steering admission or checkpoint outcome. */
+  'steer.update': SteerUpdatePayload
   /** A child finished (status + observability rollup). */
   'subagent.complete': SubagentEventPayload
   /** Batched tool-name progress from a child. */
@@ -7524,6 +7555,7 @@ export const GATEWAY_EVENT_TYPES = [
   'skills.changed',
   'skin.changed',
   'status.update',
+  'steer.update',
   'subagent.complete',
   'subagent.progress',
   'subagent.spawn_requested',

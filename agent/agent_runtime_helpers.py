@@ -3685,6 +3685,9 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
       persistence never rewrites (replayed histories then diverge from the
       live request bytes and break the provider prompt cache).
     """
+    strict_checkpoint = getattr(agent, "_strict_steer_checkpoint", None)
+    if strict_checkpoint is not None and strict_checkpoint(messages, num_tool_msgs):
+        return
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()

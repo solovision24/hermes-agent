@@ -433,6 +433,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if not session or session.get("_finalized"):
         return
     session["_finalized"] = True
+    from tui_gateway.strict_steer import finish_run
+    finish_run(session)
     _lock_vault_managers(session)
     if (history_ready := session.get("resume_history_ready")) is not None and not history_ready.is_set():
         session["resume_history_error"] = "session resume cancelled"
