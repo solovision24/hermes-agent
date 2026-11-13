@@ -12467,6 +12467,19 @@
             ],
             "default": null,
             "title": "Reason"
+          },
+          "if_agent_epoch": {
+            "anyOf": [
+              {
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "If Agent Epoch"
           }
         },
         "required": [
@@ -12729,6 +12742,11 @@
             "title": "Profile Key",
             "type": "string"
           },
+          "conditional_acquire": {
+            "default": false,
+            "title": "Conditional Acquire",
+            "type": "boolean"
+          },
           "ticket": {
             "title": "Ticket",
             "type": "string"
@@ -12907,6 +12925,11 @@
           "profile_key": {
             "title": "Profile Key",
             "type": "string"
+          },
+          "conditional_acquire": {
+            "default": false,
+            "title": "Conditional Acquire",
+            "type": "boolean"
           }
         },
         "required": [
@@ -13070,6 +13093,11 @@
           "profile_key": {
             "title": "Profile Key",
             "type": "string"
+          },
+          "conditional_acquire": {
+            "default": false,
+            "title": "Conditional Acquire",
+            "type": "boolean"
           }
         },
         "required": [
@@ -13265,6 +13293,11 @@
             "title": "Profile Key",
             "type": "string"
           },
+          "conditional_acquire": {
+            "default": false,
+            "title": "Conditional Acquire",
+            "type": "boolean"
+          },
           "stopped": {
             "title": "Stopped",
             "type": "boolean"
@@ -13456,6 +13489,11 @@
           "profile_key": {
             "title": "Profile Key",
             "type": "string"
+          },
+          "conditional_acquire": {
+            "default": false,
+            "title": "Conditional Acquire",
+            "type": "boolean"
           },
           "docker_image": {
             "title": "Docker Image",

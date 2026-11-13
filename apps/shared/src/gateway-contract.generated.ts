@@ -1253,6 +1253,7 @@ export interface DisplayStatus {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  conditional_acquire?: boolean
 }
 /** A persisted Docker sandbox kept on the previous default image; the user decides the switch. */
 export interface DisplayImageSwitch {
@@ -1298,6 +1299,7 @@ export interface DisplayStopResult {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  conditional_acquire?: boolean
   stopped: boolean
 }
 export interface DisplayObserveParams {
@@ -1323,6 +1325,7 @@ export interface DisplayObserveResult {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  conditional_acquire?: boolean
   ticket: string
   path: string
   viewer_id: string
@@ -1350,6 +1353,7 @@ export interface DisplaySwitchSandboxImageResult {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  conditional_acquire?: boolean
   docker_image: string
 }
 export interface DisplayInstallResult {
@@ -1361,6 +1365,7 @@ export interface DisplayLeaseAcquireParams {
   profile?: string | null
   viewer_id: string
   reason?: string | null
+  if_agent_epoch?: number | null
 }
 export interface DisplayLeaseResult {
   lease: DisplayLease
@@ -4472,6 +4477,7 @@ export interface DisplayStatusPayload {
   image_switch?: DisplayImageSwitch | null
   lease: DisplayLease
   profile_key: string
+  conditional_acquire?: boolean
 }
 export interface DisplayLeasePayload {
   profile_key: string

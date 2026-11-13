@@ -228,10 +228,15 @@ def _transition(profile_key: Optional[str], mutate: Callable[[Lease], bool]) -> 
     return lease
 
 
-def acquire(viewer_id: str, *, profile_key: Optional[str] = None, reason: str = "") -> Lease:
+def acquire(viewer_id: str, *, profile_key: Optional[str] = None, reason: str = "",
+            if_agent_epoch: Optional[int] = None) -> Lease:
     """Human ``viewer_id`` takes control. Last writer wins: a second viewer evicts the first, and the
-    RFB bridge closes the evicted socket so its UI drops to view-only."""
+    RFB bridge closes the evicted socket so its UI drops to view-only. With ``if_agent_epoch`` an
+    automatic click only acquires the exact agent-held lease it observed; a competing takeover or
+    intervening handoff makes it a no-op. The comparison and write share the file lock."""
     def _m(lease: Lease) -> bool:
+        if if_agent_epoch is not None and (lease.holder != AGENT or lease.epoch != if_agent_epoch):
+            return False
         if lease.holder == HUMAN and lease.viewer_id == viewer_id and not _expire_human(lease):
             return False  # already theirs: no epoch bump, `since` and the reason on screen stay put
         # The agent's ask ("please log in to X") stays as the takeover reason: the human needs it

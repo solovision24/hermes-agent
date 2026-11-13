@@ -9,6 +9,8 @@ in-flight result was produced under a lease that has since changed.
 
 from __future__ import annotations
 
+from pydantic import Field
+
 from .base import Params, Payload, Result, WireEnum
 from .common import ProfileParams
 from .registry import event, method, server_request
@@ -63,6 +65,7 @@ class DisplayStatus(Result):
     image_switch: DisplayImageSwitch | None = None  # a default-image switch the pane may approve (docker placement)
     lease: DisplayLease
     profile_key: str
+    conditional_acquire: bool = False  # runtime supports atomic agent-held epoch acquisition
 
 
 # ── methods ───────────────────────────────────────────────────────────────────────────────────
@@ -138,6 +141,7 @@ method("display.install", params=ProfileParams, result=DisplayInstallResult,
 class DisplayLeaseAcquireParams(ProfileParams):
     viewer_id: str
     reason: str | None = None
+    if_agent_epoch: int | None = Field(default=None, ge=0, strict=True)
 
 
 class DisplayLeaseResult(Result):

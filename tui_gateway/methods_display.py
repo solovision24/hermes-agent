@@ -32,7 +32,8 @@ def _display_snapshot() -> dict:
     from hermes_constants import hermes_home_key
     from tools.bot_desktop import lease as _bd_lease, runtime as _bd_runtime
     st = _bd_runtime.status()
-    return {**st.as_dict(), "lease": _bd_lease.public_view(_bd_lease.get()), "profile_key": hermes_home_key()}
+    return {**st.as_dict(), "lease": _bd_lease.public_view(_bd_lease.get()), "profile_key": hermes_home_key(),
+            "conditional_acquire": True}
 
 
 def _install_lease_listener() -> None:
@@ -240,7 +241,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, _DISPLAY_ERR, "viewer_id required")
     if (refused := _foreign_viewer_id(rid, viewer_id)) is not None:
         return refused
-    lease = _bd_lease.acquire(viewer_id, reason=str(params.get("reason") or ""))
+    lease = _bd_lease.acquire(viewer_id, reason=str(params.get("reason") or ""),
+                              if_agent_epoch=params.get("if_agent_epoch"))
     return _ok(rid, {"lease": _bd_lease.public_view(lease)})
 
 
