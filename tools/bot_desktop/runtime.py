@@ -150,6 +150,7 @@ class DesktopStatus:
     memory_limit_mb: Optional[int] = None
     placement: str = "gateway"  # "gateway" | "terminal:<backend>" — where Xvnc runs
     image_switch: Optional[dict[str, object]] = None  # pending default-image switch the pane can approve
+    credential_storage: Optional[dict[str, str]] = None  # metadata only; None means this target was not probed
 
     def as_dict(self) -> dict[str, object]:
         return dict(self.__dict__)
@@ -637,6 +638,7 @@ def geometry() -> str:
 
 def status(profile: Optional[str] = None) -> DesktopStatus:
     from tools.bot_desktop import browser as _bd_browser
+    from tools.bot_desktop import credentials
     from tools.bot_desktop import resources
     from tools.bot_desktop import sandbox_host
     where = placement.resolve()
@@ -665,6 +667,7 @@ def status(profile: Optional[str] = None) -> DesktopStatus:
         blocker=None if running or missing or not is_supported_host() else resources.memory_blocker(mem),
         memory_available_mb=mem.available_mb,
         memory_limit_mb=mem.limit_mb,
+        credential_storage=credentials.probe(env) if running and is_supported_host() else None,
     )
 
 
