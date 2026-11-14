@@ -35,7 +35,8 @@ def probe(env: Mapping[str, str], *, timeout: float = 0.8) -> dict[str, str]:
     """
     address = env.get("DBUS_SESSION_BUS_ADDRESS", "")
     if not address:
-        return _result("unavailable")
+        # No published route means unprobed, not evidence of a missing provider.
+        return _result("unknown")
     # Bot Desktop publishes a private local Unix bus. Refuse network/ambient bus
     # routing, multiple-address fallbacks, and values with control characters.
     if (not address.startswith("unix:path=/") or ";" in address or

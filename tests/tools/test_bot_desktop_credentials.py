@@ -53,7 +53,31 @@ def test_unsafe_bus_address_never_probed(monkeypatch, address):
 def test_missing_bus_never_falls_back_to_ambient(monkeypatch):
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", BUS)
     calls = replies(monkeypatch, [])
-    assert credentials.probe({})["state"] == "unavailable"
+    assert credentials.probe({})["state"] == "unknown"
+    assert not calls
+
+
+def test_running_desktop_without_published_bus_is_unverified(monkeypatch):
+    from tools.bot_desktop import browser, placement, resources, runtime, sandbox_host
+
+    monkeypatch.setattr(placement, "resolve", lambda: SimpleNamespace(where=placement.GATEWAY))
+    monkeypatch.setattr(sandbox_host, "_read_marker", lambda: None)
+    monkeypatch.setattr(runtime, "_launcher_pid", lambda: 123)
+    monkeypatch.setattr(runtime, "published_env", lambda: {"DISPLAY": ":121"})
+    monkeypatch.setattr(runtime, "is_supported_host", lambda: True)
+    monkeypatch.setattr(runtime, "missing_binaries", lambda: [])
+    monkeypatch.setattr(runtime, "geometry", lambda: "800x600")
+    monkeypatch.setattr(resources, "memory_info", lambda: resources.MemoryInfo(None, None))
+    monkeypatch.setattr(browser, "executable", lambda: None)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", BUS)
+    calls = replies(monkeypatch, [])
+
+    status = runtime.status()
+    assert status.running is True
+    assert status.credential_storage is not None
+    assert status.credential_storage["state"] == "unknown"
+    assert "could not be checked" in status.credential_storage["message"]
+    assert "Configure" not in status.credential_storage["message"]
     assert not calls
 
 
@@ -144,14 +168,20 @@ def test_runtime_routes_a_b_a_to_each_published_bus(tmp_path, monkeypatch):
     assert seen == ["unix:path=/a", "unix:path=/b", "unix:path=/a"]
 
 
-def test_screen_status_prints_unlock_guidance(monkeypatch, capsys):
+@pytest.mark.parametrize("state", ["locked", "unknown"])
+def test_screen_status_prints_safe_readiness_guidance(monkeypatch, capsys, state):
     from hermes_cli.subcommands.computer_use_screen import _screen_status
     from tools.bot_desktop import lease, runtime
-    st = SimpleNamespace(supported=True, installed=True, running=True, profile="test", display=":121", geometry="800x600", pid=123, socket="private-socket", credential_storage=credentials._result("locked"))
+    st = SimpleNamespace(supported=True, installed=True, running=True, profile="test", display=":121", geometry="800x600", pid=123, socket="private-socket", credential_storage=credentials._result(state))
     monkeypatch.setattr(runtime, "status", lambda: st)
     monkeypatch.setattr(lease, "get", lambda: None)
     monkeypatch.setattr(lease, "public_view", lambda _: {"holder":"agent"})
     assert _screen_status(SimpleNamespace(json=False)) == 0
     text = capsys.readouterr().out
-    assert "system authentication dialog" in text
-    assert "never in chat" in text
+    if state == "locked":
+        assert "system authentication dialog" in text
+        assert "never in chat" in text
+    else:
+        assert "could not be checked" in text
+        assert "No Secret Service provider" not in text
+        assert "Configure" not in text

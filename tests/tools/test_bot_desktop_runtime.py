@@ -228,6 +228,11 @@ def in_process_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "_ALLOC_LOCK", tmp_path / "alloc.lock")
     monkeypatch.setattr(runtime, "missing_binaries", list)
     monkeypatch.setattr(runtime, "geometry", lambda: "800x600")
+    # The fake launcher does not run the idle watcher. Resolve its command from
+    # this test interpreter, not the operator's installed PM payload/store.
+    from hermes_cli import _launchers
+    monkeypatch.setattr(_launchers, "installation_command",
+                        lambda root, args=(), *, module: [sys.executable, "-m", module, *args])
     monkeypatch.setenv("HERMES_BD_XLOCK_DIR", str(tmp_path / "xlocks"))
     yield tmp_path
     with contextlib.suppress(Exception):
